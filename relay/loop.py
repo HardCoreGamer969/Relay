@@ -1,7 +1,10 @@
 """The single-model agent loop.
 
-v0.02 runs the loop with ONE role (default ``hands``). It does NOT split work
-across brain/hands -- that planner/executor decomposition is a later milestone.
+``run_task`` runs the loop with ONE role (default ``hands``): it does NOT split
+work across brain/hands. The two-role planner/executor architecture lives in
+``relay.orchestrator`` (v0.04) and reuses this module's shared helpers
+(``execute_action`` / ``describe_action``); ``run_task`` is kept intact as the
+single-model loop, still useful for comparison and via ``relay run --solo``.
 
 The loop is: call the model -> parse its text into actions (via the text
 protocol) -> execute each action with the tools -> feed the results back as the
@@ -90,8 +93,11 @@ class TaskResult:
         return self.status == STATUS_COMPLETED
 
 
-def _describe(action: Action) -> str:
-    """A short, prose-free label for an action (for the transcript/console)."""
+def describe_action(action: Action) -> str:
+    """A short, prose-free label for an action (for the transcript/console).
+
+    Public so the planner/orchestrator (v0.04) can reuse it.
+    """
     if action.kind == "read":
         return f'read path="{action.path}"'
     if action.kind == "list":
@@ -107,8 +113,11 @@ def _describe(action: Action) -> str:
     return action.kind
 
 
-def _execute(tools: Tools, action: Action) -> str:
-    """Run a single action against the tools, returning an observation string."""
+def execute_action(tools: Tools, action: Action) -> str:
+    """Run a single action against the tools, returning an observation string.
+
+    Public so the planner/orchestrator (v0.04) can reuse it.
+    """
     try:
         if action.kind == "read":
             return tools.read(action.path or "")
@@ -208,11 +217,11 @@ def run_task(
             if action.kind == "done":
                 result.status = STATUS_COMPLETED
                 result.done_summary = action.content or ""
-                emit(StepResult(kind="done", detail=_describe(action), observation=""))
+                emit(StepResult(kind="done", detail=describe_action(action), observation=""))
                 break
-            observation = _execute(tools, action)
-            emit(StepResult(kind=action.kind, detail=_describe(action), observation=observation))
-            observations.append(f"[{_describe(action)}]\n{observation}")
+            observation = execute_action(tools, action)
+            emit(StepResult(kind=action.kind, detail=describe_action(action), observation=observation))
+            observations.append(f"[{describe_action(action)}]\n{observation}")
 
         if result.done:
             break

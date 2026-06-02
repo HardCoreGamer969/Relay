@@ -25,3 +25,6 @@ dist/
 
 # OMC orchestration state (local tooling, not part of Relay)
 .omc/
+
+# Relay run logs (running Relay on its own repo writes here)
+.relay/

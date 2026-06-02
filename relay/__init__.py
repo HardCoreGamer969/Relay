@@ -13,6 +13,10 @@
   plans the ordered work up front and the hands (executor) carry out each step
   in a narrow context, with the brain re-engaging only on escalation
   (``run_planned``). The single-model ``run_task`` is kept for comparison.
+- v0.05 persists each run as a structured ``RunRecord`` (JSONL at
+  ``.relay/runs.jsonl``) so runs are comparable over time, and adds a
+  ``relay doctor`` slug preflight. The persisted schema is the durable floor
+  the run-matrix (v0.1) will read.
 """
 
 from __future__ import annotations
@@ -24,10 +28,18 @@ from relay.orchestrator import Event, PlannedTaskResult, run_planned
 from relay.planner import Plan, PlanStep, make_plan, project_digest, replan
 from relay.policy import ALLOW, BLOCKED, CONFIRM, PolicyResult, classify
 from relay.protocol import Action, ParseResult, parse
+from relay.runlog import (
+    SCHEMA_VERSION,
+    RunRecord,
+    append_record,
+    build_record,
+    default_log_path,
+    load_records,
+)
 from relay.telemetry import CallRecord, Ledger
 from relay.tools import PathEscapeError, ToolError, Tools
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"
 
 __all__ = [
     # v0.01 -- model layer
@@ -62,5 +74,12 @@ __all__ = [
     "Plan",
     "PlanStep",
     "project_digest",
+    # v0.05 -- durable run records
+    "RunRecord",
+    "build_record",
+    "append_record",
+    "load_records",
+    "default_log_path",
+    "SCHEMA_VERSION",
     "__version__",
 ]

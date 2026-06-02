@@ -43,10 +43,11 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.04 (the brain/hands split)
+## Status — v0.05 (durable runs + `relay doctor`)
 
-The two-role architecture above is now live: `relay run` plans with the brain and
-executes with the hands by default.
+The two-role architecture (v0.04) is live; v0.05 makes runs **comparable over
+time** by persisting each one as a structured record, and adds a **`relay doctor`**
+preflight that checks the configured model slugs before a run can 404 on them.
 
 **What exists now:**
 
@@ -54,14 +55,15 @@ executes with the hands by default.
 - `relay/config.py` — role → model mapping (`brain`, `hands`) resolved from env.
 - `relay/telemetry.py` — `CallRecord` / `Ledger` recording tokens, cost, latency, and parse-failure count, **split per role**.
 - `relay/models.py` — `call_model(...)`, **the seam** everything else builds on.
-- `relay/protocol.py` — the text action protocol + a tolerant `parse()` (now also `<plan>`/`<step>`, `<abort>`, `<blocked>`).
+- `relay/protocol.py` — the text action protocol + a tolerant `parse()` (`<plan>`/`<step>`, `<abort>`, `<blocked>`).
 - `relay/policy.py` — the command policy: `classify()` → `BLOCKED` / `CONFIRM` / `ALLOW`.
 - `relay/tools.py` — `read` / `list` / `grep` / `edit` / `bash`; `bash` consults the policy and an approver.
-- `relay/loop.py` — `run_task(...)`, the single-model loop (kept for `--solo`; shares `execute_action`/`describe_action`).
-- `relay/planner.py` — **the brain**: `make_plan(...)` and `replan(...)` (read-only investigation + planning).
+- `relay/loop.py` — `run_task(...)`, the single-model loop (kept for `--solo`).
+- `relay/planner.py` — **the brain**: `make_plan(...)` and `replan(...)`.
 - `relay/orchestrator.py` — **the two-role loop**: `run_planned(...)`, narrow executor context, bounded escalation.
-- `relay/cli.py` — `relay models`, `relay demo`, and `relay run` (two-role by default; `--solo`, `--confirm-plan`, `--auto-approve`).
-- Network-free tests for the protocol, tools, loop, policy, planner, and orchestrator.
+- `relay/runlog.py` — **durable run records**: `RunRecord` + `build_record` / `append_record` / `load_records` (JSONL).
+- `relay/cli.py` — `relay models`, `relay demo`, `relay run`, **`relay runs`**, and **`relay doctor`**.
+- Network-free tests for the protocol, tools, loop, policy, planner, orchestrator, run log, and CLI.
 
 ### The text protocol (never native tool-calling)
 
@@ -168,6 +170,14 @@ relay run -g "create hello.txt" --solo hands
 
 # Unattended: auto-approve CONFIRM-category bash commands (BLOCKED still refused)
 relay run -g "clean build artifacts" --auto-approve
+
+# Preflight: check the configured model slugs resolve before they 404 mid-run
+relay doctor
+relay doctor anthropic/claude-sonnet-4.5 openai/gpt-4o-mini   # probe slugs ad-hoc
+
+# See recent runs (persisted to .relay/runs.jsonl); --no-log skips persistence
+relay runs --limit 10
+relay run -g "throwaway experiment" --no-log
 ```
 
 `relay demo` asks the **brain** for one concrete next step and the **hands** how
@@ -187,12 +197,62 @@ final terminal status, then prints the telemetry table **split brain vs hands**
 | `--confirm-plan` | off | Pause for approval after the plan, before execution. |
 | `--auto-approve` / `-y` | off | Auto-approve `CONFIRM` bash commands (`BLOCKED` still refused). |
 | `--max-steps` | `20` | Max model turns (solo mode only). |
+| `--no-log` | off | Skip persisting this run to `.relay/runs.jsonl`. |
 
 `relay run` fails gracefully with no API key, pointing you at `.env.example`.
 When a `CONFIRM` command comes up without `--auto-approve`, it pauses and asks you
 to approve or deny (see [Command policy](#command-policy-the-guardrail)). If
 `--root` is a git repo with uncommitted changes, `relay run` prints a one-line
 nudge to commit first (git is the real undo net — `bash` isn't sandboxed).
+
+## Run history & preflight
+
+Every `relay run` is persisted (unless `--no-log`) as one JSON line appended to
+`<root>/.relay/runs.jsonl` — append-only, no schema migrations. This is the
+durable floor the model **run-matrix** (a later milestone) will read; v0.05 only
+records and displays individual runs, it does not sweep or rank model pairs.
+
+```bash
+relay runs              # a table of recent runs: when, mode, brain/hands models, status, cost, tokens, steps
+relay runs --limit 25 --root path/to/project
+```
+
+`relay doctor` is a **preflight**: for each configured role (or any slugs you
+pass), it makes a minimal `max_tokens=1` call through OpenRouter and reports
+`OK` / `FAILED` with the reason — catching a retired-slug 404 ("no endpoints
+found") *before* a real run depends on it. It exits non-zero if any slug failed
+(usable in CI/scripts) and, with no `OPENROUTER_API_KEY`, says so and exits
+rather than fabricating a result.
+
+### The `runs.jsonl` schema
+
+Each line is a `RunRecord` (`schema_version` lets future readers adapt):
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "20260602T144107Z-ab12cd34",
+  "timestamp": "2026-06-02T14:41:07+00:00",
+  "goal": "create two files ...",
+  "mode": "planned",
+  "roles": {"brain": "anthropic/claude-sonnet-4.5", "hands": "anthropic/claude-3.5-haiku"},
+  "status": "completed",
+  "steps": 2,
+  "escalations": 0,
+  "parse_failures": 0,
+  "per_role": [
+    {"role": "brain", "model": "...", "calls": 1, "prompt_tokens": 367,
+     "completion_tokens": 83, "total_tokens": 450, "cost_usd": 0.002346, "time_s": 4.48}
+  ],
+  "totals": {"tokens": 1470, "cost_usd": 0.003725, "time_s": 9.27},
+  "wall_time_s": 9.4
+}
+```
+
+`steps` is plan steps (planned) or executor turns (solo); `escalations` is
+planned-only. `cost_usd` is `null` when OpenRouter didn't report a cost, and
+`totals.cost_usd` sums only known costs. `wall_time_s` is real wall-clock,
+distinct from the summed model latency in `totals.time_s`.
 
 ## Swapping models
 

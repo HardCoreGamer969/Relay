@@ -13,7 +13,15 @@ Supported tags::
     <grep pattern="..." path="..."/>
     <edit path="...">...full file content...</edit>
     <bash>...command...</bash>
-    <done>...short summary...</done>         ends the loop
+    <done>...short summary...</done>         ends the (sub)loop
+    <plan><step>...</step>...</plan>         the brain's ordered plan (v0.04)
+    <abort>reason</abort>                    the brain: goal is unreachable (v0.04)
+    <blocked>reason</blocked>                the executor: stuck on this step (v0.04)
+
+``<done>`` is context-dependent in v0.04: from the **executor** it means *this
+step* is complete (not the whole task); the task completes when the plan is
+exhausted. The ``<plan>``/``<abort>`` tags come from the brain (planner) and
+``<blocked>`` from the hands (executor).
 
 A message that contains no valid action and no ``<done>`` is a *parse failure*,
 surfaced via :attr:`ParseResult.is_parse_failure` so the loop can correct it.
@@ -25,7 +33,7 @@ import re
 from dataclasses import dataclass, field
 
 # Action kinds the parser can produce.
-KINDS = ("read", "list", "grep", "edit", "bash", "done")
+KINDS = ("read", "list", "grep", "edit", "bash", "done", "plan", "abort", "blocked")
 
 
 @dataclass
@@ -37,13 +45,15 @@ class Action:
       - ``grep``: ``pattern`` + ``path``
       - ``edit``: ``path`` + ``content`` (full new file contents)
       - ``bash``: ``content`` (the command)
-      - ``done``: ``content`` (the summary)
+      - ``done`` / ``abort`` / ``blocked``: ``content`` (the summary/reason)
+      - ``plan``: ``steps`` (ordered step instructions)
     """
 
     kind: str
     path: str | None = None
     pattern: str | None = None
     content: str | None = None
+    steps: list[str] | None = None
 
 
 @dataclass
@@ -62,9 +72,26 @@ class ParseResult:
     def is_done(self) -> bool:
         return any(a.kind == "done" for a in self.actions)
 
+    def first(self, kind: str) -> Action | None:
+        """Return the first action of ``kind`` in document order, or None."""
+        for action in self.actions:
+            if action.kind == kind:
+                return action
+        return None
+
+    @property
+    def plan_steps(self) -> list[str] | None:
+        """Ordered step instructions if a ``<plan>`` was emitted, else None."""
+        plan = self.first("plan")
+        return plan.steps if plan is not None else None
+
 
 _ATTR_RE = re.compile(r"""(\w+)\s*=\s*(["'])(.*?)\2""", re.DOTALL)
 _THINKING_RE = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL)
+_PLAN_RE = re.compile(r"<plan>(.*?)</plan>", re.DOTALL)
+_STEP_RE = re.compile(r"<step>(.*?)</step>", re.DOTALL)
+_ABORT_RE = re.compile(r"<abort>(.*?)</abort>", re.DOTALL)
+_BLOCKED_RE = re.compile(r"<blocked>(.*?)</blocked>", re.DOTALL)
 _EDIT_RE = re.compile(r"""<edit\s+([^>]*?)>(.*?)</edit>""", re.DOTALL)
 _BASH_RE = re.compile(r"<bash>(.*?)</bash>", re.DOTALL)
 _DONE_RE = re.compile(r"<done>(.*?)</done>", re.DOTALL)
@@ -115,37 +142,49 @@ def parse(text: str) -> ParseResult:
     """Parse a model message into ordered actions plus captured thinking.
 
     Tolerant of surrounding prose: only recognized tags are extracted, in the
-    order they appear in the message.
+    order they appear in the message. Block-tag bodies are masked cumulatively
+    as they are consumed, so a tag nested inside another tag's body (e.g. a
+    ``<read.../>`` written inside an ``<edit>`` body, or an ``<edit>`` inside a
+    ``<plan>``) is not double-parsed as its own action.
     """
     if not text:
         return ParseResult()
 
     placed: list[tuple[int, Action]] = []
     thinking: list[str] = []
-    consumed: list[tuple[int, int]] = []
+    masked = text
 
-    for m in _THINKING_RE.finditer(text):
-        thinking.append(m.group(1).strip())
-        consumed.append((m.start(), m.end()))
+    def consume(regex: re.Pattern[str], on_match) -> None:
+        nonlocal masked
+        spans: list[tuple[int, int]] = []
+        for m in regex.finditer(masked):
+            on_match(m)
+            spans.append((m.start(), m.end()))
+        masked = _mask(masked, spans)
 
-    for m in _EDIT_RE.finditer(text):
+    consume(_THINKING_RE, lambda m: thinking.append(m.group(1).strip()))
+
+    def _add_plan(m: re.Match[str]) -> None:
+        steps = [s.group(1).strip() for s in _STEP_RE.finditer(m.group(1))]
+        placed.append((m.start(), Action(kind="plan", steps=[s for s in steps if s])))
+
+    # Plan first, so <step>/<edit>/etc. inside a plan body are not parsed loose.
+    consume(_PLAN_RE, _add_plan)
+    consume(_ABORT_RE, lambda m: placed.append((m.start(), Action(kind="abort", content=m.group(1).strip()))))
+    consume(_BLOCKED_RE, lambda m: placed.append((m.start(), Action(kind="blocked", content=m.group(1).strip()))))
+
+    def _add_edit(m: re.Match[str]) -> None:
         path = _attrs(m.group(1)).get("path")
         if path:
             placed.append(
                 (m.start(), Action(kind="edit", path=path, content=_strip_block_newlines(m.group(2))))
             )
-        consumed.append((m.start(), m.end()))
 
-    for m in _BASH_RE.finditer(text):
-        placed.append((m.start(), Action(kind="bash", content=m.group(1).strip())))
-        consumed.append((m.start(), m.end()))
+    consume(_EDIT_RE, _add_edit)
+    consume(_BASH_RE, lambda m: placed.append((m.start(), Action(kind="bash", content=m.group(1).strip()))))
+    consume(_DONE_RE, lambda m: placed.append((m.start(), Action(kind="done", content=m.group(1).strip()))))
 
-    for m in _DONE_RE.finditer(text):
-        placed.append((m.start(), Action(kind="done", content=m.group(1).strip())))
-        consumed.append((m.start(), m.end()))
-
-    # Mask block bodies so self-closing tags inside them are not double-parsed.
-    masked = _mask(text, consumed)
+    # Self-closing tags last, scanned over the fully-masked text.
     for m in _SELF_CLOSING_RE.finditer(masked):
         kind = m.group(1)
         attrs = _attrs(m.group(2))

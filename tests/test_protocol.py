@@ -79,3 +79,41 @@ def test_single_quoted_attributes_are_accepted():
     result = parse("<read path='notes/todo.txt'/>")
     assert result.actions[0].kind == "read"
     assert result.actions[0].path == "notes/todo.txt"
+
+
+# --- v0.04 tags: plan / abort / blocked ------------------------------------
+
+
+def test_plan_parses_steps_in_order():
+    text = "Here is the plan:\n<plan><step>do A</step><step>do B</step><step>do C</step></plan>"
+    result = parse(text)
+    assert not result.is_parse_failure
+    assert result.plan_steps == ["do A", "do B", "do C"]
+    assert result.first("plan").steps == ["do A", "do B", "do C"]
+
+
+def test_blocked_and_abort_parse_with_reason():
+    blocked = parse("<blocked>cannot find the config file</blocked>")
+    assert not blocked.is_parse_failure
+    assert blocked.first("blocked").content == "cannot find the config file"
+
+    aborted = parse("<abort>the goal contradicts itself</abort>")
+    assert not aborted.is_parse_failure
+    assert aborted.first("abort").content == "the goal contradicts itself"
+
+
+def test_tag_inside_plan_body_is_not_parsed_loose():
+    # A step that mentions an <edit> must not surface a loose edit action.
+    text = '<plan><step>create x via <edit path="x">y</edit></step></plan>'
+    result = parse(text)
+    assert [a.kind for a in result.actions] == ["plan"]
+    assert result.first("edit") is None
+
+
+def test_empty_plan_has_no_steps():
+    result = parse("<plan></plan>")
+    plan = result.first("plan")
+    assert plan is not None
+    assert plan.steps == []
+    # plan_steps reflects the (empty) list, and the planner treats this as no plan.
+    assert result.plan_steps == []

@@ -3,10 +3,23 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
 from relay.tools import PathEscapeError, ToolError, Tools
+
+
+def _record_subprocess(monkeypatch, stdout="ran", returncode=0):
+    """Patch subprocess.run inside relay.tools to record calls without executing."""
+    calls: list = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(stdout=stdout, stderr="", returncode=returncode)
+
+    monkeypatch.setattr("relay.tools.subprocess.run", fake_run)
+    return calls
 
 
 def test_edit_then_read_roundtrip(tmp_path):
@@ -92,3 +105,81 @@ def test_symlink_pointing_outside_root_is_rejected(tmp_path):
 
     # The outside file must be untouched by the refused edit.
     assert outside.read_text(encoding="utf-8") == "secret"
+
+
+# --- v0.03: bash command-policy integration --------------------------------
+
+
+def test_allow_command_runs(tmp_path):
+    out = Tools(tmp_path).bash("echo hello")
+    assert "hello" in out
+    assert "[exit 0]" in out
+
+
+def test_blocked_command_never_runs(tmp_path, monkeypatch):
+    calls = _record_subprocess(monkeypatch)
+    out = Tools(tmp_path).bash("rm -rf /")
+    assert out.startswith("BLOCKED by policy")
+    assert calls == []  # proves the command never reached subprocess
+
+
+def test_blocked_command_blocked_even_with_auto_approve(tmp_path, monkeypatch):
+    calls = _record_subprocess(monkeypatch)
+    out = Tools(tmp_path, auto_approve=True).bash("rm -rf /")
+    assert out.startswith("BLOCKED by policy")
+    assert calls == []  # auto-approve must NOT override BLOCKED
+
+
+def test_confirm_denied_does_not_run_and_leaves_filesystem(tmp_path):
+    target = tmp_path / "keep.txt"
+    target.write_text("data", encoding="utf-8")
+
+    tools = Tools(tmp_path, approver=lambda command, reason: False)
+    out = tools.bash("rm -rf keep.txt")
+
+    assert out.startswith("DENIED by user")
+    assert target.exists()  # the gated rm never ran
+    assert target.read_text(encoding="utf-8") == "data"
+
+
+def test_confirm_default_denies_when_no_approver(tmp_path, monkeypatch):
+    calls = _record_subprocess(monkeypatch)
+    out = Tools(tmp_path).bash("rm -rf build")  # no approver, not auto_approve
+    assert out.startswith("DENIED")
+    assert calls == []  # safe default: not executed
+
+
+def test_confirm_approved_runs(tmp_path, monkeypatch):
+    calls = _record_subprocess(monkeypatch)
+    tools = Tools(tmp_path, approver=lambda command, reason: True)
+    out = tools.bash("rm -rf build")
+    assert len(calls) == 1  # approval opened the gate; the command executed
+    assert "ran" in out
+
+
+def test_auto_approve_runs_confirm(tmp_path, monkeypatch):
+    calls = _record_subprocess(monkeypatch)
+    out = Tools(tmp_path, auto_approve=True).bash("git push --force")
+    assert len(calls) == 1
+    assert "ran" in out
+
+
+def test_confirm_approver_receives_command_and_reason(tmp_path, monkeypatch):
+    _record_subprocess(monkeypatch)
+    seen = {}
+
+    def approver(command, reason):
+        seen["command"] = command
+        seen["reason"] = reason
+        return True
+
+    Tools(tmp_path, approver=approver).bash("git reset --hard")
+    assert seen["command"] == "git reset --hard"
+    assert seen["reason"]  # a non-empty, human-readable reason was passed through
+
+
+def test_bash_cwd_still_pinned_to_project_root(tmp_path):
+    # Path-confinement context from v0.02.1 must not regress: cwd is the root.
+    (tmp_path / "marker.txt").write_text("x", encoding="utf-8")
+    out = Tools(tmp_path).bash("ls" if os.name != "nt" else "dir /b")
+    assert "marker.txt" in out

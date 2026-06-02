@@ -117,14 +117,22 @@ def run(
     role: str = typer.Option(
         "hands", "--role", help="Which model role drives the loop (single role)."
     ),
+    auto_approve: bool = typer.Option(
+        False,
+        "--auto-approve",
+        "-y",
+        help="Auto-approve CONFIRM-category commands (BLOCKED stays refused).",
+    ),
 ) -> None:
     """Run the single-model agent loop against a goal, streaming each step."""
     cfg = load_models()
     ledger = Ledger()
 
+    approve_note = "auto-approve" if auto_approve else "interactive approval"
     console.print(
         Panel(
-            f"[bold]{goal}[/bold]\nroot={root}  role={role}  max-steps={max_steps}",
+            f"[bold]{goal}[/bold]\nroot={root}  role={role}  max-steps={max_steps}  "
+            f"bash policy={approve_note}",
             title="Relay run",
             border_style="cyan",
         )
@@ -139,6 +147,8 @@ def run(
             models=cfg,
             ledger=ledger,
             on_step=_print_step,
+            approver=None if auto_approve else _interactive_approver,
+            auto_approve=auto_approve,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         console.print(
@@ -170,6 +180,18 @@ def run(
     _print_telemetry(ledger)
 
 
+def _interactive_approver(command: str, reason: str) -> bool:
+    """Pause the loop and ask the user to approve a CONFIRM-category command."""
+    console.print(
+        Panel(
+            f"[bold]Command:[/bold] {command}\n[bold]Why gated:[/bold] {reason}",
+            title="Approval required (CONFIRM)",
+            border_style="yellow",
+        )
+    )
+    return typer.confirm("Run this command?", default=False)
+
+
 def _print_step(step: StepResult) -> None:
     """Stream a single agent step to the console (action + result snippet)."""
     if step.kind == "parse_failure":
@@ -179,7 +201,12 @@ def _print_step(step: StepResult) -> None:
         return  # the final done line is printed by the caller
     console.print(f"[cyan]> {step.detail}[/cyan]")
     snippet = " ".join(step.observation.split())
-    if snippet:
+    if not snippet:
+        return
+    # Refusals/denials must read as such, not blend into ordinary output.
+    if snippet.startswith("BLOCKED by policy") or snippet.startswith("DENIED"):
+        console.print(f"  [bold red]{snippet[:200]}[/bold red]")
+    else:
         console.print(f"  [dim]{snippet[:200]}[/dim]")
 
 

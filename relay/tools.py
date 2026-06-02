@@ -1,11 +1,15 @@
 """The executor's hands: the tools the agent loop can invoke.
 
-Each tool resolves paths relative to a ``project_root`` and refuses to touch
-anything outside it. That path-confinement check is the ONLY safety here.
+Each filesystem tool resolves paths relative to a ``project_root`` and refuses
+to touch anything outside it (resolve-then-check; see ``_resolve``).
 
-NOTE: There is intentionally NO command denylist / confirmation policy in
-v0.02. ``bash`` runs commands as-is with cwd pinned to ``project_root``. The
-guardrail layer (denylist, approval prompts, sandboxing) is the v0.03 milestone.
+``bash`` additionally consults the command policy (``relay.policy``) before
+running anything: it refuses ``BLOCKED`` commands outright and gates
+``CONFIRM`` commands behind an approver callback. NOTE the honest limit -- the
+policy is a best-effort speed bump against obvious destructive commands, NOT a
+security sandbox. cwd-pinning + string classification do not contain an
+adversarial command (env expansion, command substitution, eval, etc. evade
+both). Real isolation (process/container sandboxing) is a later milestone (v0.95).
 """
 
 from __future__ import annotations
@@ -14,6 +18,9 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
+
+from relay.policy import BLOCKED, CONFIRM, classify
 
 
 class ToolError(Exception):
@@ -26,9 +33,19 @@ class PathEscapeError(ToolError):
 
 @dataclass
 class Tools:
-    """Filesystem + shell tools confined to ``project_root``."""
+    """Filesystem + shell tools confined to ``project_root``.
+
+    ``approver`` decides ``CONFIRM``-category bash commands: it receives
+    ``(command, reason)`` and returns True to run. When no approver is given and
+    ``auto_approve`` is False, ``CONFIRM`` commands are denied (the safe default
+    for non-interactive contexts). ``auto_approve`` approves ``CONFIRM`` commands
+    without asking -- but never affects ``BLOCKED`` commands, which are always
+    refused.
+    """
 
     project_root: Path
+    approver: Callable[[str, str], bool] | None = None
+    auto_approve: bool = False
 
     def __post_init__(self) -> None:
         self.project_root = Path(self.project_root)
@@ -119,11 +136,33 @@ class Tools:
         return f"wrote {path} ({len(content)} bytes, {lines} lines)"
 
     def bash(self, command: str) -> str:
-        """Run ``command`` with cwd = ``project_root``; combine stdout/stderr/exit.
+        """Run ``command`` (cwd pinned to ``project_root``) subject to the policy.
 
-        MINIMAL SAFETY ONLY: no denylist or confirmation policy here -- that is
-        the v0.03 guardrail milestone.
+        The verdict from :func:`relay.policy.classify` decides the outcome:
+          - ``BLOCKED`` -> never runs; returns a ``BLOCKED by policy: ...``
+            observation so the loop can route around it (no exception raised).
+          - ``CONFIRM`` -> consults the approver; denied -> returns a
+            ``DENIED ...`` observation and does not run.
+          - ``ALLOW`` (or an approved ``CONFIRM``) -> runs and returns combined
+            stdout/stderr/exit.
+
+        This is a best-effort policy, NOT a sandbox (see module docstring).
         """
+        verdict = classify(command)
+
+        if verdict.verdict == BLOCKED:
+            return f"BLOCKED by policy: {verdict.reason}"
+
+        if verdict.verdict == CONFIRM:
+            if self.auto_approve:
+                pass  # approved without asking
+            elif self.approver is not None:
+                if not self.approver(command, verdict.reason):
+                    return f"DENIED by user: {verdict.reason}"
+            else:
+                # Safe default for non-interactive contexts: deny, visibly.
+                return f"DENIED (no approver; safe default): {verdict.reason}"
+
         proc = subprocess.run(
             command,
             shell=True,

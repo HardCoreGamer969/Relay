@@ -44,7 +44,7 @@ Tools available to you:
 - list a directory's entries.
 - grep a regex pattern across a file or directory; you get matching lines with line numbers.
 - edit a file by writing its FULL new contents; the file is replaced and parent directories are created.
-- bash to run a shell command whose working directory is the project root; you get stdout, stderr, and the exit code.
+- bash to run a shell command whose working directory is the project root; you get stdout, stderr, and the exit code. Some destructive commands are refused by policy (you will see "BLOCKED by policy: ...") or require user approval (you will see "DENIED ..." if not approved) -- when a command is refused, adapt and find another way rather than re-emitting it verbatim.
 
 Express EVERY action using these EXACT text tags. Never describe an action in
 prose -- emit the tag. You may emit more than one tag, but prefer one step at a time:
@@ -137,6 +137,8 @@ def run_task(
     ledger: Ledger | None = None,
     client: Any | None = None,
     on_step: Callable[[StepResult], None] | None = None,
+    approver: Callable[[str, str], bool] | None = None,
+    auto_approve: bool = False,
 ) -> TaskResult:
     """Drive the single-model agent loop until ``<done>`` or ``max_steps``.
 
@@ -150,8 +152,12 @@ def run_task(
         client: OpenRouter client; injected in tests to stay network-free.
         on_step: Optional callback invoked with each :class:`StepResult` as it
             happens, so callers (e.g. the CLI) can stream progress live.
+        approver: Decides ``CONFIRM``-category bash commands ``(command, reason)
+            -> bool``. None + ``auto_approve`` False denies them (safe default).
+        auto_approve: Approve ``CONFIRM`` bash commands without asking. Never
+            affects ``BLOCKED`` commands, which are always refused.
     """
-    tools = Tools(Path(project_root))
+    tools = Tools(Path(project_root), approver=approver, auto_approve=auto_approve)
     ledger = ledger if ledger is not None else Ledger()
     result = TaskResult(goal=goal, ledger=ledger)
 

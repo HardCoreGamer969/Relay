@@ -15,10 +15,13 @@ from dotenv import load_dotenv
 # The two roles Relay knows about.
 ROLES = ("brain", "hands")
 
-# These defaults are intentionally generic OpenRouter slugs and are MEANT TO BE
-# OVERRIDDEN via RELAY_BRAIN_MODEL / RELAY_HANDS_MODEL. They exist only so the
-# CLI is runnable out of the box once an API key is supplied.
-DEFAULT_BRAIN_MODEL = "anthropic/claude-3.7-sonnet"
+# These defaults are MEANT TO BE OVERRIDDEN via RELAY_BRAIN_MODEL /
+# RELAY_HANDS_MODEL; they exist only so the CLI is runnable out of the box once
+# an API key is supplied. They must be *currently available* OpenRouter slugs --
+# a stronger model for the brain (planner, called rarely) and a cheap one for the
+# hands (executor, called per step). (The old anthropic/claude-3.7-sonnet default
+# now 404s on OpenRouter, so it was replaced.)
+DEFAULT_BRAIN_MODEL = "anthropic/claude-sonnet-4.5"
 DEFAULT_HANDS_MODEL = "anthropic/claude-3.5-haiku"
 
 

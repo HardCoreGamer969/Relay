@@ -14,25 +14,54 @@ through [OpenRouter](https://openrouter.ai), which is itself the model-agnostic
 layer: any OpenRouter model slug works for either role, and swapping a model is a
 config/env change, never a code change.
 
-## Status — v0.03 (the command-policy guardrail)
+## Architecture (brain + hands)
 
-Relay can drive a loop and *do* work (v0.02); v0.03 adds the seatbelt: a command
-policy that classifies every `bash` command before it runs — refusing the
-catastrophic ones outright and pausing the destructive-but-legitimate ones for
-approval — before the loop becomes more autonomous in later milestones.
+This is the milestone Relay is named for. `relay run` drives **two** models:
+
+- The **brain** (planner) reads the goal plus a shallow **project digest** and,
+  optionally after a few read-only `read`/`list`/`grep` investigations, emits an
+  ordered `<plan>` of concrete, executor-sized `<step>`s. The brain is
+  **read-only** — it cannot `edit` or `bash` (those attempts are refused).
+- The **hands** (executor) carry out each step **one at a time, in a narrow
+  context**: the current step instruction plus a one-line carry-over of what
+  earlier steps produced — *not* the full plan, *not* the brain's reasoning,
+  *not* prior steps' raw transcripts. That narrowness is the point: it is both
+  cheaper and often higher-quality (less to get distracted by).
+
+**Bounded interleaving.** The brain plans once up front and re-engages **only on
+escalation** — it does not review every successful step. A step *fails* when the
+executor emits `<blocked>`, exhausts its per-step budget, or can't follow the
+protocol; the harness then asks the brain to **replan** the remaining tail
+(keeping completed steps) or `<abort>`. Every loop is bounded
+(`max_executor_steps=12` per step, `max_escalations=3` replans, an optional
+overall budget) so a weak model can't burn money in a spiral.
+
+A planned run ends in one clear terminal status: `completed`, `planning_failed`,
+`aborted_by_brain`, `escalation_limit`, or `max_steps`. Telemetry is recorded
+per role, so the end-of-run table shows **brain vs hands** cost/tokens/time
+separately — the seed of the later model bake-off. Run the single-model loop
+instead with `relay run --solo hands`, or preview a plan before any writes with
+`--confirm-plan`.
+
+## Status — v0.04 (the brain/hands split)
+
+The two-role architecture above is now live: `relay run` plans with the brain and
+executes with the hands by default.
 
 **What exists now:**
 
 - `relay/client.py` — the one place that touches the OpenRouter (OpenAI-compatible) SDK.
 - `relay/config.py` — role → model mapping (`brain`, `hands`) resolved from env.
-- `relay/telemetry.py` — `CallRecord` / `Ledger` recording tokens, cost, latency, **and parse-failure count**.
+- `relay/telemetry.py` — `CallRecord` / `Ledger` recording tokens, cost, latency, and parse-failure count, **split per role**.
 - `relay/models.py` — `call_model(...)`, **the seam** everything else builds on.
-- `relay/protocol.py` — the text action protocol + a tolerant `parse()`.
-- `relay/policy.py` — **the command policy**: `classify()` → `BLOCKED` / `CONFIRM` / `ALLOW`.
-- `relay/tools.py` — `read` / `list` / `grep` / `edit` / `bash`; `bash` now consults the policy and an approver.
-- `relay/loop.py` — `run_task(...)`, the single-model agent loop (now threads the approver).
-- `relay/cli.py` — `relay models`, `relay demo`, and `relay run` (now with `--auto-approve`).
-- Network-free tests for the protocol, tools, loop, and policy.
+- `relay/protocol.py` — the text action protocol + a tolerant `parse()` (now also `<plan>`/`<step>`, `<abort>`, `<blocked>`).
+- `relay/policy.py` — the command policy: `classify()` → `BLOCKED` / `CONFIRM` / `ALLOW`.
+- `relay/tools.py` — `read` / `list` / `grep` / `edit` / `bash`; `bash` consults the policy and an approver.
+- `relay/loop.py` — `run_task(...)`, the single-model loop (kept for `--solo`; shares `execute_action`/`describe_action`).
+- `relay/planner.py` — **the brain**: `make_plan(...)` and `replan(...)` (read-only investigation + planning).
+- `relay/orchestrator.py` — **the two-role loop**: `run_planned(...)`, narrow executor context, bounded escalation.
+- `relay/cli.py` — `relay models`, `relay demo`, and `relay run` (two-role by default; `--solo`, `--confirm-plan`, `--auto-approve`).
+- Network-free tests for the protocol, tools, loop, policy, planner, and orchestrator.
 
 ### The text protocol (never native tool-calling)
 
@@ -92,10 +121,13 @@ safe default is to **deny**. When a command is refused, the model sees
 > deliberately not this one. Treat this layer as what it is: it blocks obvious
 > destructive commands and gates risky ones behind confirmation — nothing more.
 
-**Intentionally NOT here yet** (later milestones): the brain/hands planner split
-(Relay still runs **one** role only — v0.04), process/container **sandboxing** of
-`bash` (v0.95), a network-egress policy, and diff-based edits (edit is full-file
-write for now).
+**Intentionally NOT here yet** (later milestones): process/container **sandboxing**
+of `bash` (v0.95); plan snapshot / fork / time-travel — the plan here is in-memory
+and forward-only, so escalation replaces the remaining tail rather than branching
+(v0.2); dual-channel human/machine rendering and experience levels (v0.15); the
+run-matrix that sweeps model pairs for comparison (v0.1); a network-egress policy;
+and diff-based edits (edit is full-file write for now). The brain also does not
+review *successful* steps — re-engaging only on escalation is deliberate.
 
 ## Telemetry
 
@@ -124,34 +156,43 @@ relay models
 # Run the brain → hands seam once for a goal
 relay demo --goal "build a CLI todo app"
 
-# Drive the single-model agent loop against a goal (this one actually does work)
+# Drive the two-role brain + hands loop against a goal (the default)
 relay run --goal "create a file hello.txt containing the text: hi from relay"
-relay run -g "add a docstring to main.py" --root . --max-steps 20 --role hands
+relay run -g "add a hello route to a tiny flask app" --root .
+
+# Preview: pause for approval after the brain produces the plan, before executing
+relay run -g "refactor utils.py" --confirm-plan
+
+# Single-model loop (no planner), for comparison/debugging
+relay run -g "create hello.txt" --solo hands
 
 # Unattended: auto-approve CONFIRM-category bash commands (BLOCKED still refused)
 relay run -g "clean build artifacts" --auto-approve
 ```
 
-`relay demo` asks the **brain** for exactly one concrete next step, hands that
-step to the **hands** to describe how they'd carry it out, then prints a
-telemetry table (tokens / cost / time per role, with a total).
+`relay demo` asks the **brain** for one concrete next step and the **hands** how
+they'd carry it out (a one-shot taste of the seam), then prints telemetry.
 
-`relay run` drives the agent loop: the model emits an action, Relay executes it
-with the tools, streams the action and a result snippet to the console, and
-repeats until the model emits `<done>` (or it hits `--max-steps`). At the end it
-prints the telemetry table **plus the parse-failure count**. Options:
+`relay run` (default) runs the **two-role** loop: the brain plans, the hands
+execute each step in a narrow context, and the brain replans on escalation. It
+streams the plan, each step + its result, any escalation + revised plan, and a
+final terminal status, then prints the telemetry table **split brain vs hands**
+(plus the parse-failure count). Options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--goal` / `-g` | (required) | The goal to accomplish. |
 | `--root` | `.` | Directory the tools are confined to. |
-| `--max-steps` | `20` | Maximum model turns before stopping. |
-| `--role` | `hands` | Which single role drives the loop. |
+| `--solo <role>` | off | Run the single-model loop with that role instead of brain+hands. |
+| `--confirm-plan` | off | Pause for approval after the plan, before execution. |
 | `--auto-approve` / `-y` | off | Auto-approve `CONFIRM` bash commands (`BLOCKED` still refused). |
+| `--max-steps` | `20` | Max model turns (solo mode only). |
 
-Both commands fail gracefully with no API key, pointing you at `.env.example`.
-When a `CONFIRM` command comes up without `--auto-approve`, `relay run` pauses and
-asks you to approve or deny it (see [Command policy](#command-policy-the-guardrail)).
+`relay run` fails gracefully with no API key, pointing you at `.env.example`.
+When a `CONFIRM` command comes up without `--auto-approve`, it pauses and asks you
+to approve or deny (see [Command policy](#command-policy-the-guardrail)). If
+`--root` is a git repo with uncommitted changes, `relay run` prints a one-line
+nudge to commit first (git is the real undo net — `bash` isn't sandboxed).
 
 ## Swapping models
 

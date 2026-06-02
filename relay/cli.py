@@ -8,13 +8,16 @@ Every command prints telemetry, now naturally split brain vs hands.
 
 from __future__ import annotations
 
+import os
 import subprocess
+import time
 
 import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from relay.client import build_client
 from relay.config import load_models
 from relay.loop import (
     STATUS_COMPLETED,
@@ -32,6 +35,7 @@ from relay.orchestrator import (
     Event,
     run_planned,
 )
+from relay.runlog import append_record, build_record, default_log_path, load_records
 from relay.telemetry import Ledger
 
 app = typer.Typer(
@@ -142,25 +146,36 @@ def run(
     max_steps: int = typer.Option(
         20, "--max-steps", help="Max model turns (solo mode only)."
     ),
+    no_log: bool = typer.Option(
+        False, "--no-log", help="Skip persisting this run to .relay/runs.jsonl."
+    ),
 ) -> None:
     """Run the agent against a goal.
 
     Default: the two-role brain (planner) + hands (executor) architecture.
-    Use --solo <role> for the single-model loop.
+    Use --solo <role> for the single-model loop. Each run is persisted to
+    <root>/.relay/runs.jsonl (see `relay runs`) unless --no-log is given.
     """
     cfg = load_models()
     ledger = Ledger()
     approver = None if auto_approve else _interactive_approver
     _warn_if_dirty_git(root)
 
+    mode = "solo" if solo else "planned"
+    start = time.perf_counter()
     if solo:
-        _run_solo(goal, root, solo, max_steps, cfg, ledger, auto_approve, approver)
+        result = _run_solo(goal, root, solo, max_steps, cfg, ledger, auto_approve, approver)
     else:
-        _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan)
+        result = _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan)
+    wall_time_s = time.perf_counter() - start
+
     _print_telemetry(ledger)
+    if not no_log:
+        _save_run(goal=goal, mode=mode, result=result, ledger=ledger, cfg=cfg,
+                  wall_time_s=wall_time_s, root=root)
 
 
-def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver) -> None:
+def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver):
     """The v0.02 single-model loop, kept for comparison/debugging."""
     bash_policy = "auto-approve" if auto_approve else "interactive approval"
     console.print(
@@ -192,9 +207,10 @@ def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver) 
         )
     else:
         console.print(f"\n[yellow]stopped: {result.status}[/yellow]")
+    return result
 
 
-def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan) -> None:
+def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan):
     """The two-role brain/hands architecture (the default)."""
     bash_policy = "auto-approve" if auto_approve else "interactive approval"
     console.print(
@@ -216,6 +232,147 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan) 
         _print_run_error(exc)
         raise typer.Exit(code=1)
     _print_planned_status(result)
+    return result
+
+
+def _save_run(*, goal, mode, result, ledger, cfg, wall_time_s, root) -> None:
+    """Persist the finished run. Logging must NEVER crash a run -- warn and go on."""
+    try:
+        record = build_record(
+            goal=goal, mode=mode, result=result, ledger=ledger, models=cfg,
+            wall_time_s=wall_time_s,
+        )
+        path = default_log_path(root)
+        append_record(record, path)
+        console.print(f"[dim]saved run {record.run_id} -> {path}[/dim]")
+    except Exception as exc:  # noqa: BLE001 — the run result matters more than the log
+        console.print(f"[yellow]note:[/yellow] could not save run log: {exc}")
+
+
+@app.command()
+def runs(
+    limit: int = typer.Option(
+        10, "--limit", help="How many recent runs to show (most recent first)."
+    ),
+    root: str = typer.Option(
+        ".", "--root", help="Project root whose .relay/runs.jsonl to read."
+    ),
+) -> None:
+    """Show recently recorded runs from <root>/.relay/runs.jsonl."""
+    path = default_log_path(root)
+    records = load_records(path)
+    if not records:
+        console.print(f"[yellow]no runs recorded yet[/yellow] (looked in {path})")
+        return
+    console.print(_runs_table(records, limit))
+
+
+def _fmt_ts(iso: str) -> str:
+    """Shorten an ISO timestamp to 'YYYY-MM-DD HH:MM:SS' for display."""
+    text = (iso or "")[:19]
+    return text.replace("T", " ") if text else "-"
+
+
+def _runs_table(records, limit: int) -> Table:
+    """Build a rich Table of the most-recent ``limit`` runs (newest first)."""
+    recent = list(reversed(records))[: max(limit, 0)]
+    table = Table(title=f"Relay runs (showing {len(recent)} of {len(records)})")
+    table.add_column("When", style="dim")
+    table.add_column("Mode")
+    table.add_column("Models", overflow="fold")
+    # Fold long values rather than ellipsis-truncate: Rich's ellipsis mojibakes
+    # on the legacy Windows console (the v0.04 telemetry lesson).
+    table.add_column("Status", overflow="fold")
+    table.add_column("Cost (USD)", justify="right")
+    table.add_column("Tokens", justify="right")
+    table.add_column("Steps", justify="right")
+    for rec in recent:
+        roles = rec.roles if isinstance(rec.roles, dict) else {}
+        models_text = "\n".join(f"{role}: {model}" for role, model in roles.items()) or "-"
+        totals = rec.totals if isinstance(rec.totals, dict) else {}
+        cost = totals.get("cost_usd")
+        cost_text = "-" if cost is None else f"${cost:.6f}"
+        style = "green" if rec.status == "completed" else "yellow"
+        table.add_row(
+            _fmt_ts(rec.timestamp),
+            rec.mode,
+            models_text,
+            f"[{style}]{rec.status}[/{style}]",
+            cost_text,
+            str(totals.get("tokens", "")),
+            str(rec.steps),
+        )
+    return table
+
+
+@app.command()
+def doctor(
+    slugs: list[str] = typer.Argument(
+        None, help="Optional model slugs to probe ad-hoc; default checks the configured roles."
+    ),
+) -> None:
+    """Preflight: check that configured (or given) model slugs resolve on OpenRouter.
+
+    Each check is a minimal (max_tokens=1) live call. Exits non-zero if any slug
+    failed, so it is usable as a preflight in scripts -- catching the kind of
+    retired-slug 404 ("no endpoints found") that bit a run in v0.04.
+    """
+    cfg = load_models()  # loads .env so the key is visible
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        console.print(
+            "[red]OPENROUTER_API_KEY is not set[/red] - cannot probe models. "
+            "Copy .env.example to .env and add your key."
+        )
+        raise typer.Exit(code=1)
+
+    checks = [("arg", s) for s in slugs] if slugs else [("brain", cfg.brain), ("hands", cfg.hands)]
+    try:
+        client = build_client()
+    except Exception as exc:  # noqa: BLE001 — surface a clear message, don't traceback
+        console.print(f"[red]could not build the OpenRouter client:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    rows, all_ok = _run_doctor(checks, client)
+    _print_doctor_table(rows)
+    raise typer.Exit(code=0 if all_ok else 1)
+
+
+def _probe_model(client, slug: str) -> tuple[bool, str]:
+    """Minimal (max_tokens=1) call to check a slug resolves. Never raises."""
+    try:
+        client.chat.completions.create(
+            model=slug,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+            extra_body={"usage": {"include": True}},
+        )
+        return True, "resolved"
+    except Exception as exc:  # noqa: BLE001 — classify any failure as the note
+        text = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+        return False, text[:120]
+
+
+def _run_doctor(checks, client) -> tuple[list[dict], bool]:
+    """Probe each ``(label, slug)``; return the rows and whether all succeeded."""
+    rows: list[dict] = []
+    all_ok = True
+    for label, slug in checks:
+        ok, note = _probe_model(client, slug)
+        rows.append({"role": label, "model": slug, "status": "OK" if ok else "FAILED", "note": note})
+        all_ok = all_ok and ok
+    return rows, all_ok
+
+
+def _print_doctor_table(rows) -> None:
+    table = Table(title="Relay doctor: model slug preflight")
+    table.add_column("Role", style="bold")
+    table.add_column("Model slug", overflow="fold")
+    table.add_column("Status")
+    table.add_column("Note", overflow="fold")
+    for row in rows:
+        style = "green" if row["status"] == "OK" else "bold red"
+        table.add_row(row["role"], row["model"], f"[{style}]{row['status']}[/{style}]", row["note"])
+    console.print(table)
 
 
 def _confirm_plan_gate(plan) -> bool:

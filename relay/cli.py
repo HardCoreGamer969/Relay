@@ -1,8 +1,8 @@
 """The Relay CLI.
 
 ``relay models`` shows the role → model mapping; ``relay demo`` runs the
-brain → hands seam once, proving two different models can be reached through a
-single seam with telemetry on every call.
+brain → hands seam once; ``relay run`` drives the single-model agent loop
+against a goal. Every command prints telemetry (now including parse failures).
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from relay.config import load_models
+from relay.loop import StepResult, run_task
 from relay.models import call_model
 from relay.telemetry import Ledger
 
@@ -96,6 +97,79 @@ def demo(
     _print_telemetry(ledger)
 
 
+@app.command()
+def run(
+    goal: str = typer.Option(
+        ..., "--goal", "-g", help="The goal for the agent loop to accomplish."
+    ),
+    root: str = typer.Option(
+        ".", "--root", help="Project root the agent's tools are confined to."
+    ),
+    max_steps: int = typer.Option(
+        20, "--max-steps", help="Maximum model turns before stopping."
+    ),
+    role: str = typer.Option(
+        "hands", "--role", help="Which model role drives the loop (single role)."
+    ),
+) -> None:
+    """Run the single-model agent loop against a goal, streaming each step."""
+    cfg = load_models()
+    ledger = Ledger()
+
+    console.print(
+        Panel(
+            f"[bold]{goal}[/bold]\nroot={root}  role={role}  max-steps={max_steps}",
+            title="Relay run",
+            border_style="cyan",
+        )
+    )
+
+    try:
+        result = run_task(
+            goal,
+            root,
+            role=role,
+            max_steps=max_steps,
+            models=cfg,
+            ledger=ledger,
+            on_step=_print_step,
+        )
+    except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
+        console.print(
+            Panel(
+                f"[red]Run failed:[/red] {exc}\n\n"
+                "Relay reaches every model through OpenRouter. Make sure "
+                "[bold]OPENROUTER_API_KEY[/bold] is set - copy "
+                "[bold].env.example[/bold] to [bold].env[/bold] and add your key.",
+                title="Relay run: error",
+                border_style="red",
+            )
+        )
+        raise typer.Exit(code=1)
+
+    if result.done:
+        console.print(f"\n[bold green]done:[/bold green] {result.done_summary}")
+    else:
+        console.print(
+            "\n[yellow]stopped without <done> (hit max-steps or consecutive "
+            "parse failures)[/yellow]"
+        )
+    _print_telemetry(ledger)
+
+
+def _print_step(step: StepResult) -> None:
+    """Stream a single agent step to the console (action + result snippet)."""
+    if step.kind == "parse_failure":
+        console.print(f"[red]! parse failure[/red] - {step.observation}")
+        return
+    if step.kind == "done":
+        return  # the final done line is printed by the caller
+    console.print(f"[cyan]> {step.detail}[/cyan]")
+    snippet = " ".join(step.observation.split())
+    if snippet:
+        console.print(f"  [dim]{snippet[:200]}[/dim]")
+
+
 def _print_telemetry(ledger: Ledger) -> None:
     """Render a per-role telemetry table with a totals line."""
     table = Table(title="Telemetry: tokens / cost / time")
@@ -132,6 +206,11 @@ def _print_telemetry(ledger: Ledger) -> None:
         style="bold",
     )
     console.print(table)
+
+    # Parse-failure rate is a first-class model-quality signal, not a log line.
+    pf = ledger.parse_failures
+    style = "bold red" if pf else "dim"
+    console.print(f"[{style}]parse failures: {pf}[/{style}]")
 
 
 if __name__ == "__main__":

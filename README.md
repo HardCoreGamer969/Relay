@@ -14,23 +14,51 @@ through [OpenRouter](https://openrouter.ai), which is itself the model-agnostic
 layer: any OpenRouter model slug works for either role, and swapping a model is a
 config/env change, never a code change.
 
-## Status — v0.01 (the model layer)
+## Status — v0.02 (tools + text protocol + single-model agent loop)
 
-This first milestone ships **only the model layer**: the single seam every later
-part of Relay is built on, plus telemetry on every call.
+This is the milestone where Relay stops *describing* work and starts *doing* it.
+A single model drives a loop: it emits actions as plain-text tags, Relay parses
+and executes them with real tools, feeds the results back, and repeats until the
+goal is met.
 
 **What exists now:**
 
 - `relay/client.py` — the one place that touches the OpenRouter (OpenAI-compatible) SDK.
 - `relay/config.py` — role → model mapping (`brain`, `hands`) resolved from env.
-- `relay/telemetry.py` — `CallRecord` / `Ledger` recording tokens, cost, and latency.
+- `relay/telemetry.py` — `CallRecord` / `Ledger` recording tokens, cost, latency, **and parse-failure count**.
 - `relay/models.py` — `call_model(...)`, **the seam** everything else builds on.
-- `relay/cli.py` — `relay models` and `relay demo`.
-- Network-free tests.
+- `relay/protocol.py` — the text action protocol + a tolerant `parse()`.
+- `relay/tools.py` — `read` / `list` / `grep` / `edit` / `bash`, confined to a project root.
+- `relay/loop.py` — `run_task(...)`, the single-model agent loop.
+- `relay/cli.py` — `relay models`, `relay demo`, and **`relay run`**.
+- Network-free tests for the protocol, tools, and loop.
 
-**Intentionally NOT here yet** (later milestones): tools, an agent loop, bash
-execution, file editing, guardrails, and any real planner/executor decomposition
-logic. The `demo` command calls each role exactly once — nothing more.
+### The text protocol (never native tool-calling)
+
+The model expresses actions as plain-text tags that Relay parses itself — it does
+**not** use any provider's function/tool-calling API. This is deliberate: it
+keeps *every* model (including ones with no function-calling support) in the
+comparison set. Supported tags:
+
+```text
+<thinking>...</thinking>                 optional; captured, not executed
+<read path="..."/>
+<list path="..."/>
+<grep pattern="..." path="..."/>
+<edit path="...">...full new file content...</edit>
+<bash>...command...</bash>
+<done>...short summary...</done>         ends the loop
+```
+
+A message with no valid action and no `<done>` is a **parse failure** — recorded
+in the ledger (parse-failure rate is a free model-quality signal) and nudged back
+on track, aborting cleanly after a few consecutive failures.
+
+**Intentionally NOT here yet** (later milestones): the brain/hands planner split
+(v0.02 runs **one** role only), diff-based edits (edit is full-file write for
+now), and any command guardrails — `bash` has **minimal safety only** (it refuses
+paths outside the project root, but has no command denylist or confirmation
+policy). That guardrail layer is v0.03.
 
 ## Telemetry
 
@@ -58,12 +86,29 @@ relay models
 
 # Run the brain → hands seam once for a goal
 relay demo --goal "build a CLI todo app"
+
+# Drive the single-model agent loop against a goal (this one actually does work)
+relay run --goal "create a file hello.txt containing the text: hi from relay"
+relay run -g "add a docstring to main.py" --root . --max-steps 20 --role hands
 ```
 
 `relay demo` asks the **brain** for exactly one concrete next step, hands that
 step to the **hands** to describe how they'd carry it out, then prints a
-telemetry table (tokens / cost / time per role, with a total). With no API key it
-fails gracefully and points you at `.env.example`.
+telemetry table (tokens / cost / time per role, with a total).
+
+`relay run` drives the agent loop: the model emits an action, Relay executes it
+with the tools, streams the action and a result snippet to the console, and
+repeats until the model emits `<done>` (or it hits `--max-steps`). At the end it
+prints the telemetry table **plus the parse-failure count**. Options:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--goal` / `-g` | (required) | The goal to accomplish. |
+| `--root` | `.` | Directory the tools are confined to. |
+| `--max-steps` | `20` | Maximum model turns before stopping. |
+| `--role` | `hands` | Which single role drives the loop. |
+
+Both commands fail gracefully with no API key, pointing you at `.env.example`.
 
 ## Swapping models
 

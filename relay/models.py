@@ -40,12 +40,38 @@ def _extract_tokens(usage: Any) -> tuple[int, int]:
     return int(prompt or 0), int(completion or 0)
 
 
+def _read_cost_field(usage: Any) -> Any:
+    """Find OpenRouter's ``cost`` in the usage block, trying real shapes in turn.
+
+    OpenRouter returns ``cost`` as an *extra* field. The ``openai`` SDK models
+    are pydantic v2 with ``extra="allow"``, so the value is surfaced through
+    ``model_extra`` and not necessarily as a first-class attribute. Try, in
+    order: a direct attribute, then ``model_extra``, then dict-style access.
+    """
+    if usage is None:
+        return None
+    # 1. direct attribute (if the SDK promoted it to a first-class field)
+    cost = getattr(usage, "cost", None)
+    if cost is not None:
+        return cost
+    # 2. pydantic v2 extra fields (openai SDK usage models allow extras)
+    model_extra = getattr(usage, "model_extra", None)
+    if isinstance(model_extra, dict):
+        cost = model_extra.get("cost")
+        if cost is not None:
+            return cost
+    # 3. plain mapping
+    if isinstance(usage, dict):
+        return usage.get("cost")
+    return None
+
+
 def _extract_cost(usage: Any) -> float | None:
-    """Read OpenRouter's returned per-generation cost.
+    """Read OpenRouter's real per-generation cost from the usage block.
 
     Guarded so pricing can never crash a run: any missing/odd value → None.
     """
-    cost = _get(usage, "cost")
+    cost = _read_cost_field(usage)
     if cost is None:
         return None
     try:

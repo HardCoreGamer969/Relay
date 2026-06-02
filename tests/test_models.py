@@ -46,6 +46,20 @@ class FakeClient:
         self.chat = SimpleNamespace(completions=FakeCompletions(response))
 
 
+class PydanticStyleUsage:
+    """Mimics a pydantic v2 usage model (``extra="allow"``), as the openai SDK
+    builds it: OpenRouter's extra ``cost`` lives in ``model_extra``, NOT as a
+    first-class attribute. This is the real response shape the v0.01 test missed.
+    """
+
+    def __init__(self, prompt_tokens, completion_tokens, extra):
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.total_tokens = prompt_tokens + completion_tokens
+        self.model_extra = dict(extra)
+        # deliberately NO top-level ``cost`` attribute
+
+
 def test_role_resolves_to_right_model_slug():
     cfg = ModelConfig(brain="vendor/brain-model", hands="vendor/hands-model")
     assert cfg.for_role("brain") == "vendor/brain-model"
@@ -115,3 +129,26 @@ def test_missing_cost_falls_back_to_none():
 
     assert ledger.records[0].cost_usd is None
     assert ledger.total_cost() is None
+
+
+def test_cost_is_read_from_model_extra_when_no_top_level_attribute():
+    """Locks in the REAL response shape: cost only in pydantic's model_extra."""
+    cfg = ModelConfig(brain="vendor/brain-model", hands="vendor/hands-model")
+    ledger = Ledger()
+
+    usage = PydanticStyleUsage(prompt_tokens=7, completion_tokens=3, extra={"cost": 0.00042})
+    # Sanity: there is genuinely no top-level .cost attribute to read.
+    assert getattr(usage, "cost", None) is None
+
+    message = SimpleNamespace(content="ok")
+    response = SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
+    client = FakeClient(response)
+
+    result = call_model(
+        "brain", [{"role": "user", "content": "hi"}], models=cfg, ledger=ledger, client=client
+    )
+
+    assert result.record.prompt_tokens == 7
+    assert result.record.completion_tokens == 3
+    assert result.record.cost_usd == pytest.approx(0.00042)
+    assert ledger.total_cost() == pytest.approx(0.00042)

@@ -9,7 +9,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from relay.config import ModelConfig
-from relay.loop import run_task
+from relay.loop import (
+    STATUS_COMPLETED,
+    STATUS_MAX_STEPS,
+    STATUS_PARSE_FAILURE_ABORT,
+    run_task,
+)
 from relay.telemetry import Ledger
 
 
@@ -65,6 +70,7 @@ def test_loop_edits_a_file_then_finishes(tmp_path):
         client=client,
     )
 
+    assert result.status == STATUS_COMPLETED
     assert result.done is True
     assert result.done_summary == "created hello.txt"
     assert (tmp_path / "hello.txt").read_text(encoding="utf-8") == "hi from relay"
@@ -99,10 +105,27 @@ def test_loop_aborts_after_consecutive_parse_failures(tmp_path):
         "noop", tmp_path, models=CFG, ledger=ledger, client=client, max_steps=10
     )
 
+    assert result.status == STATUS_PARSE_FAILURE_ABORT
     assert result.done is False
     # Aborts after 3 consecutive parse failures (only 3 model calls consumed).
     assert ledger.parse_failures == 3
     assert len(ledger.records) == 3
+
+
+def test_loop_stops_at_max_steps_without_done(tmp_path):
+    # The model keeps emitting valid actions but never declares <done>; the loop
+    # must terminate as STATUS_MAX_STEPS -- "merely slow", NOT a protocol failure.
+    ledger = Ledger()
+    client = ScriptedClient(['<list path="."/>'] * 5)
+
+    result = run_task(
+        "never finishes", tmp_path, models=CFG, ledger=ledger, client=client, max_steps=3
+    )
+
+    assert result.status == STATUS_MAX_STEPS
+    assert result.done is False
+    assert ledger.parse_failures == 0  # not a protocol failure -- it just ran out of turns
+    assert len(ledger.records) == 3  # exactly max_steps model calls
 
 
 def test_on_step_callback_streams_each_step(tmp_path):

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from relay.tools import PathEscapeError, ToolError, Tools
@@ -57,3 +59,36 @@ def test_path_escape_is_rejected(tmp_path):
 def test_read_missing_file_raises_tool_error(tmp_path):
     with pytest.raises(ToolError):
         Tools(tmp_path).read("does-not-exist.txt")
+
+
+def test_nested_path_inside_root_still_works(tmp_path):
+    # The escape guard must not over-tighten: a legitimate deep path is allowed.
+    tools = Tools(tmp_path)
+    tools.edit("sub/dir/file.txt", "deep content")
+    assert (tmp_path / "sub" / "dir" / "file.txt").read_text(encoding="utf-8") == "deep content"
+    assert tools.read("sub/dir/file.txt") == "deep content"
+
+
+def test_symlink_pointing_outside_root_is_rejected(tmp_path):
+    # A symlink that LIVES inside the root but POINTS outside it must be refused:
+    # resolve-then-check follows the link to its real (outside) target. A naive
+    # raw-string check for ".." would miss this.
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.txt"  # sibling of root -> outside the root
+    outside.write_text("secret", encoding="utf-8")
+
+    link = root / "link.txt"
+    try:
+        os.symlink(outside, link)
+    except (OSError, NotImplementedError, AttributeError):
+        pytest.skip("symlink creation not permitted on this platform")
+
+    tools = Tools(root)
+    with pytest.raises(PathEscapeError):
+        tools.read("link.txt")
+    with pytest.raises(PathEscapeError):
+        tools.edit("link.txt", "overwrite attempt")
+
+    # The outside file must be untouched by the refused edit.
+    assert outside.read_text(encoding="utf-8") == "secret"

@@ -13,7 +13,13 @@ from rich.panel import Panel
 from rich.table import Table
 
 from relay.config import load_models
-from relay.loop import StepResult, run_task
+from relay.loop import (
+    STATUS_COMPLETED,
+    STATUS_MAX_STEPS,
+    STATUS_PARSE_FAILURE_ABORT,
+    StepResult,
+    run_task,
+)
 from relay.models import call_model
 from relay.telemetry import Ledger
 
@@ -147,13 +153,20 @@ def run(
         )
         raise typer.Exit(code=1)
 
-    if result.done:
+    if result.status == STATUS_COMPLETED:
         console.print(f"\n[bold green]done:[/bold green] {result.done_summary}")
-    else:
+    elif result.status == STATUS_MAX_STEPS:
         console.print(
-            "\n[yellow]stopped without <done> (hit max-steps or consecutive "
-            "parse failures)[/yellow]"
+            f"\n[yellow]stopped: hit max-steps ({max_steps}) without <done> "
+            "(the model may just need more steps)[/yellow]"
         )
+    elif result.status == STATUS_PARSE_FAILURE_ABORT:
+        console.print(
+            "\n[bold red]aborted: too many consecutive parse failures - the model "
+            "could not drive the protocol[/bold red]"
+        )
+    else:  # defensive: unknown status should never silently look like success
+        console.print(f"\n[yellow]stopped: {result.status}[/yellow]")
     _print_telemetry(ledger)
 
 

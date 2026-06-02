@@ -34,10 +34,19 @@ class Tools:
         self.project_root = Path(self.project_root)
 
     def _resolve(self, path: str) -> Path:
-        """Resolve ``path`` against the root, refusing anything that escapes it."""
+        """Resolve ``path`` and refuse anything that escapes the project root.
+
+        Resolve-then-check: both the candidate and the root are resolved to
+        absolute real paths *first* -- ``Path.resolve()`` collapses ``..`` AND
+        follows symlinks -- and only then do we verify the candidate is inside
+        the root. Resolving before checking is what closes the symlink hole: a
+        symlink that sits inside the root but points outside it resolves to its
+        real (outside) target and is refused, whereas a raw-string check for
+        ``..`` would let it through and then read/edit/bash outside the root.
+        """
         root = self.project_root.resolve()
         target = (root / path).resolve()
-        if target != root and root not in target.parents:
+        if not target.is_relative_to(root):
             raise PathEscapeError(
                 f"path {path!r} resolves outside the project root and was refused"
             )

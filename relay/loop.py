@@ -25,6 +25,14 @@ from relay.tools import ToolError, Tools
 # How many consecutive parse failures to tolerate before aborting the run.
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
 
+# The three distinct ways a run can end. Kept distinct because "died on the
+# protocol" vs "merely ran out of turns" is the difference between a model that
+# *can't* drive Relay and one that just needs more steps -- they must not look
+# the same in the run-matrix later.
+STATUS_COMPLETED = "completed"  # the model emitted <done>
+STATUS_MAX_STEPS = "max_steps"  # ran out of turns without <done>
+STATUS_PARSE_FAILURE_ABORT = "parse_failure_abort"  # hit consecutive-parse-failure limit
+
 SYSTEM_PROMPT = """\
 You are Relay, an autonomous coding agent working inside a single project directory.
 
@@ -70,9 +78,16 @@ class TaskResult:
 
     goal: str
     steps: list[StepResult] = field(default_factory=list)
-    done: bool = False
+    # Terminal state. Defaults to ``max_steps`` -- the state a run is in if it
+    # falls out of the loop having neither finished nor aborted.
+    status: str = STATUS_MAX_STEPS
     done_summary: str | None = None
     ledger: Ledger | None = None
+
+    @property
+    def done(self) -> bool:
+        """Back-compat: True iff the run completed by emitting ``<done>``."""
+        return self.status == STATUS_COMPLETED
 
 
 def _describe(action: Action) -> str:
@@ -166,6 +181,7 @@ def run_task(
             snippet = " ".join(reply.split())[:200]
             emit(StepResult(kind="parse_failure", detail="no valid action", observation=snippet))
             if consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
+                result.status = STATUS_PARSE_FAILURE_ABORT
                 break  # abort cleanly
             messages.append(
                 {
@@ -184,7 +200,7 @@ def run_task(
         observations: list[str] = []
         for action in parsed.actions:
             if action.kind == "done":
-                result.done = True
+                result.status = STATUS_COMPLETED
                 result.done_summary = action.content or ""
                 emit(StepResult(kind="done", detail=_describe(action), observation=""))
                 break

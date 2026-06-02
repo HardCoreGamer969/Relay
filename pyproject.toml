@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "relay-cli"
+version = "0.0.1"
+description = "Relay — a planner/executor coding agent built on a model-agnostic OpenRouter seam."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Relay" }]
+keywords = ["openrouter", "llm", "coding-agent", "planner-executor"]
+dependencies = [
+    "openai",
+    "typer",
+    "rich",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+# The brand is "Relay" and the CLI command is `relay`. The PyPI distribution
+# name is `relay-cli` because the bare `relay` name is taken on the registries.
+[project.scripts]
+relay = "relay.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["relay"]

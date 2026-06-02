@@ -9,6 +9,10 @@
 - v0.03 adds the command-policy guardrail: ``bash`` commands are classified
   (``BLOCKED`` / ``CONFIRM`` / ``ALLOW``) and gated behind approval. It is a
   best-effort speed bump, NOT a security sandbox (real isolation is v0.95).
+- v0.04 adds the two-role architecture Relay is named for: a brain (planner)
+  plans the ordered work up front and the hands (executor) carry out each step
+  in a narrow context, with the brain re-engaging only on escalation
+  (``run_planned``). The single-model ``run_task`` is kept for comparison.
 """
 
 from __future__ import annotations
@@ -16,12 +20,14 @@ from __future__ import annotations
 from relay.config import ModelConfig, load_models
 from relay.loop import StepResult, TaskResult, run_task
 from relay.models import ModelResult, call_model
+from relay.orchestrator import Event, PlannedTaskResult, run_planned
+from relay.planner import Plan, PlanStep, make_plan, project_digest, replan
 from relay.policy import ALLOW, BLOCKED, CONFIRM, PolicyResult, classify
 from relay.protocol import Action, ParseResult, parse
 from relay.telemetry import CallRecord, Ledger
 from relay.tools import PathEscapeError, ToolError, Tools
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 __all__ = [
     # v0.01 -- model layer
@@ -47,5 +53,14 @@ __all__ = [
     "BLOCKED",
     "CONFIRM",
     "ALLOW",
+    # v0.04 -- brain/hands orchestration
+    "run_planned",
+    "PlannedTaskResult",
+    "Event",
+    "make_plan",
+    "replan",
+    "Plan",
+    "PlanStep",
+    "project_digest",
     "__version__",
 ]

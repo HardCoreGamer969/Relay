@@ -52,10 +52,18 @@ class Ledger:
     """Collects :class:`CallRecord`s and aggregates them."""
 
     records: list[CallRecord] = field(default_factory=list)
+    # Count of model messages that contained no valid action (a first-class
+    # model-quality signal: parse-failure rate, surfaced in the summary output).
+    parse_failures: int = 0
 
     def add(self, record: CallRecord) -> CallRecord:
         self.records.append(record)
         return record
+
+    def record_parse_failure(self) -> int:
+        """Increment and return the running parse-failure count."""
+        self.parse_failures += 1
+        return self.parse_failures
 
     def total_cost(self) -> float | None:
         """Sum of known costs, or None if no call reported a cost."""

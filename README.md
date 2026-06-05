@@ -43,14 +43,14 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.06 (plan-memory substrate)
+## Status — v0.07 (the autonomous, learning loop)
 
-The two-role architecture (v0.04) is live and runs are persisted (v0.05). v0.06
-adds the substrate for an upcoming autonomous, *learning* planner loop: a
-within-run **plan memory** store that is **context-window-aware**, so it works on
-any brain — from a 200K frontier model down to an 8K local one. (The autonomous
-loop that *reads* this memory is the next milestone; this milestone builds and
-proves only the store.)
+This completes the v0.06 pair into the capability Relay was built toward: an
+**autonomous planner↔executor loop**. The brain plans, then *talks to the
+executor itself* — supervising its output, answering its questions when it
+legitimately can, escalating to you only for genuine product decisions, learning
+into within-run memory, and evolving the plan from what it learns. The human is
+no longer the wire between planner and executor.
 
 **What exists now:**
 
@@ -58,17 +58,17 @@ proves only the store.)
 - `relay/config.py` — role → model mapping (`brain`, `hands`) resolved from env.
 - `relay/telemetry.py` — `CallRecord` / `Ledger` recording tokens, cost, latency, and parse-failure count, **split per role**.
 - `relay/models.py` — `call_model(...)`, **the seam** everything else builds on.
-- `relay/protocol.py` — the text action protocol + a tolerant `parse()` (`<plan>`/`<step>`, `<abort>`, `<blocked>`).
+- `relay/protocol.py` — the text action protocol + a tolerant `parse()` (`<plan>`/`<step>`, `<abort>`, `<blocked>`, `<question>`).
 - `relay/policy.py` — the command policy: `classify()` → `BLOCKED` / `CONFIRM` / `ALLOW`.
 - `relay/tools.py` — `read` / `list` / `grep` / `edit` / `bash`; `bash` consults the policy and an approver.
 - `relay/loop.py` — `run_task(...)`, the single-model loop (kept for `--solo`).
-- `relay/planner.py` — **the brain**: `make_plan(...)` and `replan(...)`.
-- `relay/orchestrator.py` — **the two-role loop**: `run_planned(...)`, narrow executor context, bounded escalation.
-- `relay/runlog.py` — **durable run records**: `RunRecord` + `build_record` / `append_record` / `load_records` (JSONL).
 - `relay/memory.py` — **plan memory**: `PlanMemory` of dual-fidelity `MemoryEntry` values, budget-bounded `relevant(...)`, compress-not-truncate `compacted_context(...)`.
 - `relay/context.py` — **context-window awareness**: `resolve_context_window(...)` (override → OpenRouter metadata → local probe → default).
-- `relay/cli.py` — `relay models`, `relay demo`, `relay run`, `relay runs`, and `relay doctor` (now reports the resolved brain window).
-- Network-free tests for the protocol, tools, loop, policy, planner, orchestrator, run log, CLI, memory, and context.
+- `relay/planner.py` — **the brain**: `make_plan` / `replan` / `evolve_plan`, plus `review_step` (supervise) and `answer_or_escalate` (answer-vs-escalate).
+- `relay/orchestrator.py` — **the autonomous loop**: `run_planned(...)` threads plan memory, supervises at step boundaries, resolves executor questions, and evolves the plan.
+- `relay/runlog.py` — **durable run records**: `RunRecord` + `build_record` / `append_record` / `load_records` (JSONL).
+- `relay/cli.py` — `relay models`, `relay demo`, `relay run`, `relay runs`, and `relay doctor`.
+- Network-free tests across the whole stack (protocol, tools, loop, policy, planner, orchestrator, run log, CLI, memory, context).
 
 ## Plan memory (within-run)
 
@@ -76,8 +76,8 @@ Plan memory is the brain's **within-run knowledge** — facts it discovered,
 decisions it made (with rationale), user confirmations, and dead ends —
 accumulated as a run progresses and discarded when the run ends. It is reasoning
 state, **not** telemetry: it is in-process only and never touches `runs.jsonl`.
-(The autonomous loop that reads it lands in the next milestone; v0.06 is just the
-store and its window adaptivity.)
+The autonomous loop (below) reads it window-aware when planning, supervising,
+answering, and deciding to escalate, and writes to it as it learns.
 
 Each `MemoryEntry` is **dual-fidelity** — a precise `detail` (for the brain and
 executors) and a plain `summary` (for humans) — plus `kind`
@@ -121,6 +121,37 @@ never crashes a run (a failed step falls through):
 `relay doctor` prints the resolved window and its source
 (`override` / `openrouter` / `local:<runtime>` / `default`).
 
+## The autonomous loop
+
+`relay run` drives an autonomous planner↔executor loop — the brain relays to the
+executor itself instead of a human doing it:
+
+- **Selective supervision (default on).** The brain reviews at **step boundaries**
+  (and on anomalies), not on every executor action — one `review_step` call per
+  step → `accept` / `follow_up` (a bounded corrective hand-back) / `revise_plan`.
+  Supervision costs brain calls; it's a measurable tradeoff you can disable with
+  `--no-supervise`.
+- **Answer vs. escalate (the sharp edge).** When the executor emits a
+  `<question>`, the brain makes an explicit, **logged** classification: *can I
+  answer this from the code + memory (technical), or is it a genuine product
+  decision for the user?* It answers itself when it legitimately can, and
+  **leans to escalate when unsure** — a needless escalation is a mild annoyance,
+  but a wrong self-answer silently builds the wrong thing. Escalations go to the
+  `user_decision` seam (an interactive prompt in the CLI). With no seam available
+  the run stops as `unresolved_escalation` rather than **guessing**.
+- **Learns + evolves.** The brain writes what it learns to plan memory
+  (step outcomes → `fact`, self-answers/reviews → `decision`, user resolutions →
+  `confirmation`, dead ends → `dead_end`, each with provenance + dual form) and
+  evolves the remaining plan (`evolve_plan`) when learning warrants it. All loops
+  are bounded (`max_followups_per_step`, `max_plan_revisions`, `max_escalations`,
+  `max_total_steps`).
+- **Everything is an event.** `executor_question`, `brain_self_answered`,
+  `brain_escalated`, `user_decided`, `step_reviewed`, `plan_revised`,
+  `memory_write` stream to the console so the brain↔executor exchange is visible.
+
+> Product decisions are **never** auto-answered. `--auto-approve` only
+> auto-approves `CONFIRM` bash commands; it does not answer escalated questions.
+
 ### The text protocol (never native tool-calling)
 
 The model expresses actions as plain-text tags that Relay parses itself — it does
@@ -135,7 +166,11 @@ comparison set. Supported tags:
 <grep pattern="..." path="..."/>
 <edit path="...">...full new file content...</edit>
 <bash>...command...</bash>
-<done>...short summary...</done>         ends the loop
+<question>...</question>                  executor: needs info to proceed (brain answers/escalates)
+<done>...short summary...</done>         ends the (sub)step
+<plan><step>...</step>...</plan>         brain: the ordered plan
+<abort>reason</abort>                    brain: goal unreachable
+<blocked>reason</blocked>                executor: stuck on this step
 ```
 
 A message with no valid action and no `<done>` is a **parse failure** — recorded

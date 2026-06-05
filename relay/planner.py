@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from relay.config import ModelConfig
+from relay.config import ModelConfig, assumption_directive
 from relay.context import DEFAULT_CONTEXT_WINDOW
 from relay.loop import describe_action, execute_action
 from relay.memory import PlanMemory, memory_budget
@@ -526,12 +526,16 @@ def answer_or_escalate(
     client: Any | None = None,
     memory_budget_tokens: int = _DEFAULT_MEMORY_BUDGET,
     brain_role: str = "brain",
+    assumption_level: str = "auto",
 ) -> Resolution:
     """Classify an executor question: self_answer (technical) or escalate (product).
 
     Reads a window-aware memory slice so self-answers stay consistent with earlier
-    decisions. Biased to ``escalate`` when unsure (an unparseable/ambiguous reply
-    escalates), because a wrong self-answer silently builds the wrong thing.
+    decisions. The **assumption dial** (``assumption_level``) biases the
+    self-answer-vs-escalate threshold globally: a low dial assumes more (escalates
+    rarely), a high dial asks more, ``auto`` is the brain's normal-mode judgment.
+    Still biased to ``escalate`` when the reply is unparseable/ambiguous, because a
+    wrong self-answer silently builds the wrong thing.
     """
     mem_ctx = _memory_context(
         memory, question, memory_budget_tokens, client=client, models=models, ledger=ledger
@@ -539,6 +543,7 @@ def answer_or_escalate(
     memory_block = (
         f"Relevant memory (facts/decisions already established):\n{mem_ctx}\n\n" if mem_ctx else ""
     )
+    system = f"{_ANSWER_SYSTEM}\n{assumption_directive(assumption_level)}"
     user = (
         f"Goal: {goal}\n\n"
         f"Current step: [{step.index}] {step.instruction}\n\n"
@@ -548,7 +553,7 @@ def answer_or_escalate(
     )
     reply = call_model(
         brain_role,
-        [{"role": "system", "content": _ANSWER_SYSTEM}, {"role": "user", "content": user}],
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
         models=models,
         ledger=ledger,
         client=client,

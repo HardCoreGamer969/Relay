@@ -272,3 +272,49 @@ def test_evolve_plan_abort_returns_none(monkeypatch):
     monkeypatch.setattr(planner_mod, "call_model", _FakeBrain("<abort>cannot continue</abort>"))
     revised = evolve_plan("g", Plan.from_instructions(["x"]), "r", PlanMemory(), models=CFG, client=object())
     assert revised is None
+
+
+# --- v0.08: the assumption dial biases answer_or_escalate -------------------
+
+
+class _DialHonoringBrain:
+    """Simulates a model that obeys the dial: low dial -> self_answer (assume),
+    high dial -> escalate (ask). Lets us prove the dial reaches the prompt AND
+    changes the decision, network-free."""
+
+    def __init__(self):
+        self.prompts = []
+
+    def __call__(self, role, messages, **kwargs):
+        prompt = " ".join(m["content"] for m in messages)
+        self.prompts.append(prompt)
+        if "ASSUMPTION DIAL = 1" in prompt:
+            text = "<decision>self_answer</decision><answer>assumed a sensible default</answer>"
+        elif "ASSUMPTION DIAL = 5" in prompt:
+            text = "<decision>escalate</decision><ask_user>which option do you want?</ask_user>"
+        else:
+            text = "<decision>self_answer</decision><answer>auto default</answer>"
+        return SimpleNamespace(text=text, record=None)
+
+
+def test_dial_threaded_into_answer_prompt(monkeypatch):
+    brain = _DialHonoringBrain()
+    monkeypatch.setattr(planner_mod, "call_model", brain)
+    plan = _one_step_plan()
+    answer_or_escalate("q?", "g", plan, plan.steps[0], PlanMemory(),
+                       models=CFG, client=object(), assumption_level="5")
+    assert "ASSUMPTION DIAL = 5" in brain.prompts[0]  # the dial reaches the prompt
+
+
+def test_dial_biases_answer_decision(monkeypatch):
+    monkeypatch.setattr(planner_mod, "call_model", _DialHonoringBrain())
+    plan = _one_step_plan()
+
+    low = answer_or_escalate("q?", "g", plan, plan.steps[0], PlanMemory(),
+                             models=CFG, client=object(), assumption_level="1")
+    high = answer_or_escalate("q?", "g", plan, plan.steps[0], PlanMemory(),
+                              models=CFG, client=object(), assumption_level="5")
+
+    assert low.kind == "self_answer"   # low dial -> the brain assumes
+    assert high.kind == "escalate"     # high dial -> the brain asks the user
+

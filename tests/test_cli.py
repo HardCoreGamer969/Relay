@@ -375,3 +375,70 @@ def test_confirm_plan_uses_one_round(tmp_path, monkeypatch):
 
     runner.invoke(app, ["run", "-g", "x", "--root", str(tmp_path), "--no-log", "--confirm-plan"])
     assert conv_kw["max_rounds"] == 1  # --confirm-plan is the degenerate 1-round case
+
+
+# --- v0.08(B): one continuous transcript CLI wiring ------------------------
+
+
+def test_run_threads_one_transcript_through_both_phases(tmp_path, monkeypatch):
+    from relay.conversation import ConversationResult
+    from relay.orchestrator import PlannedTaskResult
+    from relay.planner import Plan
+    from relay.telemetry import CallRecord
+
+    monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/brain", hands="vendor/hands"))
+    monkeypatch.setattr(cli, "_warn_if_dirty_git", lambda root: None)
+    seen = {}
+
+    def fake_conv(goal, root, **kwargs):
+        seen["conv"] = kwargs.get("transcript")
+        return ConversationResult(goal=goal, plan=Plan.from_instructions(["x"]), committed=True)
+
+    def fake_run(goal, root, **kwargs):
+        seen["run"] = kwargs.get("transcript")
+        kwargs["ledger"].add(CallRecord("brain", "vendor/brain", 1, 1, 0.0, 0.0))
+        return PlannedTaskResult(goal=goal, plan=Plan.from_instructions(["x"]), status="completed",
+                                 ledger=kwargs["ledger"])
+
+    monkeypatch.setattr(cli, "plan_conversationally", fake_conv)
+    monkeypatch.setattr(cli, "run_planned", fake_run)
+
+    result = runner.invoke(app, ["run", "-g", "x", "--root", str(tmp_path), "--no-log"])
+    assert result.exit_code == 0
+    # The CLI hands the SAME transcript object to the conversation and the loop, so
+    # an escalation continues the planning dialogue rather than starting fresh.
+    assert seen["conv"] is not None and seen["conv"] is seen["run"]
+
+
+def test_show_transcript_prints_compacted_thread(tmp_path, monkeypatch):
+    from rich.console import Console
+
+    from relay.conversation import ConversationResult
+    from relay.orchestrator import PlannedTaskResult
+    from relay.planner import Plan
+    from relay.telemetry import CallRecord
+    from relay.transcript import Transcript
+
+    monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/brain", hands="vendor/hands"))
+    monkeypatch.setattr(cli, "_warn_if_dirty_git", lambda root: None)
+    monkeypatch.setattr(cli, "console", Console(width=200, legacy_windows=False))  # no wrap
+
+    def fake_conv(goal, root, **kwargs):
+        return ConversationResult(goal=goal, plan=Plan.from_instructions(["x"]), committed=True)
+
+    def fake_run(goal, root, **kwargs):
+        kwargs["ledger"].add(CallRecord("brain", "vendor/brain", 1, 1, 0.0, 0.0))
+        compacted = Transcript()
+        compacted.record("brain", "proposal", "PROPOSAL_TEXT_MARKER")
+        compacted.record("user", "commit", "ok build it")
+        return PlannedTaskResult(goal=goal, plan=Plan.from_instructions(["x"]), status="completed",
+                                 ledger=kwargs["ledger"], transcript_compacted=compacted)
+
+    monkeypatch.setattr(cli, "plan_conversationally", fake_conv)
+    monkeypatch.setattr(cli, "run_planned", fake_run)
+
+    result = runner.invoke(app, ["run", "-g", "x", "--root", str(tmp_path), "--no-log", "--show-transcript"])
+    assert result.exit_code == 0
+    assert "Conversation thread" in result.output       # the scroll-back preview header
+    assert "PROPOSAL_TEXT_MARKER" in result.output      # turn text is shown
+    assert "proposal" in result.output and "commit" in result.output

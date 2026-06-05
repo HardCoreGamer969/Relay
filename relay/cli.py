@@ -41,6 +41,7 @@ from relay.orchestrator import (
 )
 from relay.runlog import append_record, build_record, default_log_path, load_records
 from relay.telemetry import Ledger
+from relay.transcript import Transcript
 
 app = typer.Typer(
     help="Relay - a planner/executor coding agent on a model-agnostic OpenRouter seam.",
@@ -159,6 +160,11 @@ def run(
         help="Assumption dial: 1 (assume freely) .. 5 (follow the letter) or 'auto'. "
         "Overrides RELAY_ASSUMPTION_LEVEL for this run.",
     ),
+    show_transcript: bool = typer.Option(
+        False, "--show-transcript",
+        help="After the run, print the (compacted) continuous conversation thread "
+        "-- the plain-CLI preview of scroll-back (the scrollable view is the TUI).",
+    ),
     no_log: bool = typer.Option(
         False, "--no-log", help="Skip persisting this run to .relay/runs.jsonl."
     ),
@@ -184,7 +190,7 @@ def run(
     else:
         result = _run_planned(
             goal, root, cfg, ledger, auto_approve, approver, confirm_plan,
-            supervise=not no_supervise, dial=dial,
+            supervise=not no_supervise, dial=dial, show_transcript=show_transcript,
         )
     wall_time_s = time.perf_counter() - start
 
@@ -230,8 +236,12 @@ def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver):
 
 
 def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, *,
-                 supervise=True, dial="auto"):
-    """Conversational planning -> commit -> the two-role autonomous loop."""
+                 supervise=True, dial="auto", show_transcript=False):
+    """Conversational planning -> commit -> the two-role autonomous loop.
+
+    Both phases share ONE transcript, so a mid-run escalation appears as the next
+    turn of the same conversation rather than a separate popup.
+    """
     bash_policy = "auto-approve" if auto_approve else "interactive approval"
     console.print(
         Panel(
@@ -243,13 +253,15 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
         )
     )
 
+    transcript = Transcript()  # the one continuous thread across planning + execution
+
     # 1. Plan as a conversation (--confirm-plan = the degenerate 1-round case).
     try:
         conversation = plan_conversationally(
             goal, root, models=cfg, ledger=ledger, client=None,
             assumption_level=dial, user_turn=_interactive_user_turn,
             max_rounds=1 if confirm_plan else DEFAULT_MAX_ROUNDS,
-            on_event=_print_conv_event,
+            on_event=_print_conv_event, transcript=transcript,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)
@@ -257,21 +269,25 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
 
     if not conversation.committed or conversation.plan is None or not conversation.plan.steps:
         console.print("\n[yellow]plan not committed; nothing executed[/yellow]")
-        return PlannedTaskResult(goal=goal, plan=conversation.plan, status=STATUS_DECLINED, ledger=ledger)
+        return PlannedTaskResult(goal=goal, plan=conversation.plan, status=STATUS_DECLINED,
+                                 ledger=ledger, transcript=transcript)
 
-    # 2. Execute the committed plan (the dial keeps biasing answer_or_escalate).
+    # 2. Execute the committed plan on the SAME thread (the dial keeps biasing
+    #    answer_or_escalate; escalations continue the conversation above).
     try:
         result = run_planned(
             goal, root, models=cfg, ledger=ledger, client=None,
             approver=approver, auto_approve=auto_approve,
             supervise=supervise, user_decision=_interactive_user_decision,
             assumption_level=dial, committed_plan=conversation.plan,
-            on_event=_print_event,
+            on_event=_print_event, transcript=transcript,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)
         raise typer.Exit(code=1)
     _print_planned_status(result)
+    if show_transcript:
+        _print_transcript(result.transcript_compacted or result.transcript or transcript)
     return result
 
 
@@ -300,20 +316,36 @@ def _print_conv_event(kind: str, message: str, payload: dict) -> None:
 
 
 def _interactive_user_decision(question: str) -> str:
-    """Escalation seam: put the brain's precise product question to the user.
+    """Escalation seam: the brain's product question as the NEXT TURN of the same
+    conversation -- not a differently-styled popup.
 
-    This is the temporary plain-text seam; the friendly conversational version is
-    the next milestone. Product decisions are NEVER auto-answered -- not even with
+    The brain phrased this as a continuation (it was handed the conversation so
+    far), so it is rendered in the same cyan "Conversation" style as the planning
+    dialogue. Product decisions are NEVER auto-answered -- not even with
     --auto-approve (that only covers CONFIRM bash commands).
     """
-    console.print(
-        Panel(
-            f"[bold]The agent needs a product decision:[/bold]\n{question}",
-            title="Decision required (escalated by the brain)",
-            border_style="magenta",
-        )
-    )
-    return typer.prompt("Your answer")
+    console.print(Panel(question, title="Conversation (the agent is continuing)", border_style="cyan"))
+    return typer.prompt("You")
+
+
+def _print_transcript(transcript) -> None:
+    """Print the (compacted) continuous conversation thread: the plain-CLI preview
+    of scroll-back. ASCII-safe; long turn text is folded, not ellipsis-truncated.
+    The scrollable interactive view is the TUI milestone."""
+    turns = getattr(transcript, "turns", None) or []
+    if not turns:
+        console.print("[dim](no conversation thread to show)[/dim]")
+        return
+    table = Table(title="Conversation thread (compacted preview)")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Who", style="bold")
+    table.add_column("Phase", style="cyan")
+    # Fold long turn text rather than ellipsis-truncate (the legacy-Windows lesson).
+    table.add_column("Said", overflow="fold")
+    for turn in turns:
+        who = "you" if turn.speaker == "user" else "brain"
+        table.add_row(str(turn.created_at), who, turn.phase, " ".join((turn.text or "").split()))
+    console.print(table)
 
 
 def _save_run(*, goal, mode, result, ledger, cfg, wall_time_s, root) -> None:

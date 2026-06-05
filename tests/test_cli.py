@@ -216,3 +216,75 @@ def test_run_survives_log_write_failure(tmp_path, monkeypatch):
     result = runner.invoke(app, ["run", "-g", "x", "--root", str(tmp_path)])
     assert result.exit_code == 0  # the run itself still succeeds
     assert "could not save run log" in result.output
+
+
+# --- v0.06: autonomous-loop CLI wiring -------------------------------------
+
+
+def _capture_run_planned(monkeypatch, *, status="completed", events=()):
+    """Patch run_planned to a network-free fake; capture its kwargs; emit events."""
+    from relay.orchestrator import Event, PlannedTaskResult
+    from relay.planner import Plan, PlanStep
+    from relay.telemetry import CallRecord
+
+    captured = {}
+    monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/brain", hands="vendor/hands"))
+    monkeypatch.setattr(cli, "_warn_if_dirty_git", lambda root: None)
+
+    def fake_run_planned(goal, root, **kwargs):
+        captured.update(kwargs)
+        on_event = kwargs.get("on_event")
+        if on_event is not None:
+            for kind, payload in events:
+                on_event(Event(kind, kind, payload))
+        ledger = kwargs["ledger"]
+        ledger.add(CallRecord("brain", "vendor/brain", 10, 5, 0.1, 0.001))
+        plan = Plan(steps=[PlanStep(0, "do a", status="done", outcome="did a")])
+        return PlannedTaskResult(goal=goal, plan=plan, status=status, ledger=ledger)
+
+    monkeypatch.setattr(cli, "run_planned", fake_run_planned)
+    return captured
+
+
+def test_run_supervision_on_by_default(tmp_path, monkeypatch):
+    captured = _capture_run_planned(monkeypatch)
+    result = runner.invoke(app, ["run", "-g", "x", "--root", str(tmp_path), "--no-log"])
+    assert result.exit_code == 0
+    assert captured["supervise"] is True
+    assert captured["user_decision"] is not None  # the escalation seam is wired
+
+
+def test_run_no_supervise_flag(tmp_path, monkeypatch):
+    captured = _capture_run_planned(monkeypatch)
+    result = runner.invoke(app, ["run", "-g", "x", "--root", str(tmp_path), "--no-log", "--no-supervise"])
+    assert result.exit_code == 0
+    assert captured["supervise"] is False
+
+
+def test_run_renders_brain_executor_events(tmp_path, monkeypatch):
+    events = [
+        ("executor_question", {"question": "which database should I use?"}),
+        ("brain_self_answered", {"question": "which database?", "answer": "use SQLite"}),
+        ("brain_escalated", {"question": "should we support OAuth?"}),
+        ("user_decided", {"answer": "yes, OAuth"}),
+        ("step_reviewed", {"verdict": "accept"}),
+        ("plan_revised", {"steps": ["new tail step"]}),
+        ("memory_write", {"kind": "fact", "summary": "did a thing"}),
+    ]
+    _capture_run_planned(monkeypatch, events=events)
+    result = runner.invoke(app, ["run", "-g", "x", "--root", str(tmp_path), "--no-log"])
+    assert result.exit_code == 0
+    out = result.output
+    assert "executor asks" in out and "which database should I use?" in out
+    assert "brain answers" in out and "use SQLite" in out  # the headline self-answer
+    assert "escalated to user" in out
+    assert "user decided" in out
+    assert "review: accept" in out
+    assert "memory +=" in out
+
+
+def test_run_surfaces_unresolved_escalation(tmp_path, monkeypatch):
+    _capture_run_planned(monkeypatch, status="unresolved_escalation")
+    result = runner.invoke(app, ["run", "-g", "x", "--root", str(tmp_path), "--no-log"])
+    assert result.exit_code == 0
+    assert "UNRESOLVED ESCALATION" in result.output

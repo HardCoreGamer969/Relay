@@ -33,6 +33,7 @@ from relay.orchestrator import (
     STATUS_DECLINED,
     STATUS_ESCALATION_LIMIT,
     STATUS_PLANNING_FAILED,
+    STATUS_UNRESOLVED_ESCALATION,
     Event,
     run_planned,
 )
@@ -147,15 +148,21 @@ def run(
     max_steps: int = typer.Option(
         20, "--max-steps", help="Max model turns (solo mode only)."
     ),
+    no_supervise: bool = typer.Option(
+        False, "--no-supervise",
+        help="Disable brain supervision (no step-boundary review calls).",
+    ),
     no_log: bool = typer.Option(
         False, "--no-log", help="Skip persisting this run to .relay/runs.jsonl."
     ),
 ) -> None:
     """Run the agent against a goal.
 
-    Default: the two-role brain (planner) + hands (executor) architecture.
-    Use --solo <role> for the single-model loop. Each run is persisted to
-    <root>/.relay/runs.jsonl (see `relay runs`) unless --no-log is given.
+    Default: the two-role brain (planner) + hands (executor) architecture. The
+    brain supervises at step boundaries, answers the executor's questions itself
+    when it can, and escalates product decisions to you. Use --solo <role> for
+    the single-model loop. Each run is persisted to <root>/.relay/runs.jsonl
+    (see `relay runs`) unless --no-log is given.
     """
     cfg = load_models()
     ledger = Ledger()
@@ -167,7 +174,9 @@ def run(
     if solo:
         result = _run_solo(goal, root, solo, max_steps, cfg, ledger, auto_approve, approver)
     else:
-        result = _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan)
+        result = _run_planned(
+            goal, root, cfg, ledger, auto_approve, approver, confirm_plan, supervise=not no_supervise
+        )
     wall_time_s = time.perf_counter() - start
 
     _print_telemetry(ledger)
@@ -211,13 +220,13 @@ def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver):
     return result
 
 
-def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan):
+def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, *, supervise=True):
     """The two-role brain/hands architecture (the default)."""
     bash_policy = "auto-approve" if auto_approve else "interactive approval"
     console.print(
         Panel(
             f"[bold]{goal}[/bold]\nroot={root}\nbrain={cfg.brain}\nhands={cfg.hands}\n"
-            f"bash policy={bash_policy}",
+            f"bash policy={bash_policy}  supervision={'on' if supervise else 'off'}",
             title="Relay run (brain + hands)",
             border_style="cyan",
         )
@@ -226,6 +235,7 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan):
         result = run_planned(
             goal, root, models=cfg, ledger=ledger, client=None,
             approver=approver, auto_approve=auto_approve,
+            supervise=supervise, user_decision=_interactive_user_decision,
             on_event=_print_event,
             plan_gate=_confirm_plan_gate if confirm_plan else None,
         )
@@ -234,6 +244,23 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan):
         raise typer.Exit(code=1)
     _print_planned_status(result)
     return result
+
+
+def _interactive_user_decision(question: str) -> str:
+    """Escalation seam: put the brain's precise product question to the user.
+
+    This is the temporary plain-text seam; the friendly conversational version is
+    the next milestone. Product decisions are NEVER auto-answered -- not even with
+    --auto-approve (that only covers CONFIRM bash commands).
+    """
+    console.print(
+        Panel(
+            f"[bold]The agent needs a product decision:[/bold]\n{question}",
+            title="Decision required (escalated by the brain)",
+            border_style="magenta",
+        )
+    )
+    return typer.prompt("Your answer")
 
 
 def _save_run(*, goal, mode, result, ledger, cfg, wall_time_s, root) -> None:
@@ -398,10 +425,11 @@ def _print_event(event: Event) -> None:
         steps = event.payload.get("steps", [])
         body = "\n".join(f"{i}. {s}" for i, s in enumerate(steps)) or "(no steps)"
         console.print(Panel(body, title="Plan (brain)", border_style="magenta"))
-    elif kind == "replanned":
+    elif kind in ("replanned", "plan_revised"):
         steps = event.payload.get("steps", [])
         body = "\n".join(f"- {s}" for s in steps) or "(no steps)"
-        console.print(Panel(body, title="Revised plan (brain)", border_style="magenta"))
+        title = "Revised plan (brain, after learning)" if kind == "plan_revised" else "Revised plan (brain)"
+        console.print(Panel(body, title=title, border_style="magenta"))
     elif kind == "brain_action":
         console.print(f"  [magenta]brain[/magenta] {event.message}")
     elif kind == "step_start":
@@ -419,6 +447,25 @@ def _print_event(event: Event) -> None:
                 console.print(f"    [dim]{observation[:200]}[/dim]")
     elif kind == "exec_parse_failure":
         console.print(f"  [red]! parse failure[/red] {event.payload.get('snippet', '')}")
+    elif kind == "executor_question":
+        question = " ".join((event.payload.get("question") or "").split())
+        console.print(f"  [yellow]? executor asks:[/yellow] {question[:200]}")
+    elif kind == "brain_self_answered":
+        # The headline behavior: the brain answers the executor itself.
+        answer = " ".join((event.payload.get("answer") or "").split())
+        console.print(f"  [green]brain answers:[/green] {answer[:200]}")
+    elif kind == "brain_escalated":
+        question = " ".join((event.payload.get("question") or "").split())
+        console.print(f"  [bold yellow]^ escalated to user:[/bold yellow] {question[:200]}")
+    elif kind == "user_decided":
+        answer = " ".join((event.payload.get("answer") or "").split())
+        console.print(f"  [bold green]user decided:[/bold green] {answer[:200]}")
+    elif kind == "step_reviewed":
+        verdict = event.payload.get("verdict", "")
+        color = {"accept": "green", "follow_up": "yellow", "revise_plan": "magenta"}.get(verdict, "white")
+        console.print(f"  [{color}]review: {verdict}[/{color}]")
+    elif kind == "memory_write":
+        console.print(f"    [dim]memory += [{event.payload.get('kind')}] {event.payload.get('summary')}[/dim]")
     elif kind == "step_done":
         console.print(f"  [green]done:[/green] {event.payload.get('outcome')}")
     elif kind == "step_failed":
@@ -432,13 +479,19 @@ def _print_planned_status(result) -> None:
     """Print the final terminal status of a planned run, distinctly per status."""
     status = result.status
     steps = len(result.plan.steps) if result.plan is not None else 0
+    revisions = getattr(result, "revisions", 0)
     if status == STATUS_COMPLETED:
         console.print(
             f"\n[bold green]COMPLETED[/bold green] {steps} step(s) done "
-            f"(escalations: {result.escalations})"
+            f"(escalations: {result.escalations}, plan revisions: {revisions})"
         )
     elif status == STATUS_PLANNING_FAILED:
         console.print("\n[bold red]PLANNING FAILED[/bold red] the brain produced no usable plan")
+    elif status == STATUS_UNRESOLVED_ESCALATION:
+        console.print(
+            "\n[bold red]UNRESOLVED ESCALATION[/bold red] a product decision was needed but "
+            "none could be obtained (no decision seam); nothing was guessed"
+        )
     elif status == STATUS_ABORTED_BY_BRAIN:
         console.print("\n[bold red]ABORTED BY BRAIN[/bold red] goal deemed unreachable")
     elif status == STATUS_ESCALATION_LIMIT:

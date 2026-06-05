@@ -26,12 +26,25 @@
   ``<question>``s itself or ESCALATES product decisions (``answer_or_escalate``),
   LEARNS into memory, and EVOLVES the plan (``evolve_plan``). The human is no
   longer in the middle of the loop.
+- v0.08 (A of B) makes planning a **conversation** (``plan_conversationally``):
+  the brain assesses scope, proposes or asks, the user reacts in plain language,
+  and on commit hands a ``Plan`` to ``run_planned``. The **assumption dial**
+  (``resolve_assumption_level``) is a user-owned global bias on every
+  assume-vs-ask decision -- the conversation AND ``answer_or_escalate``.
 """
 
 from __future__ import annotations
 
-from relay.config import ModelConfig, load_models
+from relay.config import (
+    ASSUMPTION_LEVELS,
+    DEFAULT_ASSUMPTION_LEVEL,
+    ModelConfig,
+    assumption_directive,
+    load_models,
+    resolve_assumption_level,
+)
 from relay.context import DEFAULT_CONTEXT_WINDOW, resolve_context_window
+from relay.conversation import ConversationResult, ScopeAssessment, plan_conversationally
 from relay.loop import StepResult, TaskResult, run_task
 from relay.memory import (
     MemoryEntry,
@@ -72,7 +85,7 @@ from relay.runlog import (
 from relay.telemetry import CallRecord, Ledger
 from relay.tools import PathEscapeError, ToolError, Tools
 
-__version__ = "0.0.7"
+__version__ = "0.0.8"
 
 __all__ = [
     # v0.01 -- model layer
@@ -129,5 +142,13 @@ __all__ = [
     "StepReview",
     "Resolution",
     "STATUS_UNRESOLVED_ESCALATION",
+    # v0.08 (A of B) -- conversational planning + the assumption dial
+    "plan_conversationally",
+    "ConversationResult",
+    "ScopeAssessment",
+    "resolve_assumption_level",
+    "assumption_directive",
+    "ASSUMPTION_LEVELS",
+    "DEFAULT_ASSUMPTION_LEVEL",
     "__version__",
 ]

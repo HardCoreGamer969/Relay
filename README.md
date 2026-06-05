@@ -43,19 +43,19 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.07 (the autonomous, learning loop)
+## Status — v0.08 A (conversational planning + the assumption dial)
 
-This completes the v0.06 pair into the capability Relay was built toward: an
-**autonomous planner↔executor loop**. The brain plans, then *talks to the
-executor itself* — supervising its output, answering its questions when it
-legitimately can, escalating to you only for genuine product decisions, learning
-into within-run memory, and evolving the plan from what it learns. The human is
-no longer the wire between planner and executor.
+Planning is now a **conversation**: the brain assesses the goal's scope, proposes
+or asks accordingly, you react in plain language, the brain revises, and only on
+commit does it hand off to the autonomous loop (v0.07). And a user-owned
+**assumption dial** biases *every* assume-vs-ask decision the brain makes — both
+the conversation and the autonomous loop. (This is part A of two; the
+continuous-during-execution transcript is part B; the TUI is later.)
 
 **What exists now:**
 
 - `relay/client.py` — the one place that touches the OpenRouter (OpenAI-compatible) SDK.
-- `relay/config.py` — role → model mapping (`brain`, `hands`) resolved from env.
+- `relay/config.py` — role → model mapping, **and the assumption dial** (`resolve_assumption_level`, `assumption_directive`).
 - `relay/telemetry.py` — `CallRecord` / `Ledger` recording tokens, cost, latency, and parse-failure count, **split per role**.
 - `relay/models.py` — `call_model(...)`, **the seam** everything else builds on.
 - `relay/protocol.py` — the text action protocol + a tolerant `parse()` (`<plan>`/`<step>`, `<abort>`, `<blocked>`, `<question>`).
@@ -64,11 +64,59 @@ no longer the wire between planner and executor.
 - `relay/loop.py` — `run_task(...)`, the single-model loop (kept for `--solo`).
 - `relay/memory.py` — **plan memory**: `PlanMemory` of dual-fidelity `MemoryEntry` values, budget-bounded `relevant(...)`, compress-not-truncate `compacted_context(...)`.
 - `relay/context.py` — **context-window awareness**: `resolve_context_window(...)` (override → OpenRouter metadata → local probe → default).
-- `relay/planner.py` — **the brain**: `make_plan` / `replan` / `evolve_plan`, plus `review_step` (supervise) and `answer_or_escalate` (answer-vs-escalate).
-- `relay/orchestrator.py` — **the autonomous loop**: `run_planned(...)` threads plan memory, supervises at step boundaries, resolves executor questions, and evolves the plan.
+- `relay/planner.py` — **the brain**: `make_plan` / `replan` / `evolve_plan`, `review_step` (supervise), `answer_or_escalate` (answer-vs-escalate, dial-biased).
+- `relay/conversation.py` — **conversational planning**: `plan_conversationally(...)` — scope assessment, posture, dual-fidelity proposal, free-form reactions, commit.
+- `relay/orchestrator.py` — **the autonomous loop**: `run_planned(...)` (now accepts a committed plan + the dial).
 - `relay/runlog.py` — **durable run records**: `RunRecord` + `build_record` / `append_record` / `load_records` (JSONL).
-- `relay/cli.py` — `relay models`, `relay demo`, `relay run`, `relay runs`, and `relay doctor`.
-- Network-free tests across the whole stack (protocol, tools, loop, policy, planner, orchestrator, run log, CLI, memory, context).
+- `relay/cli.py` — `relay models`, `relay demo`, `relay run` (conversational, `--assume`), `relay runs`, `relay doctor`.
+- Network-free tests across the whole stack (incl. conversation + the dial).
+
+## Conversational planning + the assumption dial
+
+`relay run` no longer plans in one shot — it plans *with you*:
+
+1. **Scope assessment (visible, logged).** The brain's first move judges how much
+   of the goal is consequential AND undetermined: `small` (self-contained),
+   `large` (forking), or `ambiguous` (can't tell which). Reading scope off a goal
+   string is error-prone ("website" spans three orders of magnitude), so it's an
+   explicit step, not a silent classifier.
+2. **Posture follows scope + the dial.** small → *propose-fast* (state a full plan,
+   assumptions exposed); large → *elicit-first* (ask the few highest-stakes,
+   genuinely-undetermined questions, then propose); ambiguous → ask *one* scoping
+   question first. Questions are restrained on purpose: only what is consequential
+   AND genuinely ambiguous AND something you can actually judge — the brain just
+   decides the noise ("retry 3 or 5?") and records it.
+3. **Free-form reaction loop.** You react in plain language ("make it dark mode,
+   drop the login"); the brain folds it into the plan and re-renders, until you
+   commit (or a round cap halts). On commit, the finalized plan hands to the
+   autonomous loop. `--confirm-plan` is the degenerate 1-round case.
+
+**Dual-fidelity is DERIVED, not parallel.** The plain plan you see and the precise
+executor spec are one artifact — the plain version is *derived from the exact
+steps*, never generated independently. If they were produced separately they would
+drift, and you'd approve a friendly sentence while a different reality got built.
+The consequential additions the brain made compiling vague intent ("make login
+simple" → "Google sign-in only, no passwords") are surfaced as assumptions to
+confirm.
+
+### The assumption dial (`RELAY_ASSUMPTION_LEVEL` / `--assume`)
+
+A single user-owned setting biasing how much the brain assumes vs. asks —
+threaded into **both** the planning conversation and the autonomous loop's
+`answer_or_escalate`, so you're asked consistently everywhere.
+
+| Level | Behavior |
+| --- | --- |
+| `1` | Super loose: assume almost everything, act on intent, ask almost nothing. |
+| `2`–`4` | Increasing caution between the extremes. |
+| `5` | Exact letter: assume almost nothing, follow instructions literally — but still surface genuine impossibilities/contradictions (e.g. "add this Python library" in a JS project). |
+| `auto` (default) | Normal mode: the brain decides per-question whether to assume or ask. |
+
+`auto` is its own mode (the threshold handed back to the brain), **not** a numeric
+midpoint. Honest note: level `1` deliberately weakens pre-execution oversight —
+you've chosen "build it, I'll react to the result," shifting the safety net from
+pre-confirmation onto correction-after-seeing. Relay honors that; it does not
+"protect" a level-1 user by asking anyway.
 
 ## Plan memory (within-run)
 

@@ -251,8 +251,11 @@ def compact_transcript(
     out = Transcript()
     out.add(Turn(id="", speaker="brain", phase="summary", text=narrative, created_at=0,
                  refs=[t.id for t in older]))
+    # Keep recent turns' ORIGINAL ids so a memory entry's provenance ("transcript:tN")
+    # still resolves against the compacted record (the summary turn refs the folded
+    # older ids). ``add`` preserves a non-empty id and only the ordinal is re-stamped.
     for turn in recent:
-        out.add(Turn(id="", speaker=turn.speaker, phase=turn.phase, text=turn.text,
+        out.add(Turn(id=turn.id, speaker=turn.speaker, phase=turn.phase, text=turn.text,
                      created_at=0, refs=list(turn.refs)))
     return out
 
@@ -305,7 +308,8 @@ def _narrate(
     if not turns:
         return ""
     rendered = "\n".join(_render_turn(t) for t in turns)
-    max_tokens = max(64, budget_tokens) if budget_tokens else 512
+    # Explicit None check (not truthiness): budget 0 must NOT fall back to 512.
+    max_tokens = max(64, budget_tokens) if budget_tokens is not None else 512
     try:
         result = call_model(
             "brain",
@@ -327,13 +331,18 @@ def _narrate(
     return _fit(text, budget_tokens)
 
 
-def _fallback_narrative(turns: list[Turn], *, note: str = "") -> str:
+def _fallback_narrative(turns: list[Turn], *, note: str = "", max_turns: int = 12) -> str:
     """A deterministic, still-readable narrative when the summarizer is unavailable.
 
     Keeps the older turns' content (more verbatim) and NOTES that the automatic
-    summary was unavailable -- the graceful-degradation contract.
+    summary was unavailable -- the graceful-degradation contract. Self-bounded
+    (caps how many turns it spells out) so it stays readable even with no token
+    budget to trim it; ``_narrate``'s ``_fit`` still applies when a budget is given.
     """
-    brief = "; ".join(f"{t.speaker} {t.phase}: {_one_line(t.text)}" for t in turns)
+    shown, omitted = turns[-max_turns:], max(0, len(turns) - max_turns)
+    brief = "; ".join(f"{t.speaker} {t.phase}: {_one_line(t.text)}" for t in shown)
+    if omitted:
+        brief = f"({omitted} earlier turn(s) omitted); " + brief
     prefix = f"[readable summary unavailable: {note}] " if note else ""
     return f"{prefix}Earlier in the conversation -- {brief}."
 

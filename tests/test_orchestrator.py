@@ -538,3 +538,25 @@ def test_assumption_level_threaded_into_answer(tmp_path):
     answer_call = _brain_calls(client)[1]
     prompt = " ".join(m["content"] for m in answer_call["messages"])
     assert "ASSUMPTION DIAL = 1" in prompt
+
+
+# --- v0.08(B): the conversation thread is closed on EVERY terminal path ------
+
+
+def test_planning_failed_still_closes_the_thread(tmp_path):
+    client = RoutedClient(brain=[], hands=[])
+    result = run_planned("g", tmp_path, models=CFG, client=client, committed_plan=Plan(steps=[]))
+    assert result.status == STATUS_PLANNING_FAILED
+    # Even on an early terminal path the thread is closed: a result turn + a
+    # compacted record exist, so a transcript consumer gets a uniform contract.
+    assert result.transcript_compacted is not None
+    assert any(t.phase == "result" for t in result.transcript.turns)
+
+
+def test_plan_gate_decline_still_closes_the_thread(tmp_path):
+    client = RoutedClient(brain=["<plan><step>x</step></plan>"], hands=[])
+    result = run_planned("g", tmp_path, models=CFG, client=client, plan_gate=lambda p: False)
+    assert result.status == "declined_by_user"
+    assert result.transcript_compacted is not None
+    assert any(t.phase == "result" for t in result.transcript.turns)
+    assert len(_hands_calls(client)) == 0  # decline still executes nothing

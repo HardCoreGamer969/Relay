@@ -320,9 +320,9 @@ def _interactive_user_decision(question: str) -> str:
     conversation -- not a differently-styled popup.
 
     The brain phrased this as a continuation (it was handed the conversation so
-    far), so it is rendered in the same cyan "Conversation" style as the planning
-    dialogue. Product decisions are NEVER auto-answered -- not even with
-    --auto-approve (that only covers CONFIRM bash commands).
+    far), so it is rendered in cyan to match the conversational tone rather than as
+    a separate magenta "decision required" popup. Product decisions are NEVER
+    auto-answered -- not even with --auto-approve (that only covers CONFIRM bash).
     """
     console.print(Panel(question, title="Conversation (the agent is continuing)", border_style="cyan"))
     return typer.prompt("You")

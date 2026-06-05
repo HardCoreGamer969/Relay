@@ -408,6 +408,19 @@ def run_planned(
         memory.remember(kind, detail, summary, provenance=provenance, tags=list(tags or []))
         emit("memory_write", f"{kind}: {summary}", {"kind": kind, "summary": summary, "provenance": provenance})
 
+    def finalize(plan_for_summary: Plan | None) -> PlannedTaskResult:
+        """Close the conversation thread on ANY terminal path: a deterministic
+        result turn (no model call), then the readable post-execution compaction.
+        Called once per run, so every outcome leaves a result turn + a compacted
+        record -- not just the run-to-completion path."""
+        transcript.record("brain", "result", _result_summary(result.status, plan_for_summary or Plan(steps=[])))
+        result.transcript_compacted = compact_transcript(
+            transcript, budget_tokens=mem_budget, client=client, models=models, ledger=ledger
+        )
+        emit("transcript_compacted", "transcript compacted to its readable form",
+             {"turns": len(result.transcript_compacted.turns)})
+        return result
+
     # --- Plan phase --------------------------------------------------------
     # A committed_plan (from the planning conversation) skips make_plan.
     if committed_plan is not None:
@@ -421,7 +434,7 @@ def run_planned(
     if plan is None or not plan.steps:
         result.status = STATUS_PLANNING_FAILED
         emit("status", "planning failed: the brain produced no usable plan", {"status": STATUS_PLANNING_FAILED})
-        return result
+        return finalize(plan)
 
     result.plan = plan
     emit("plan_created", f"plan: {len(plan.steps)} step(s)", {"steps": [s.instruction for s in plan.steps]})
@@ -429,7 +442,7 @@ def run_planned(
     if plan_gate is not None and not plan_gate(plan):
         result.status = STATUS_DECLINED
         emit("status", "plan declined by user before execution", {"status": STATUS_DECLINED})
-        return result
+        return finalize(plan)
 
     tools = Tools(Path(project_root), approver=approver, auto_approve=auto_approve)
 
@@ -645,10 +658,4 @@ def run_planned(
     # Post-execution: a high-level brain "here's where things ended" turn (composed
     # deterministically from the outcome -- no model call), then the readable
     # auto-compaction pass that yields the durable, scroll-back record.
-    transcript.record("brain", "result", _result_summary(result.status, plan))
-    result.transcript_compacted = compact_transcript(
-        transcript, budget_tokens=mem_budget, client=client, models=models, ledger=ledger
-    )
-    emit("transcript_compacted", "transcript compacted to its readable form",
-         {"turns": len(result.transcript_compacted.turns)})
-    return result
+    return finalize(plan)

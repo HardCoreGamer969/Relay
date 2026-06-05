@@ -157,6 +157,21 @@ def test_compaction_degrades_gracefully_on_summarizer_failure(monkeypatch):
     assert "todo app" in compacted.turns[0].text                  # kept more verbatim
 
 
+def test_compaction_preserves_recent_turn_ids(monkeypatch):
+    """A memory entry's provenance ("transcript:tN") must still resolve against the
+    compacted record, so recent verbatim turns keep their ORIGINAL ids."""
+    brain = _Brain()
+    monkeypatch.setattr(tr, "call_model", brain)
+    t = _long_transcript()
+    recent_ids = [x.id for x in t.turns[-3:]]
+    older_ids = [x.id for x in t.turns[:-3]]
+
+    compacted = compact_transcript(t, keep_recent=3, client=object())
+
+    assert [x.id for x in compacted.turns[1:]] == recent_ids   # recent ids preserved
+    assert compacted.turns[0].refs == older_ids                # summary refs the folded ids
+
+
 def test_compaction_does_not_use_memory_compacted_context(monkeypatch):
     """Structural guard: the transcript narrative must not be routed through plan
     memory's dense compactor (that would wreck human scroll-back)."""

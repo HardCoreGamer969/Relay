@@ -43,14 +43,17 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.08 A (conversational planning + the assumption dial)
+## Status — v0.08 B (the continuous transcript + compaction)
 
-Planning is now a **conversation**: the brain assesses the goal's scope, proposes
-or asks accordingly, you react in plain language, the brain revises, and only on
-commit does it hand off to the autonomous loop (v0.07). And a user-owned
-**assumption dial** biases *every* assume-vs-ask decision the brain makes — both
-the conversation and the autonomous loop. (This is part A of two; the
-continuous-during-execution transcript is part B; the TUI is later.)
+Planning is a **conversation** (v0.08 A) and a user-owned **assumption dial**
+biases *every* assume-vs-ask decision — both the conversation and the autonomous
+loop. Part B fuses the two "the brain is asking me something" modes into **one
+continuous transcript**: the planning dialogue and the mid-run escalations are
+turns in the same thread, so a product decision raised mid-run reads as a
+continuation of the conversation, not a context-less popup. Plan memory now
+**derives from** the transcript, and the transcript compacts toward *readability*
+(recent verbatim, older folded into a readable narrative). (The scrollable
+interactive scroll-back is the TUI milestone; here it's a plain-CLI preview.)
 
 **What exists now:**
 
@@ -65,11 +68,12 @@ continuous-during-execution transcript is part B; the TUI is later.)
 - `relay/memory.py` — **plan memory**: `PlanMemory` of dual-fidelity `MemoryEntry` values, budget-bounded `relevant(...)`, compress-not-truncate `compacted_context(...)`.
 - `relay/context.py` — **context-window awareness**: `resolve_context_window(...)` (override → OpenRouter metadata → local probe → default).
 - `relay/planner.py` — **the brain**: `make_plan` / `replan` / `evolve_plan`, `review_step` (supervise), `answer_or_escalate` (answer-vs-escalate, dial-biased).
-- `relay/conversation.py` — **conversational planning**: `plan_conversationally(...)` — scope assessment, posture, dual-fidelity proposal, free-form reactions, commit.
-- `relay/orchestrator.py` — **the autonomous loop**: `run_planned(...)` (now accepts a committed plan + the dial).
+- `relay/conversation.py` — **conversational planning**: `plan_conversationally(...)` — scope assessment, posture, dual-fidelity proposal, free-form reactions, commit; appends its turns to the shared transcript.
+- `relay/transcript.py` — **the continuous transcript**: `Transcript` of `Turn` values (the human-facing source of truth), `record_decision` (transcript-first, memory-derived), and readability-preserving compaction (`compact_transcript` / `render_for_brain`).
+- `relay/orchestrator.py` — **the autonomous loop**: `run_planned(...)` (committed plan + the dial + the shared transcript; escalations continue the thread).
 - `relay/runlog.py` — **durable run records**: `RunRecord` + `build_record` / `append_record` / `load_records` (JSONL).
-- `relay/cli.py` — `relay models`, `relay demo`, `relay run` (conversational, `--assume`), `relay runs`, `relay doctor`.
-- Network-free tests across the whole stack (incl. conversation + the dial).
+- `relay/cli.py` — `relay models`, `relay demo`, `relay run` (conversational, `--assume`, `--show-transcript`), `relay runs`, `relay doctor`.
+- Network-free tests across the whole stack (incl. conversation, the dial, and the continuous transcript).
 
 ## Conversational planning + the assumption dial
 
@@ -117,6 +121,45 @@ midpoint. Honest note: level `1` deliberately weakens pre-execution oversight �
 you've chosen "build it, I'll react to the result," shifting the safety net from
 pre-confirmation onto correction-after-seeing. Relay honors that; it does not
 "protect" a level-1 user by asking anyway.
+
+## The continuous transcript (one thread, planning → execution)
+
+Before this, you met the brain twice — once while planning, again (separately)
+when a decision escalated mid-run. Two popups, no shared memory of the
+conversation. Now there is **one `Transcript`**: an ordered, append-only thread of
+`Turn`s (`speaker`, `phase`, `text`, a monotonic `created_at`, optional `refs`)
+that spans the whole run. The planning proposal, your reactions, the commit, any
+mid-run escalation **and** your decision, and a closing result turn are all turns
+in the same thread — so a question raised mid-execution is just the next thing the
+brain says, phrased *as a continuation* ("earlier you said you wanted this
+simple, so…"). When composing an escalation the brain is handed a window-bounded
+slice of the recent thread, so it stays conversationally coherent.
+
+The transcript holds the **conversation**, not an execution log — granular tool
+calls stay in the event stream / `runs.jsonl`, never as turns.
+
+**Transcript-first, memory-derived.** There are now two stores that both compact,
+and they must not drift. The transcript is human-facing, chronological, and the
+**source of truth for what was said and decided**; plan memory is the brain's
+dense working extract. A user-facing decision is recorded to the transcript
+**first** (via `record_decision`), then derived into a linked `MemoryEntry` whose
+`provenance` points back at the turn (`transcript:<id>`). When the two disagree,
+the transcript wins and memory is what gets re-derived.
+
+**Compaction preserves readability.** The transcript must stay legible and bounded
+over a long run, so it compacts — but *not* with plan memory's dense
+`compacted_context` (that would wreck scroll-back). Instead, recent turns stay
+**verbatim** and older ones fold into a **readable narrative** ("Earlier: you
+asked for a todo app, the brain proposed a Flask backend, you changed auth to
+Google-only, then committed."). Brain reads are window-bounded to the resolved
+context window (`render_for_brain`); a post-execution pass compacts the thread to
+its durable readable form (`compact_transcript`). A failing summarizer degrades
+gracefully (keeps more verbatim, notes it) — it never crashes the run.
+
+`relay run --show-transcript` prints the compacted thread after a run — the
+plain-CLI preview of scroll-back. (The scrollable interactive view is the TUI
+milestone; the transcript is in-process for one run, but snapshot-shaped
+—`to_state()` / `from_state()`— so cross-session scroll-back is cheap to add.)
 
 ## Plan memory (within-run)
 

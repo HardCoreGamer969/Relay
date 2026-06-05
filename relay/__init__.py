@@ -31,6 +31,15 @@
   and on commit hands a ``Plan`` to ``run_planned``. The **assumption dial**
   (``resolve_assumption_level``) is a user-owned global bias on every
   assume-vs-ask decision -- the conversation AND ``answer_or_escalate``.
+- v0.08 (B of B) fuses planning and execution into ONE continuous **transcript**
+  (``Transcript`` of ``Turn`` values): the planning dialogue and the mid-run
+  escalations are turns in the same thread, so a product decision asked mid-run
+  reads as a continuation of the conversation, not a context-less popup. Plan
+  memory now DERIVES from the transcript (``record_decision`` is transcript-first,
+  the memory entry's provenance links back to the turn). The transcript compacts
+  toward **readability** (``compact_transcript`` / ``render_for_brain`` -- recent
+  verbatim, older folded into a readable narrative), distinct from plan memory's
+  dense compaction, window-bounded for brain reads, run as a post-execution pass.
 """
 
 from __future__ import annotations
@@ -84,8 +93,15 @@ from relay.runlog import (
 )
 from relay.telemetry import CallRecord, Ledger
 from relay.tools import PathEscapeError, ToolError, Tools
+from relay.transcript import (
+    Transcript,
+    Turn,
+    compact_transcript,
+    record_decision,
+    render_for_brain,
+)
 
-__version__ = "0.0.8"
+__version__ = "0.0.9"
 
 __all__ = [
     # v0.01 -- model layer
@@ -150,5 +166,11 @@ __all__ = [
     "assumption_directive",
     "ASSUMPTION_LEVELS",
     "DEFAULT_ASSUMPTION_LEVEL",
+    # v0.08 (B of B) -- the continuous transcript + readability compaction
+    "Transcript",
+    "Turn",
+    "record_decision",
+    "compact_transcript",
+    "render_for_brain",
     "__version__",
 ]

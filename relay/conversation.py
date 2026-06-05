@@ -41,6 +41,7 @@ from relay.models import call_model
 from relay.planner import MAX_PLAN_STEPS, Plan, project_digest
 from relay.protocol import parse
 from relay.telemetry import Ledger
+from relay.transcript import Transcript, record_decision
 
 DEFAULT_MAX_ROUNDS = 6
 MAX_ELICITATION_QUESTIONS = 3
@@ -136,6 +137,9 @@ class ConversationResult:
     rounds: int = 0
     questions_asked: int = 0  # scoping + elicitation questions put to the user
     events: list[dict] = field(default_factory=list)
+    # The continuous conversation thread (this planning dialogue's turns). The same
+    # object is handed to ``run_planned`` so a mid-run escalation continues it.
+    transcript: Transcript | None = None
 
 
 # --- small parse helpers ----------------------------------------------------
@@ -264,6 +268,7 @@ def plan_conversationally(
     max_rounds: int = DEFAULT_MAX_ROUNDS,
     brain_role: str = "brain",
     on_event: EventSink | None = None,
+    transcript: Transcript | None = None,
 ) -> ConversationResult:
     """Run the pre-execution planning conversation, returning a committed plan.
 
@@ -273,8 +278,15 @@ def plan_conversationally(
     free-form natural language -> fold + re-render -> repeat until commit or
     ``max_rounds`` (never loops forever). On commit, ``result.plan`` is the
     finalized :class:`~relay.planner.Plan` ready for ``run_planned``.
+
+    ``transcript`` is the ONE continuous conversation thread. The planning turns
+    (proposal, the user's reactions, the commit) are appended here; the SAME object
+    is then handed to ``run_planned`` so a mid-run escalation is the next turn of
+    this dialogue, not a separate popup. A commit is recorded transcript-first via
+    :func:`~relay.transcript.record_decision` (memory, if any, is derived from it).
     """
-    result = ConversationResult(goal=goal)
+    transcript = transcript if transcript is not None else Transcript()
+    result = ConversationResult(goal=goal, transcript=transcript)
 
     def emit(kind: str, message: str, payload: dict | None = None) -> None:
         event = {"kind": kind, "message": message, "payload": payload or {}}
@@ -303,12 +315,18 @@ def plan_conversationally(
             f"To scope this, what kind of thing do you have in mind for: {goal}?"
         )
         emit("scoping_question", question, {"question": question})
-        answers.append((question, user_turn(question)))
+        transcript.record("brain", "planning", question)
+        reply = user_turn(question)
+        transcript.record("user", "planning", reply)
+        answers.append((question, reply))
         result.questions_asked += 1
     elif posture == "elicit_first":
         for question in assessment.questions[:MAX_ELICITATION_QUESTIONS]:
             emit("elicitation", question, {"question": question})
-            answers.append((question, user_turn(question)))
+            transcript.record("brain", "planning", question)
+            reply = user_turn(question)
+            transcript.record("user", "planning", reply)
+            answers.append((question, reply))
             result.questions_asked += 1
 
     # 3. Propose the initial plan (precise spec + surfaced assumptions).
@@ -321,16 +339,29 @@ def plan_conversationally(
     result.plain_plan = _derive_plain(plan, assumptions)
     emit("plan_proposed", "plan proposed",
          {"plain": result.plain_plan, "steps": [s.instruction for s in plan.steps], "assumptions": assumptions})
+    transcript.record("brain", "proposal", result.plain_plan)
 
     # 4. Reaction loop: show -> commit or fold-and-revise, bounded by max_rounds.
     while result.rounds < max_rounds:
         reaction = user_turn(result.plain_plan)
         result.rounds += 1
         if _is_commit(reaction):
+            # Commit is a user-facing decision: recorded transcript-first, then
+            # derived into memory (provenance links the entry to this commit turn).
+            record_decision(
+                transcript, memory,
+                text=reaction or "(approved as proposed)",
+                detail=f"User committed the plan ({len(plan.steps)} step(s)): "
+                       + "; ".join(s.instruction for s in plan.steps),
+                summary="user committed the plan",
+                kind="decision", phase="commit", speaker="user",
+                refs=[f"step{s.index}" for s in plan.steps],
+            )
             result.committed = True
             emit("committed", "plan committed", {"steps": [s.instruction for s in plan.steps]})
             return result
         emit("user_reacted", reaction, {"reaction": reaction})
+        transcript.record("user", "reaction", reaction)
         if result.rounds >= max_rounds:
             break  # no further round to show a revision; stop without committing
         plan, assumptions = _propose(
@@ -342,6 +373,7 @@ def plan_conversationally(
         result.plain_plan = _derive_plain(plan, assumptions)
         emit("plan_revised", "plan revised",
              {"plain": result.plain_plan, "steps": [s.instruction for s in plan.steps], "assumptions": assumptions})
+        transcript.record("brain", "proposal", result.plain_plan)
 
     emit("not_committed", f"no commit within {max_rounds} round(s)", {})
     return result

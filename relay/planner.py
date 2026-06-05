@@ -392,6 +392,11 @@ PRODUCT DECISION only the user can make (what to build, scope, a user-visible
 preference). Answer it yourself when you legitimately can. When GENUINELY UNSURE,
 ESCALATE: a needless escalation is a mild annoyance, but answering a product
 decision yourself silently builds the wrong thing.
+
+If a "conversation so far" is provided, you are continuing ONE ongoing dialogue
+with the user. Phrase any escalation as a natural continuation of it -- you may
+reference what was already discussed (e.g. "earlier you said you wanted this
+simple, so...") -- not a fresh, context-less prompt.
 """
 
 _ANSWER_GRAMMAR = (
@@ -527,6 +532,7 @@ def answer_or_escalate(
     memory_budget_tokens: int = _DEFAULT_MEMORY_BUDGET,
     brain_role: str = "brain",
     assumption_level: str = "auto",
+    conversation_context: str = "",
 ) -> Resolution:
     """Classify an executor question: self_answer (technical) or escalate (product).
 
@@ -536,6 +542,10 @@ def answer_or_escalate(
     rarely), a high dial asks more, ``auto`` is the brain's normal-mode judgment.
     Still biased to ``escalate`` when the reply is unparseable/ambiguous, because a
     wrong self-answer silently builds the wrong thing.
+
+    ``conversation_context`` is a window-bounded slice of the continuous transcript
+    (the dialogue so far). When present, the brain phrases an escalation as the next
+    turn of that conversation -- a continuation, not a context-less popup.
     """
     mem_ctx = _memory_context(
         memory, question, memory_budget_tokens, client=client, models=models, ledger=ledger
@@ -543,10 +553,15 @@ def answer_or_escalate(
     memory_block = (
         f"Relevant memory (facts/decisions already established):\n{mem_ctx}\n\n" if mem_ctx else ""
     )
+    convo_block = (
+        f"The conversation so far (continue it; reference it when escalating):\n"
+        f"{conversation_context}\n\n" if conversation_context else ""
+    )
     system = f"{_ANSWER_SYSTEM}\n{assumption_directive(assumption_level)}"
     user = (
         f"Goal: {goal}\n\n"
         f"Current step: [{step.index}] {step.instruction}\n\n"
+        f"{convo_block}"
         f"The executor asks: {question}\n\n"
         f"{memory_block}"
         f"{_ANSWER_GRAMMAR}"

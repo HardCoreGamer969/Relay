@@ -48,6 +48,7 @@ from relay.planner import (
 from relay.protocol import parse
 from relay.telemetry import Ledger
 from relay.tools import Tools
+from relay.transcript import Transcript, compact_transcript, record_decision, render_for_brain
 
 # Terminal statuses. STATUS_COMPLETED / STATUS_MAX_STEPS are shared with the
 # single-model loop; the rest are unique to the two-role run.
@@ -122,6 +123,11 @@ class PlannedTaskResult:
     events: list[Event] = field(default_factory=list)
     memory: PlanMemory | None = None
     revisions: int = 0
+    # The continuous conversation thread (planning turns, mid-run escalations,
+    # decisions, the result turn). ``transcript`` is the full live thread (source
+    # of truth); ``transcript_compacted`` is its post-execution readable form.
+    transcript: Transcript | None = None
+    transcript_compacted: Transcript | None = None
 
     @property
     def done(self) -> bool:
@@ -289,6 +295,25 @@ def _run_executor_step(
     )
 
 
+def _result_summary(status: str, plan: Plan) -> str:
+    """A plain, human-readable one-liner for the conversation's closing result turn.
+
+    Composed from the run outcome (NOT a model call) so it adds no brain cost and
+    cannot drift from what actually happened.
+    """
+    done = sum(1 for s in plan.steps if s.status == "done")
+    total = len(plan.steps)
+    phrasing = {
+        STATUS_COMPLETED: "Done -- built everything we agreed on.",
+        STATUS_MAX_STEPS: "Stopped early: the step budget ran out.",
+        STATUS_ESCALATION_LIMIT: "Stopped: too many steps failed to recover.",
+        STATUS_ABORTED_BY_BRAIN: "Stopped: I judged the goal unreachable as specified.",
+        STATUS_UNRESOLVED_ESCALATION: "Paused: I needed a decision from you that I could not get.",
+        STATUS_PLANNING_FAILED: "Could not produce a usable plan.",
+    }.get(status, f"Ended with status: {status}.")
+    return f"{phrasing} ({done}/{total} step(s) completed.)"
+
+
 def _adopt_revision(plan: Plan, revised: Plan) -> Plan:
     """Splice a revision into the plan: keep done/failed steps, replace the tail.
 
@@ -329,6 +354,7 @@ def run_planned(
     plan_gate: Callable[[Plan], bool] | None = None,
     committed_plan: Plan | None = None,
     assumption_level: str = "auto",
+    transcript: Transcript | None = None,
 ) -> PlannedTaskResult:
     """Drive the autonomous two-role planner/executor loop.
 
@@ -350,6 +376,13 @@ def run_planned(
     dial, threaded into ``answer_or_escalate`` so the user's assume-vs-ask bias
     holds in the autonomous loop, not just the conversation.
 
+    ``transcript`` is the ONE continuous conversation thread shared with the
+    planning conversation: mid-run escalations and the user's decisions land here
+    as the next turns of the same dialogue (not context-less popups). When the
+    brain composes an escalation it is given a window-bounded slice of the recent
+    thread, so the question reads as a continuation. After the run a readable,
+    post-execution compaction pass produces ``result.transcript_compacted``.
+
     Note: a single step's executor ceiling is ``max_executor_steps *
     (1 + max_followups_per_step)`` (each supervised follow-up re-runs the
     executor with its own budget); ``max_total_steps`` is the hard global cap.
@@ -358,7 +391,8 @@ def run_planned(
     """
     ledger = ledger if ledger is not None else Ledger()
     memory = memory if memory is not None else PlanMemory()
-    result = PlannedTaskResult(goal=goal, ledger=ledger, memory=memory)
+    transcript = transcript if transcript is not None else Transcript()
+    result = PlannedTaskResult(goal=goal, ledger=ledger, memory=memory, transcript=transcript)
 
     cfg = models if models is not None else load_models()
     window, _source = resolve_context_window(cfg.brain, client=client, override=context_window)
@@ -408,10 +442,15 @@ def run_planned(
 
         def resolve(question: str) -> _QuestionResolution:
             emit("executor_question", question, {"index": step.index, "question": question})
+            # Give the brain a window-bounded slice of the conversation so far, so an
+            # escalation reads as a continuation of the dialogue, not a fresh prompt.
+            convo_ctx = render_for_brain(
+                transcript, budget_tokens=mem_budget, client=client, models=models, ledger=ledger
+            )
             resolution = answer_or_escalate(
                 question, goal, plan, step, memory, models=models, ledger=ledger,
                 client=client, memory_budget_tokens=mem_budget, brain_role=brain_role,
-                assumption_level=assumption_level,
+                assumption_level=assumption_level, conversation_context=convo_ctx,
             )
             for kind, detail, summary in resolution.records:
                 remember(kind, detail, summary, provenance=f"step{step.index} brain")
@@ -424,15 +463,28 @@ def run_planned(
                      {"question": question, "answer": resolution.answer, "reasoning": resolution.reasoning})
                 return _QuestionResolution(answer=resolution.answer)
 
+            # Escalation: the brain's product question is the next turn of the SAME
+            # thread (a continuation), not a context-less popup.
+            transcript.record("brain", "escalation", resolution.question_for_user,
+                              refs=[f"step{step.index}"])
             emit("brain_escalated", resolution.question_for_user,
                  {"question": resolution.question_for_user, "reasoning": resolution.reasoning})
             if user_decision is None:
                 return _QuestionResolution(answer=None, unresolved=True)
             answer = user_decision(resolution.question_for_user)
-            remember(
-                "confirmation", f"User decided on '{resolution.question_for_user}': {answer}",
-                f"user: {answer}", provenance="user",
+            # Transcript-first, memory-derived: the user's decision is authoritative in
+            # the thread; the memory confirmation is derived + linked back to the turn.
+            _turn, entry = record_decision(
+                transcript, memory,
+                text=answer,
+                detail=f"User decided on '{resolution.question_for_user}': {answer}",
+                summary=f"user: {answer}",
+                kind="confirmation", phase="decision", speaker="user",
+                refs=[f"step{step.index}"],
             )
+            if entry is not None:
+                emit("memory_write", f"confirmation: user: {answer}",
+                     {"kind": "confirmation", "summary": f"user: {answer}", "provenance": entry.provenance})
             emit("user_decided", answer, {"question": resolution.question_for_user, "answer": answer})
             return _QuestionResolution(answer=answer)
 
@@ -590,4 +642,13 @@ def run_planned(
         emit("replanned", f"revised plan adopted: {len(plan.remaining())} new step(s)",
              {"steps": [s.instruction for s in plan.steps if s.status == "pending"]})
 
+    # Post-execution: a high-level brain "here's where things ended" turn (composed
+    # deterministically from the outcome -- no model call), then the readable
+    # auto-compaction pass that yields the durable, scroll-back record.
+    transcript.record("brain", "result", _result_summary(result.status, plan))
+    result.transcript_compacted = compact_transcript(
+        transcript, budget_tokens=mem_budget, client=client, models=models, ledger=ledger
+    )
+    emit("transcript_compacted", "transcript compacted to its readable form",
+         {"turns": len(result.transcript_compacted.turns)})
     return result

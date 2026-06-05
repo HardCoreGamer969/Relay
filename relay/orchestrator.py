@@ -327,6 +327,8 @@ def run_planned(
     context_window: int | None = None,
     on_event: EventCallback | None = None,
     plan_gate: Callable[[Plan], bool] | None = None,
+    committed_plan: Plan | None = None,
+    assumption_level: str = "auto",
 ) -> PlannedTaskResult:
     """Drive the autonomous two-role planner/executor loop.
 
@@ -342,6 +344,11 @@ def run_planned(
     used to size memory reads). ``user_decision(question) -> answer`` is the
     escalation seam; with none available, a product decision ends the run with
     status ``unresolved_escalation`` rather than guessing.
+
+    ``committed_plan`` (from the v0.08 planning conversation) skips ``make_plan``
+    and executes the already-agreed plan. ``assumption_level`` is the assumption
+    dial, threaded into ``answer_or_escalate`` so the user's assume-vs-ask bias
+    holds in the autonomous loop, not just the conversation.
 
     Note: a single step's executor ceiling is ``max_executor_steps *
     (1 + max_followups_per_step)`` (each supervised follow-up re-runs the
@@ -368,12 +375,16 @@ def run_planned(
         emit("memory_write", f"{kind}: {summary}", {"kind": kind, "summary": summary, "provenance": provenance})
 
     # --- Plan phase --------------------------------------------------------
-    plan = make_plan(
-        goal, project_root, models=models, ledger=ledger, client=client,
-        max_investigation_steps=max_investigation_steps, brain_role=brain_role,
-        on_event=lambda kind, message, payload: emit(kind, message, payload),
-    )
-    if plan is None:
+    # A committed_plan (from the planning conversation) skips make_plan.
+    if committed_plan is not None:
+        plan = committed_plan if committed_plan.steps else None
+    else:
+        plan = make_plan(
+            goal, project_root, models=models, ledger=ledger, client=client,
+            max_investigation_steps=max_investigation_steps, brain_role=brain_role,
+            on_event=lambda kind, message, payload: emit(kind, message, payload),
+        )
+    if plan is None or not plan.steps:
         result.status = STATUS_PLANNING_FAILED
         emit("status", "planning failed: the brain produced no usable plan", {"status": STATUS_PLANNING_FAILED})
         return result
@@ -400,6 +411,7 @@ def run_planned(
             resolution = answer_or_escalate(
                 question, goal, plan, step, memory, models=models, ledger=ledger,
                 client=client, memory_budget_tokens=mem_budget, brain_role=brain_role,
+                assumption_level=assumption_level,
             )
             for kind, detail, summary in resolution.records:
                 remember(kind, detail, summary, provenance=f"step{step.index} brain")

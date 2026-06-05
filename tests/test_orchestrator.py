@@ -493,3 +493,48 @@ def test_longer_horizon_large_window_no_compaction(tmp_path):
     result = run_planned("build many files", tmp_path, models=CFG, client=client, context_window=200000)
     assert result.status == STATUS_COMPLETED
     assert client.summary_calls == 0  # big window -> no summarization needed
+
+
+# --- v0.08: committed plan (skip make_plan) + dial threading ----------------
+
+from relay.planner import Plan  # noqa: E402
+
+
+def test_committed_plan_skips_make_plan(tmp_path):
+    # No <plan> reply in the brain queue: the committed plan must be used directly.
+    client = RoutedClient(
+        brain=["<verdict>accept</verdict>"],
+        hands=['<edit path="x.txt">X</edit>\n<done>created x</done>'],
+    )
+    committed = Plan.from_instructions(["create x.txt with X"])
+    result = run_planned("g", tmp_path, models=CFG, client=client, committed_plan=committed)
+
+    assert result.status == STATUS_COMPLETED
+    assert (tmp_path / "x.txt").read_text(encoding="utf-8") == "X"
+    assert len(_brain_calls(client)) == 1  # only the step review -- no planning call
+
+
+def test_committed_empty_plan_is_planning_failed(tmp_path):
+    client = RoutedClient(brain=[], hands=[])
+    result = run_planned("g", tmp_path, models=CFG, client=client, committed_plan=Plan(steps=[]))
+    assert result.status == STATUS_PLANNING_FAILED
+
+
+def test_assumption_level_threaded_into_answer(tmp_path):
+    client = RoutedClient(
+        brain=[
+            "<plan><step>write loader</step></plan>",
+            "<decision>self_answer</decision><answer>read config.toml</answer>",
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
+            "<question>where to read config?</question>",
+            '<edit path="cfg.py">x</edit>\n<done>wrote it</done>',
+        ],
+    )
+    result = run_planned("g", tmp_path, models=CFG, client=client, assumption_level="1")
+    assert result.status == STATUS_COMPLETED
+    # The answer call (2nd brain call: plan, ANSWER, review) carried the dial.
+    answer_call = _brain_calls(client)[1]
+    prompt = " ".join(m["content"] for m in answer_call["messages"])
+    assert "ASSUMPTION DIAL = 1" in prompt

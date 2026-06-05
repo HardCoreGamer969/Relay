@@ -14,12 +14,15 @@ them to the brain.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from relay.config import ModelConfig
+from relay.context import DEFAULT_CONTEXT_WINDOW
 from relay.loop import describe_action, execute_action
+from relay.memory import PlanMemory, memory_budget
 from relay.models import call_model
 from relay.protocol import parse
 from relay.telemetry import Ledger
@@ -27,6 +30,10 @@ from relay.tools import Tools
 
 # A plan is capped so a misbehaving brain cannot emit a 10,000-step plan.
 MAX_PLAN_STEPS = 20
+
+# Fallback memory-read budget when a caller doesn't pass one (sized to the
+# conservative default window). Real runs pass the resolved window's budget.
+_DEFAULT_MEMORY_BUDGET = memory_budget(DEFAULT_CONTEXT_WINDOW)
 
 # Directory / file names omitted from the project digest as noise.
 _DIGEST_SKIP = {
@@ -276,18 +283,26 @@ def replan(
     client: Any | None = None,
     max_plan_retries: int = 2,
     brain_role: str = "brain",
+    memory: PlanMemory | None = None,
+    memory_budget_tokens: int = _DEFAULT_MEMORY_BUDGET,
 ) -> Plan | None:
     """Have the brain revise the remaining plan after a step failed.
 
     The brain receives the goal, the current plan, the failed step + a concise
     failure summary (NOT the full transcript), and the one-line outcomes of
-    completed steps. Returns a :class:`Plan` for the remaining work, or ``None``
-    if the brain emits ``<abort>``.
+    completed steps. When ``memory`` is given, a window-aware (budget-bounded)
+    slice of what has been learned is included so the brain stays consistent.
+    Returns a :class:`Plan` for the remaining work, or ``None`` on ``<abort>``.
     """
     outcomes_text = (
         "\n".join(f"- [{idx}] {instr}  ->  {outcome}" for idx, instr, outcome in completed_outcomes)
         or "(none completed yet)"
     )
+    mem_ctx = _memory_context(
+        memory, f"{goal} {failure_summary}", memory_budget_tokens,
+        client=client, models=models, ledger=ledger,
+    )
+    memory_block = f"What has been learned (memory):\n{mem_ctx}\n\n" if mem_ctx else ""
     messages: list[dict[str, str]] = [
         {"role": "system", "content": _REPLAN_SYSTEM},
         {
@@ -296,10 +311,306 @@ def replan(
                 f"Goal: {goal}\n\n"
                 f"Plan so far:\n{_render_plan(plan)}\n\n"
                 f"Completed outcomes:\n{outcomes_text}\n\n"
+                f"{memory_block}"
                 f"The step that FAILED: [{failed_step.index}] {failed_step.instruction}\n"
                 f"Why it failed: {failure_summary}\n\n"
                 "Emit a revised <plan> for the REMAINING work (do not repeat completed "
                 "steps), or <abort>reason</abort> if the goal is unreachable."
+            ),
+        },
+    ]
+
+    for _ in range(max_plan_retries + 1):
+        reply = call_model(brain_role, messages, models=models, ledger=ledger, client=client).text
+        messages.append({"role": "assistant", "content": reply})
+        parsed = parse(reply)
+
+        if parsed.first("abort") is not None:
+            return None
+        plan_action = parsed.first("plan")
+        if plan_action is not None and plan_action.steps:
+            return Plan.from_instructions(plan_action.steps[:MAX_PLAN_STEPS])
+
+        if ledger is not None:
+            ledger.record_parse_failure()
+        messages.append({"role": "user", "content": _PLAN_NUDGE})
+
+    return None
+
+
+# ===========================================================================
+# v0.06 (2 of 2): autonomous brain behaviors -- supervise, answer-or-escalate,
+# evolve. Each reads memory through the window-aware budget machinery (never the
+# whole store) and emits a small tag grammar parsed locally below.
+# ===========================================================================
+
+
+@dataclass
+class StepReview:
+    """The brain's verdict on a finished step (at the step boundary)."""
+
+    verdict: str  # "accept" | "follow_up" | "revise_plan"
+    followup: str = ""  # concrete corrective instruction (only for follow_up)
+    reason: str = ""  # what was learned / why revise
+    records: list[tuple[str, str, str]] = field(default_factory=list)  # (kind, detail, summary)
+
+
+@dataclass
+class Resolution:
+    """The brain's answer-vs-escalate decision for an executor question."""
+
+    kind: str  # "self_answer" | "escalate"
+    answer: str = ""  # the answer to hand the executor (self_answer)
+    question_for_user: str = ""  # the precise product question to escalate
+    reasoning: str = ""  # why this is self-answerable or a product decision (logged)
+    records: list[tuple[str, str, str]] = field(default_factory=list)
+
+
+_REVIEW_SYSTEM = """\
+You are the PLANNER (the "brain") supervising an EXECUTOR (the "hands"). At a step
+boundary you judge whether the executor's work met the step's intent, given the
+goal, the plan, what the executor did, and relevant prior memory. Be concise.
+Bias toward accept when the work is adequate; ask for a follow-up only when there
+is a concrete, correctable gap; choose revise_plan only when what was learned
+changes the REMAINING work.
+"""
+
+_REVIEW_GRAMMAR = (
+    "Reply using ONLY these tags:\n"
+    "<verdict>accept|follow_up|revise_plan</verdict>\n"
+    "<followup>concrete corrective instruction for the executor</followup>  (only if follow_up)\n"
+    "<reason>what changed / why</reason>  (especially for revise_plan)\n"
+    '<record kind="fact|decision|dead_end">precise detail :: short human summary</record>'
+    "  (zero or more facts worth remembering)"
+)
+
+_ANSWER_SYSTEM = """\
+You are the PLANNER (the "brain"). The EXECUTOR asked a question mid-step. Decide
+whether you can answer it YOURSELF -- a TECHNICAL question decidable from the
+goal, the plan, the code, and established memory -- or whether it is a genuine
+PRODUCT DECISION only the user can make (what to build, scope, a user-visible
+preference). Answer it yourself when you legitimately can. When GENUINELY UNSURE,
+ESCALATE: a needless escalation is a mild annoyance, but answering a product
+decision yourself silently builds the wrong thing.
+"""
+
+_ANSWER_GRAMMAR = (
+    "Reply using ONLY these tags:\n"
+    "<decision>self_answer|escalate</decision>\n"
+    "<answer>the answer to hand the executor</answer>  (only if self_answer)\n"
+    "<ask_user>the precise question to put to the user</ask_user>  (only if escalate)\n"
+    "<reason>why this is self-answerable or a product decision</reason>\n"
+    '<record kind="decision">precise detail :: short human summary</record>'
+    "  (what to remember, especially for self_answer)"
+)
+
+_EVOLVE_SYSTEM = """\
+You are the PLANNER (the "brain"). What the executor learned changes the remaining
+work. Revise the plan for the REMAINING steps only, as a projection over the goal
+and what has been learned (memory). Preserve completed steps; do not repeat them.
+Output <plan><step>...</step>...</plan>, or <abort>reason</abort> if the goal is
+now unreachable.
+"""
+
+_TAG_CACHE: dict[str, re.Pattern[str]] = {}
+_RECORD_RE = re.compile(r'<record\s+kind="([^"]+)"\s*>(.*?)</record>', re.DOTALL)
+
+
+def _tag(name: str, text: str) -> str | None:
+    pattern = _TAG_CACHE.get(name)
+    if pattern is None:
+        pattern = re.compile(rf"<{name}>(.*?)</{name}>", re.DOTALL)
+        _TAG_CACHE[name] = pattern
+    match = pattern.search(text or "")
+    return match.group(1).strip() if match else None
+
+
+def _parse_records(text: str) -> list[tuple[str, str, str]]:
+    """Parse ``<record kind="...">detail :: summary</record>`` entries."""
+    records: list[tuple[str, str, str]] = []
+    for match in _RECORD_RE.finditer(text or ""):
+        kind = match.group(1).strip()
+        body = match.group(2).strip()
+        if "::" in body:
+            detail, summary = (part.strip() for part in body.split("::", 1))
+        else:
+            detail = summary = body
+        if detail:
+            records.append((kind, detail, summary or detail))
+    return records
+
+
+def _bounded_text(text: str, max_chars: int) -> str:
+    text = text or ""
+    return text if len(text) <= max_chars else text[:max_chars] + " ...(truncated)"
+
+
+def _memory_context(
+    memory: PlanMemory | None,
+    query: str,
+    budget_tokens: int,
+    *,
+    client: Any | None,
+    models: ModelConfig | None,
+    ledger: Ledger | None,
+) -> str:
+    """Window-aware (budget-bounded) memory slice -- never the whole store."""
+    if memory is None or not memory.entries or budget_tokens <= 0:
+        return ""
+    return memory.compacted_context(
+        query, budget_tokens=budget_tokens, client=client, models=models, ledger=ledger
+    )
+
+
+def review_step(
+    goal: str,
+    plan: Plan,
+    step: PlanStep,
+    executor_summary: str,
+    observations: list[str] | None,
+    memory: PlanMemory | None,
+    *,
+    models: ModelConfig | None = None,
+    ledger: Ledger | None = None,
+    client: Any | None = None,
+    memory_budget_tokens: int = _DEFAULT_MEMORY_BUDGET,
+    brain_role: str = "brain",
+) -> StepReview:
+    """One brain call at a step boundary: accept / follow_up / revise_plan."""
+    mem_ctx = _memory_context(
+        memory, step.instruction, memory_budget_tokens, client=client, models=models, ledger=ledger
+    )
+    transcript = _bounded_text("\n".join(observations or []), 4000)
+    memory_block = f"Relevant memory:\n{mem_ctx}\n\n" if mem_ctx else ""
+    user = (
+        f"Goal: {goal}\n\n"
+        f"Plan so far:\n{_render_plan(plan)}\n\n"
+        f"Step under review: [{step.index}] {step.instruction}\n"
+        f"Executor reported done: {executor_summary}\n\n"
+        f"What the executor did this step:\n{transcript or '(no observations)'}\n\n"
+        f"{memory_block}"
+        f"{_REVIEW_GRAMMAR}"
+    )
+    reply = call_model(
+        brain_role,
+        [{"role": "system", "content": _REVIEW_SYSTEM}, {"role": "user", "content": user}],
+        models=models,
+        ledger=ledger,
+        client=client,
+    ).text
+    return _parse_review(reply)
+
+
+def _parse_review(text: str) -> StepReview:
+    verdict = (_tag("verdict", text) or "accept").lower()
+    if verdict not in ("accept", "follow_up", "revise_plan"):
+        verdict = "accept"  # unparseable verdict -> don't block progress
+    followup = _tag("followup", text) or ""
+    reason = _tag("reason", text) or ""
+    if verdict == "follow_up" and not followup.strip():
+        verdict = "accept"  # a follow-up with no instruction is unactionable
+    return StepReview(
+        verdict=verdict, followup=followup.strip(), reason=reason.strip(), records=_parse_records(text)
+    )
+
+
+def answer_or_escalate(
+    question: str,
+    goal: str,
+    plan: Plan,
+    step: PlanStep,
+    memory: PlanMemory | None,
+    *,
+    models: ModelConfig | None = None,
+    ledger: Ledger | None = None,
+    client: Any | None = None,
+    memory_budget_tokens: int = _DEFAULT_MEMORY_BUDGET,
+    brain_role: str = "brain",
+) -> Resolution:
+    """Classify an executor question: self_answer (technical) or escalate (product).
+
+    Reads a window-aware memory slice so self-answers stay consistent with earlier
+    decisions. Biased to ``escalate`` when unsure (an unparseable/ambiguous reply
+    escalates), because a wrong self-answer silently builds the wrong thing.
+    """
+    mem_ctx = _memory_context(
+        memory, question, memory_budget_tokens, client=client, models=models, ledger=ledger
+    )
+    memory_block = (
+        f"Relevant memory (facts/decisions already established):\n{mem_ctx}\n\n" if mem_ctx else ""
+    )
+    user = (
+        f"Goal: {goal}\n\n"
+        f"Current step: [{step.index}] {step.instruction}\n\n"
+        f"The executor asks: {question}\n\n"
+        f"{memory_block}"
+        f"{_ANSWER_GRAMMAR}"
+    )
+    reply = call_model(
+        brain_role,
+        [{"role": "system", "content": _ANSWER_SYSTEM}, {"role": "user", "content": user}],
+        models=models,
+        ledger=ledger,
+        client=client,
+    ).text
+    return _parse_resolution(reply, question)
+
+
+def _parse_resolution(text: str, question: str) -> Resolution:
+    decision = (_tag("decision", text) or "").lower()
+    answer = (_tag("answer", text) or "").strip()
+    ask = (_tag("ask_user", text) or "").strip()
+    reasoning = (_tag("reason", text) or "").strip()
+    records = _parse_records(text)
+    if decision == "self_answer" and answer:
+        return Resolution(kind="self_answer", answer=answer, reasoning=reasoning, records=records)
+    # Conservative default: anything unclear -> escalate (lean to the user).
+    return Resolution(
+        kind="escalate", question_for_user=(ask or question), reasoning=reasoning, records=records
+    )
+
+
+def evolve_plan(
+    goal: str,
+    plan: Plan,
+    reason: str,
+    memory: PlanMemory | None,
+    *,
+    models: ModelConfig | None = None,
+    ledger: Ledger | None = None,
+    client: Any | None = None,
+    memory_budget_tokens: int = _DEFAULT_MEMORY_BUDGET,
+    max_plan_retries: int = 2,
+    brain_role: str = "brain",
+) -> Plan | None:
+    """Revise the remaining plan tail as a projection over memory + goal.
+
+    Triggered by a ``revise_plan`` review verdict (vs :func:`replan`, triggered by
+    failure). Preserves completed steps; returns a revised tail or ``None`` on
+    ``<abort>``.
+    """
+    outcomes_text = (
+        "\n".join(
+            f"- [{idx}] {instr}  ->  {outcome}" for idx, instr, outcome in plan.completed_outcomes()
+        )
+        or "(none completed yet)"
+    )
+    mem_ctx = _memory_context(
+        memory, f"{goal} {reason}", memory_budget_tokens, client=client, models=models, ledger=ledger
+    )
+    memory_block = f"What has been learned (memory):\n{mem_ctx}\n\n" if mem_ctx else ""
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": _EVOLVE_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"Goal: {goal}\n\n"
+                f"Plan so far:\n{_render_plan(plan)}\n\n"
+                f"Completed outcomes:\n{outcomes_text}\n\n"
+                f"{memory_block}"
+                f"Why the remaining plan should change: {reason}\n\n"
+                "Emit a revised <plan> for the REMAINING work only (do not repeat completed "
+                "steps), or <abort>reason</abort>."
             ),
         },
     ]

@@ -121,3 +121,154 @@ def test_replan_abort_returns_none(tmp_path):
     client = ScriptedClient(["<abort>cannot recover from here</abort>"])
     revised = replan("g", Plan(steps=[failed]), failed, "boom", [], models=CFG, ledger=Ledger(), client=client)
     assert revised is None
+
+
+# --- v0.06: review_step / answer_or_escalate / evolve_plan ------------------
+
+import relay.planner as planner_mod  # noqa: E402
+from relay.memory import PlanMemory  # noqa: E402
+from relay.planner import answer_or_escalate, evolve_plan, review_step  # noqa: E402
+
+
+class _FakeBrain:
+    """Records calls and returns a fixed reply as the brain's text."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.calls = []
+
+    def __call__(self, role, messages, **kwargs):
+        self.calls.append((role, messages, kwargs))
+        return SimpleNamespace(text=self.reply, record=None)
+
+
+def _one_step_plan():
+    return Plan.from_instructions(["do the thing"])
+
+
+def test_review_accept_with_records(monkeypatch):
+    monkeypatch.setattr(
+        planner_mod, "call_model",
+        _FakeBrain('<verdict>accept</verdict><record kind="fact">routes wired :: routes done</record>'),
+    )
+    plan = _one_step_plan()
+    review = review_step("g", plan, plan.steps[0], "did it", ["[edit] wrote x"], PlanMemory(),
+                         models=CFG, client=object())
+    assert review.verdict == "accept"
+    assert review.records == [("fact", "routes wired", "routes done")]
+
+
+def test_review_follow_up(monkeypatch):
+    monkeypatch.setattr(
+        planner_mod, "call_model",
+        _FakeBrain("<verdict>follow_up</verdict><followup>add the missing docstring</followup>"),
+    )
+    plan = _one_step_plan()
+    review = review_step("g", plan, plan.steps[0], "did it", [], PlanMemory(), models=CFG, client=object())
+    assert review.verdict == "follow_up"
+    assert review.followup == "add the missing docstring"
+
+
+def test_review_revise_plan(monkeypatch):
+    monkeypatch.setattr(
+        planner_mod, "call_model",
+        _FakeBrain("<verdict>revise_plan</verdict><reason>discovered a config we must honor</reason>"),
+    )
+    plan = _one_step_plan()
+    review = review_step("g", plan, plan.steps[0], "did it", [], PlanMemory(), models=CFG, client=object())
+    assert review.verdict == "revise_plan"
+    assert "config" in review.reason
+
+
+def test_review_empty_followup_downgrades_to_accept(monkeypatch):
+    monkeypatch.setattr(planner_mod, "call_model", _FakeBrain("<verdict>follow_up</verdict>"))
+    plan = _one_step_plan()
+    review = review_step("g", plan, plan.steps[0], "did it", [], PlanMemory(), models=CFG, client=object())
+    assert review.verdict == "accept"  # unactionable follow-up -> accept
+
+
+def test_review_unparseable_defaults_to_accept(monkeypatch):
+    monkeypatch.setattr(planner_mod, "call_model", _FakeBrain("looks fine to me, nice work"))
+    plan = _one_step_plan()
+    review = review_step("g", plan, plan.steps[0], "did it", [], PlanMemory(), models=CFG, client=object())
+    assert review.verdict == "accept"
+
+
+def test_answer_self_answer(monkeypatch):
+    monkeypatch.setattr(
+        planner_mod, "call_model",
+        _FakeBrain(
+            "<decision>self_answer</decision><answer>reuse the existing db.py module</answer>"
+            '<record kind="decision">reuse db.py :: reuse db</record>'
+        ),
+    )
+    plan = _one_step_plan()
+    res = answer_or_escalate("which db module?", "g", plan, plan.steps[0], PlanMemory(),
+                             models=CFG, client=object())
+    assert res.kind == "self_answer"
+    assert res.answer == "reuse the existing db.py module"
+    assert res.records == [("decision", "reuse db.py", "reuse db")]
+
+
+def test_answer_escalate(monkeypatch):
+    monkeypatch.setattr(
+        planner_mod, "call_model",
+        _FakeBrain("<decision>escalate</decision><ask_user>Should the app support OAuth login?</ask_user>"),
+    )
+    plan = _one_step_plan()
+    res = answer_or_escalate("auth approach?", "g", plan, plan.steps[0], PlanMemory(),
+                             models=CFG, client=object())
+    assert res.kind == "escalate"
+    assert res.question_for_user == "Should the app support OAuth login?"
+
+
+def test_answer_unparseable_biases_to_escalate(monkeypatch):
+    monkeypatch.setattr(planner_mod, "call_model", _FakeBrain("hmm, not totally sure about this"))
+    plan = _one_step_plan()
+    res = answer_or_escalate("the original question", "g", plan, plan.steps[0], PlanMemory(),
+                             models=CFG, client=object())
+    assert res.kind == "escalate"
+    assert res.question_for_user == "the original question"  # falls back to the executor's question
+
+
+def test_answer_self_answer_without_answer_tag_escalates(monkeypatch):
+    monkeypatch.setattr(planner_mod, "call_model", _FakeBrain("<decision>self_answer</decision>"))
+    plan = _one_step_plan()
+    res = answer_or_escalate("q", "g", plan, plan.steps[0], PlanMemory(), models=CFG, client=object())
+    assert res.kind == "escalate"  # claimed self-answer but gave none -> conservative escalate
+
+
+def test_answer_reads_prior_decision_from_memory(monkeypatch):
+    """Memory makes self-answers consistent: the prior decision reaches the brain."""
+    mem = PlanMemory()
+    mem.remember("decision", "storage backend is SQLite (chosen in step 1)", "chose SQLite",
+                 provenance="step1", tags=["storage", "db"])
+    captured = {}
+
+    def fake(role, messages, **kwargs):
+        captured["prompt"] = "\n".join(m["content"] for m in messages)
+        return SimpleNamespace(text="<decision>self_answer</decision><answer>use SQLite</answer>", record=None)
+
+    monkeypatch.setattr(planner_mod, "call_model", fake)
+    plan = Plan.from_instructions(["build the storage layer"])
+    res = answer_or_escalate("what storage backend should I use?", "build app", plan, plan.steps[0],
+                             mem, models=CFG, client=object(), memory_budget_tokens=4000)
+    assert "SQLite" in captured["prompt"]  # window-aware read delivered the prior decision
+    assert res.kind == "self_answer" and "SQLite" in res.answer
+
+
+def test_evolve_plan_returns_revised_tail(monkeypatch):
+    monkeypatch.setattr(
+        planner_mod, "call_model",
+        _FakeBrain("<plan><step>new step A</step><step>new step B</step></plan>"),
+    )
+    plan = Plan.from_instructions(["done one", "old tail"])
+    plan.mark_done(plan.steps[0], "did one")
+    revised = evolve_plan("g", plan, "learned something", PlanMemory(), models=CFG, client=object())
+    assert [s.instruction for s in revised.steps] == ["new step A", "new step B"]
+
+
+def test_evolve_plan_abort_returns_none(monkeypatch):
+    monkeypatch.setattr(planner_mod, "call_model", _FakeBrain("<abort>cannot continue</abort>"))
+    revised = evolve_plan("g", Plan.from_instructions(["x"]), "r", PlanMemory(), models=CFG, client=object())
+    assert revised is None

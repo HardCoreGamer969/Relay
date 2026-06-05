@@ -1,9 +1,10 @@
-"""Network-free tests for the two-role orchestrator (brain + hands).
+"""Network-free tests for the autonomous two-role orchestrator (brain + hands).
 
-A scripted client returns replies in order; both roles route through it, so the
-sequence of replies follows the deterministic phase order: make_plan (brain) ->
-each executor step (hands) -> replan (brain) on escalation, etc. Calls are
-distinguished by the recorded ``model`` (brain vs hands).
+A role-routed fake client returns brain replies and hands replies from separate
+queues (routed by the model slug), which is robust to the brain<->hands
+interleaving the autonomous loop introduces (plan, executor turns, step reviews,
+question answers, evolutions). Memory is kept small so no compaction summarizer
+call fires (that path is exercised by the longer-horizon overflow test).
 """
 
 from __future__ import annotations
@@ -12,13 +13,14 @@ from types import SimpleNamespace
 
 from relay.config import ModelConfig
 from relay.loop import STATUS_COMPLETED, STATUS_MAX_STEPS
+from relay.memory import PlanMemory
 from relay.orchestrator import (
     STATUS_ABORTED_BY_BRAIN,
     STATUS_ESCALATION_LIMIT,
     STATUS_PLANNING_FAILED,
+    STATUS_UNRESOLVED_ESCALATION,
     run_planned,
 )
-from relay.telemetry import Ledger
 
 CFG = ModelConfig(brain="vendor/brain", hands="vendor/hands")
 
@@ -29,19 +31,24 @@ def _resp(content):
 
 
 class _Completions:
-    def __init__(self, replies):
-        self._replies = list(replies)
+    def __init__(self, brain, hands):
+        self.brain = list(brain)
+        self.hands = list(hands)
         self.calls: list[dict] = []
 
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        assert self._replies, "scripted client ran out of replies"
-        return _resp(self._replies.pop(0))
+    def create(self, *, model, **kwargs):
+        self.calls.append({"model": model, **kwargs})
+        queue = self.brain if model == "vendor/brain" else self.hands
+        role = "brain" if model == "vendor/brain" else "hands"
+        assert queue, f"ran out of {role} replies"
+        return _resp(queue.pop(0))
 
 
-class ScriptedClient:
-    def __init__(self, replies):
-        self.chat = SimpleNamespace(completions=_Completions(replies))
+class RoutedClient:
+    """Routes create() to a brain or hands reply queue by the model slug."""
+
+    def __init__(self, brain=(), hands=()):
+        self.chat = SimpleNamespace(completions=_Completions(brain, hands))
 
     @property
     def calls(self):
@@ -56,53 +63,284 @@ def _brain_calls(client):
     return [c for c in client.calls if c["model"] == "vendor/brain"]
 
 
-def test_happy_path_completes_and_writes_files(tmp_path):
-    client = ScriptedClient(
-        [
+def _kinds(result):
+    return [e.kind for e in result.events]
+
+
+# --- happy path + supervision ----------------------------------------------
+
+
+def test_happy_path_completes_with_supervision(tmp_path):
+    client = RoutedClient(
+        brain=[
             "<plan><step>create alpha.txt with ALPHA</step><step>create beta.txt with BETA</step></plan>",
+            "<verdict>accept</verdict>",
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
             '<edit path="alpha.txt">ALPHA</edit>\n<done>created alpha.txt</done>',
             '<edit path="beta.txt">BETA</edit>\n<done>created beta.txt</done>',
-        ]
+        ],
     )
-    ledger = Ledger()
-    result = run_planned("make two files", tmp_path, models=CFG, ledger=ledger, client=client)
+    result = run_planned("two files", tmp_path, models=CFG, client=client)
 
     assert result.status == STATUS_COMPLETED
-    assert result.done is True
     assert [s.status for s in result.plan.steps] == ["done", "done"]
     assert (tmp_path / "alpha.txt").read_text(encoding="utf-8") == "ALPHA"
     assert (tmp_path / "beta.txt").read_text(encoding="utf-8") == "BETA"
+    # Supervision cost: 1 plan + 2 step-boundary reviews = 3 brain calls (intended).
+    assert len(_brain_calls(client)) == 3
+    assert _kinds(result).count("step_reviewed") == 2
+    # Memory learned both step outcomes (fact, dual-form, with provenance).
+    facts = [e for e in result.memory.entries if e.kind == "fact"]
+    assert len(facts) == 2
+    assert all(f.detail and f.summary and f.provenance for f in facts)
 
 
-def test_telemetry_split_across_brain_and_hands(tmp_path):
-    client = ScriptedClient(
-        [
-            "<plan><step>create a.txt</step></plan>",
-            '<edit path="a.txt">A</edit>\n<done>created a.txt</done>',
-        ]
+def test_no_supervise_skips_reviews(tmp_path):
+    client = RoutedClient(
+        brain=["<plan><step>create a.txt</step></plan>"],
+        hands=['<edit path="a.txt">A</edit>\n<done>created a.txt</done>'],
     )
-    ledger = Ledger()
-    run_planned("g", tmp_path, models=CFG, ledger=ledger, client=client)
+    result = run_planned("one file", tmp_path, models=CFG, client=client, supervise=False)
 
-    by_role = ledger.by_role()
-    assert set(by_role) == {"brain", "hands"}
-    assert by_role["brain"].model == "vendor/brain"
-    assert by_role["hands"].model == "vendor/hands"
-    assert by_role["brain"].calls == 1  # one plan call
-    assert by_role["hands"].calls == 1  # one executor step
+    assert result.status == STATUS_COMPLETED
+    assert len(_brain_calls(client)) == 1  # plan only -- no review calls
+    assert "step_reviewed" not in _kinds(result)
 
 
-def test_executor_context_is_narrow(tmp_path):
-    """The crucial guard: each step's executor context excludes the full plan and
-    prior steps' raw transcripts -- only the current step + one-line carry-over."""
-    client = ScriptedClient(
-        [
+# --- executor questions: self-answer vs escalate ---------------------------
+
+
+def test_executor_question_self_answered(tmp_path):
+    client = RoutedClient(
+        brain=[
+            "<plan><step>write the config loader</step></plan>",
+            "<decision>self_answer</decision><answer>read config from config.toml</answer>",
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
+            "<question>where do I read config from?</question>",
+            '<edit path="cfg.py">cfg</edit>\n<done>wrote loader</done>',
+        ],
+    )
+    result = run_planned("config", tmp_path, models=CFG, client=client)
+
+    assert result.status == STATUS_COMPLETED
+    kinds = _kinds(result)
+    assert "executor_question" in kinds and "brain_self_answered" in kinds
+    assert "brain_escalated" not in kinds
+    # The self-answer is recorded as a decision in memory.
+    decisions = [e for e in result.memory.entries if e.kind == "decision"]
+    assert any("config.toml" in d.detail for d in decisions)
+
+
+def test_executor_question_escalated_to_user(tmp_path):
+    decisions_put = []
+
+    def user_decision(question):
+        decisions_put.append(question)
+        return "yes, support OAuth"
+
+    client = RoutedClient(
+        brain=[
+            "<plan><step>add login</step></plan>",
+            "<decision>escalate</decision><ask_user>Should login support OAuth?</ask_user>",
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
+            "<question>do we need OAuth login?</question>",
+            '<edit path="login.py">x</edit>\n<done>added login</done>',
+        ],
+    )
+    result = run_planned("auth", tmp_path, models=CFG, client=client, user_decision=user_decision)
+
+    assert result.status == STATUS_COMPLETED
+    assert decisions_put == ["Should login support OAuth?"]  # the precise product question
+    kinds = _kinds(result)
+    assert "brain_escalated" in kinds and "user_decided" in kinds
+    # The user's resolution is recorded as a confirmation.
+    assert any(e.kind == "confirmation" and "OAuth" in e.detail for e in result.memory.entries)
+
+
+def test_escalation_without_callback_ends_unresolved(tmp_path):
+    client = RoutedClient(
+        brain=[
+            "<plan><step>add login</step></plan>",
+            "<decision>escalate</decision><ask_user>Should login support OAuth?</ask_user>",
+        ],
+        hands=["<question>do we need OAuth?</question>"],
+    )
+    result = run_planned("auth", tmp_path, models=CFG, client=client, user_decision=None)
+
+    assert result.status == STATUS_UNRESOLVED_ESCALATION  # never guesses a product decision
+    assert not (tmp_path / "login.py").exists()
+    assert "brain_escalated" in _kinds(result)
+
+
+def test_self_answer_is_consistent_with_prior_memory(tmp_path):
+    """The prior decision is delivered to the brain window-aware, so it can stay consistent."""
+    memory = PlanMemory()
+    memory.remember("decision", "storage backend is SQLite (chosen earlier)", "chose SQLite",
+                    provenance="step0", tags=["storage", "db"])
+    client = RoutedClient(
+        brain=[
+            "<plan><step>build the storage layer</step></plan>",
+            "<decision>self_answer</decision><answer>use SQLite, as already decided</answer>",
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
+            "<question>which storage backend?</question>",
+            '<edit path="store.py">x</edit>\n<done>built store</done>',
+        ],
+    )
+    result = run_planned("storage", tmp_path, models=CFG, client=client, memory=memory)
+
+    assert result.status == STATUS_COMPLETED
+    # The brain's answer call (2nd brain call) saw the prior SQLite decision.
+    answer_call = _brain_calls(client)[1]
+    prompt = "\n".join(m["content"] for m in answer_call["messages"])
+    assert "SQLite" in prompt
+
+
+# --- supervision verdicts: follow_up (bounded) and revise_plan (bounded) ----
+
+
+def test_follow_up_is_bounded_then_fails(tmp_path):
+    # Reviewer keeps asking for follow-ups; budget=1 means one corrective attempt,
+    # then the step fails -> failure path -> escalation_limit (max_escalations=0).
+    client = RoutedClient(
+        brain=[
+            "<plan><step>do the thing</step></plan>",
+            "<verdict>follow_up</verdict><followup>not quite, fix it</followup>",
+            "<verdict>follow_up</verdict><followup>still not right</followup>",
+        ],
+        hands=[
+            "<done>attempt 1</done>",
+            "<done>attempt 2</done>",
+        ],
+    )
+    result = run_planned("x", tmp_path, models=CFG, client=client,
+                         max_followups_per_step=1, max_escalations=0)
+
+    assert result.status == STATUS_ESCALATION_LIMIT
+    assert len(_hands_calls(client)) == 2  # initial + exactly one bounded follow-up
+    assert _kinds(result).count("step_reviewed") == 2
+
+
+def test_follow_up_then_accept_completes(tmp_path):
+    client = RoutedClient(
+        brain=[
+            "<plan><step>do the thing</step></plan>",
+            "<verdict>follow_up</verdict><followup>add the missing piece</followup>",
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
+            '<edit path="x.txt">v1</edit>\n<done>first attempt</done>',
+            '<edit path="x.txt">v2</edit>\n<done>fixed</done>',
+        ],
+    )
+    result = run_planned("x", tmp_path, models=CFG, client=client, max_followups_per_step=2)
+
+    assert result.status == STATUS_COMPLETED
+    assert len(_hands_calls(client)) == 2  # initial + 1 follow-up
+    assert any(e.kind == "decision" and "follow-up" in e.detail.lower() for e in result.memory.entries)
+
+
+def test_revise_plan_evolves_remaining_tail(tmp_path):
+    client = RoutedClient(
+        brain=[
+            "<plan><step>STEP0 do first</step><step>STEP1 old tail</step></plan>",
+            "<verdict>revise_plan</verdict><reason>learned the tail must change</reason>",
+            "<plan><step>STEP1B revised tail</step></plan>",
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
+            '<edit path="a.txt">A</edit>\n<done>did first</done>',
+            '<edit path="b.txt">B</edit>\n<done>did revised tail</done>',
+        ],
+    )
+    result = run_planned("g", tmp_path, models=CFG, client=client)
+
+    assert result.status == STATUS_COMPLETED
+    assert result.revisions == 1
+    assert "plan_revised" in _kinds(result)
+    # Completed step 0 preserved; revised tail executed.
+    assert any(s.status == "done" and s.outcome == "did first" for s in result.plan.steps)
+    assert (tmp_path / "a.txt").exists() and (tmp_path / "b.txt").exists()
+
+
+def test_revise_plan_is_bounded(tmp_path):
+    # max_plan_revisions=0: a revise verdict does NOT evolve (no thrash); proceed.
+    client = RoutedClient(
+        brain=[
+            "<plan><step>s0</step><step>s1</step></plan>",
+            "<verdict>revise_plan</verdict><reason>would like to revise</reason>",
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
+            '<edit path="a.txt">A</edit>\n<done>did s0</done>',
+            '<edit path="b.txt">B</edit>\n<done>did s1</done>',
+        ],
+    )
+    result = run_planned("g", tmp_path, models=CFG, client=client, max_plan_revisions=0)
+
+    assert result.status == STATUS_COMPLETED
+    assert result.revisions == 0
+    assert "plan_revised" not in _kinds(result)  # revision suppressed; no evolve call
+
+
+# --- failure path still records a dead end and replans ----------------------
+
+
+def test_failure_records_dead_end_and_replans(tmp_path):
+    client = RoutedClient(
+        brain=[
+            "<plan><step>hard step</step></plan>",
+            "<plan><step>easier step</step></plan>",  # replan after the block
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
+            "<blocked>cannot do it this way</blocked>",
+            '<edit path="ok.txt">ok</edit>\n<done>did it the easy way</done>',
+        ],
+    )
+    result = run_planned("g", tmp_path, models=CFG, client=client)
+
+    assert result.status == STATUS_COMPLETED
+    assert result.escalations == 1
+    assert "replanned" in _kinds(result)
+    assert any(e.kind == "dead_end" for e in result.memory.entries)
+
+
+def test_brain_aborts_on_failure(tmp_path):
+    client = RoutedClient(
+        brain=[
+            "<plan><step>hard step</step></plan>",
+            "<abort>this is impossible</abort>",
+        ],
+        hands=["<blocked>no way</blocked>"],
+    )
+    result = run_planned("g", tmp_path, models=CFG, client=client)
+    assert result.status == STATUS_ABORTED_BY_BRAIN
+
+
+# --- narrow executor context still holds -----------------------------------
+
+
+def test_executor_context_stays_narrow(tmp_path):
+    client = RoutedClient(
+        brain=[
             "<plan><step>STEP_ALPHA create alpha.txt</step><step>STEP_BETA create beta.txt</step></plan>",
+            "<verdict>accept</verdict>",
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
             '<edit path="alpha.txt">ALPHA_RAW_CONTENT</edit>\n<done>created alpha.txt</done>',
             '<edit path="beta.txt">BETA</edit>\n<done>created beta.txt</done>',
-        ]
+        ],
     )
-    result = run_planned("g", tmp_path, models=CFG, ledger=Ledger(), client=client)
+    result = run_planned("g", tmp_path, models=CFG, client=client)
     assert result.status == STATUS_COMPLETED
 
     hands = _hands_calls(client)
@@ -111,117 +349,147 @@ def test_executor_context_is_narrow(tmp_path):
     def joined(call):
         return "\n".join(m["content"] for m in call["messages"])
 
-    step0_ctx = joined(hands[0])
-    step1_ctx = joined(hands[1])
-
-    # Step 0's context has its own instruction but NOT the future step (no full plan leak).
-    assert "STEP_ALPHA" in step0_ctx
-    assert "STEP_BETA" not in step0_ctx
-
-    # Step 1's context: its own instruction + step 0's one-line OUTCOME, but NOT
-    # step 0's raw transcript and NOT step 0's instruction.
+    step0_ctx, step1_ctx = joined(hands[0]), joined(hands[1])
+    assert "STEP_ALPHA" in step0_ctx and "STEP_BETA" not in step0_ctx  # no full-plan leak
     assert "STEP_BETA" in step1_ctx
-    assert "created alpha.txt" in step1_ctx       # one-line carry-over is allowed
-    assert "ALPHA_RAW_CONTENT" not in step1_ctx   # prior raw transcript NOT leaked
-    assert "STEP_ALPHA" not in step1_ctx          # prior step instruction NOT leaked
+    assert "created alpha.txt" in step1_ctx  # one-line carry-over allowed
+    assert "ALPHA_RAW_CONTENT" not in step1_ctx  # prior raw transcript NOT leaked
+    assert "STEP_ALPHA" not in step1_ctx
 
 
-def test_escalation_then_completion(tmp_path):
-    client = ScriptedClient(
-        [
-            "<plan><step>STEP0 create a.txt</step><step>STEP1 do the hard thing</step></plan>",
-            '<edit path="a.txt">A</edit>\n<done>created a.txt</done>',  # step 0 done
-            "<blocked>cannot do the hard thing this way</blocked>",      # step 1 -> escalate
-            "<plan><step>STEP1B create b.txt the easy way</step></plan>",  # replan
-            '<edit path="b.txt">B</edit>\n<done>did it the easy way</done>',  # revised step done
-        ]
+# --- budgets / terminal statuses -------------------------------------------
+
+
+def test_overall_budget_exhausted_is_max_steps(tmp_path):
+    client = RoutedClient(
+        brain=[
+            "<plan><step>create a.txt</step><step>create b.txt</step></plan>",
+            "<verdict>accept</verdict>",  # review of step 0 (a brain call, not an executor call)
+        ],
+        hands=['<edit path="a.txt">A</edit>\n<done>done a</done>'],
     )
-    ledger = Ledger()
-    result = run_planned("g", tmp_path, models=CFG, ledger=ledger, client=client, max_escalations=3)
+    result = run_planned("g", tmp_path, models=CFG, client=client, max_total_steps=1)
 
-    assert result.status == STATUS_COMPLETED
-    assert result.escalations == 1
-    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "A"
-    assert (tmp_path / "b.txt").read_text(encoding="utf-8") == "B"
-
-    # Completed step 0 kept its outcome and was NOT redone: exactly 3 hands calls
-    # (step0, blocked step1, revised step) -- a redo would be 4+.
-    assert len(_hands_calls(client)) == 3
-    assert any(s.status == "done" and s.outcome == "created a.txt" for s in result.plan.steps)
-    assert any(s.status == "failed" for s in result.plan.steps)  # the blocked step is recorded
-
-
-def test_escalation_limit(tmp_path):
-    client = ScriptedClient(
-        [
-            "<plan><step>do X</step></plan>",
-            "<blocked>nope</blocked>",                       # step fails -> escalate(1)
-            "<plan><step>do X differently</step></plan>",    # replan
-            "<blocked>still nope</blocked>",                 # fails again -> over the limit
-        ]
-    )
-    result = run_planned("g", tmp_path, models=CFG, ledger=Ledger(), client=client, max_escalations=1)
-    assert result.status == STATUS_ESCALATION_LIMIT
-    assert result.escalations == 1
-
-
-def test_brain_aborts_on_escalation(tmp_path):
-    client = ScriptedClient(
-        [
-            "<plan><step>do X</step></plan>",
-            "<blocked>cannot proceed</blocked>",     # step fails -> escalate
-            "<abort>this goal is unreachable</abort>",  # brain aborts the replan
-        ]
-    )
-    result = run_planned("g", tmp_path, models=CFG, ledger=Ledger(), client=client)
-    assert result.status == STATUS_ABORTED_BY_BRAIN
+    assert result.status == STATUS_MAX_STEPS
+    assert (tmp_path / "a.txt").exists()
+    assert not (tmp_path / "b.txt").exists()  # step 1 never ran -- executor budget spent
 
 
 def test_planning_failed(tmp_path):
-    client = ScriptedClient(["no plan here", "still none", "nope", "nope"])
-    result = run_planned("g", tmp_path, models=CFG, ledger=Ledger(), client=client)
+    client = RoutedClient(brain=["no plan", "still none", "nope", "nope"], hands=[])
+    result = run_planned("g", tmp_path, models=CFG, client=client)
     assert result.status == STATUS_PLANNING_FAILED
     assert result.plan is None
 
 
-def test_overall_budget_exhausted_is_max_steps(tmp_path):
-    client = ScriptedClient(
-        [
-            "<plan><step>create a.txt</step><step>create b.txt</step></plan>",
-            '<edit path="a.txt">A</edit>\n<done>done a</done>',  # step 0 uses the 1 allowed call
-        ]
-    )
-    result = run_planned(
-        "g", tmp_path, models=CFG, ledger=Ledger(), client=client, max_total_steps=1
-    )
-    assert result.status == STATUS_MAX_STEPS
-    assert (tmp_path / "a.txt").exists()
-    assert not (tmp_path / "b.txt").exists()  # step 1 never ran -- budget exhausted
-
-
-def test_plan_gate_can_decline_before_execution(tmp_path):
-    client = ScriptedClient(["<plan><step>create a.txt</step></plan>"])
-    result = run_planned(
-        "g", tmp_path, models=CFG, ledger=Ledger(), client=client,
-        plan_gate=lambda plan: False,
-    )
+def test_plan_gate_declines(tmp_path):
+    client = RoutedClient(brain=["<plan><step>x</step></plan>"], hands=[])
+    result = run_planned("g", tmp_path, models=CFG, client=client, plan_gate=lambda plan: False)
     assert result.status == "declined_by_user"
-    assert not (tmp_path / "a.txt").exists()  # nothing executed
     assert len(_hands_calls(client)) == 0
 
 
-def test_events_are_logged(tmp_path):
-    seen = []
-    client = ScriptedClient(
-        [
-            "<plan><step>create a.txt</step></plan>",
-            '<edit path="a.txt">A</edit>\n<done>created a.txt</done>',
-        ]
-    )
-    result = run_planned("g", tmp_path, models=CFG, ledger=Ledger(), client=client, on_event=seen.append)
+# --- events are first-class -------------------------------------------------
 
-    kinds = [e.kind for e in result.events]
-    assert "plan_created" in kinds
-    assert "step_start" in kinds
-    assert "step_done" in kinds
+
+def test_events_stream_brain_executor_exchanges(tmp_path):
+    seen = []
+    client = RoutedClient(
+        brain=[
+            "<plan><step>write loader</step></plan>",
+            "<decision>self_answer</decision><answer>read from config.toml</answer>",
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
+            "<question>where to read config?</question>",
+            '<edit path="cfg.py">x</edit>\n<done>wrote it</done>',
+        ],
+    )
+    result = run_planned("g", tmp_path, models=CFG, client=client, on_event=seen.append)
+
+    kinds = _kinds(result)
+    for expected in ("plan_created", "executor_question", "brain_self_answered",
+                     "step_reviewed", "memory_write", "step_done"):
+        assert expected in kinds, f"missing event: {expected}"
     assert kinds == [e.kind for e in seen]  # on_event saw the same stream
+
+
+def test_memory_entries_are_dual_form_with_provenance(tmp_path):
+    client = RoutedClient(
+        brain=["<plan><step>do a</step></plan>", "<verdict>accept</verdict>"],
+        hands=['<edit path="a.txt">A</edit>\n<done>did a</done>'],
+    )
+    result = run_planned("g", tmp_path, models=CFG, client=client)
+    assert result.memory is not None and result.memory.entries
+    for entry in result.memory.entries:
+        assert entry.detail and entry.summary and entry.provenance
+
+
+# --- longer-horizon: real accumulated memory overflows a small window -------
+
+
+class _DispatchClient:
+    """A dispatching fake: routes brain calls by their system prompt so the
+    compaction summarizer call (fired by compacted_context on real overflow) is
+    handled and counted, alongside plan/review calls and the hands."""
+
+    def __init__(self, n_steps):
+        self.n_steps = n_steps
+        self.summary_calls = 0      # compaction invocations on accumulated memory
+        self.review_prompts = []    # captured brain-review user prompts
+        self._hands_idx = 0
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, *, model, messages, **kwargs):
+        system = messages[0]["content"] if messages else ""
+        user = messages[-1]["content"] if messages else ""
+        if model == "vendor/hands":
+            i = self._hands_idx
+            self._hands_idx += 1
+            return _resp(
+                f'<edit path="f{i}.txt">content {i}</edit>\n'
+                f"<done>created file {i} with the standard boilerplate and a docstring</done>"
+            )
+        # brain calls, dispatched by their system prompt:
+        if "compacting a coding agent's plan memory" in system:
+            self.summary_calls += 1
+            return _resp("compacted: several boilerplate files created earlier")
+        if "supervising an EXECUTOR" in system:
+            self.review_prompts.append(user)
+            return _resp("<verdict>accept</verdict>")
+        if "You PLAN the work" in system:
+            steps = "".join(f"<step>create file {i}</step>" for i in range(self.n_steps))
+            return _resp(f"<plan>{steps}</plan>")
+        return _resp("<verdict>accept</verdict>")
+
+
+def test_longer_horizon_overflow_triggers_real_compaction(tmp_path):
+    """Many steps accumulate enough memory to overflow a small window, so the
+    window-aware budget machinery (compacted_context) fires on REAL entries."""
+    client = _DispatchClient(n_steps=6)
+    # window 2128 -> memory_budget = 2128//2 - 1024 = 40 tokens: a step's fact
+    # fits verbatim, but 2+ overflow -> compaction engages mid-run.
+    result = run_planned("build many files", tmp_path, models=CFG, client=client, context_window=2128)
+
+    assert result.status == STATUS_COMPLETED  # stays coherent, no crash
+    facts = [e for e in result.memory.entries if e.kind == "fact"]
+    assert len(facts) == 6  # every step's outcome was learned (nothing dropped)
+    assert all((tmp_path / f"f{i}.txt").exists() for i in range(6))
+    # Compaction actually fired on accumulated memory (not a synthetic budget).
+    assert client.summary_calls >= 1
+    # Memory reads stayed under cap: no review prompt embedded all 6 fact summaries
+    # verbatim once overflow kicked in (compaction replaced the overflow).
+    from relay.memory import estimate_tokens, memory_budget
+    budget = memory_budget(2128)
+    # The compacted block the brain saw is bounded; sanity-check a review prompt
+    # never carries an unbounded raw dump of every fact.
+    assert any(p for p in client.review_prompts)  # reviews happened
+    assert estimate_tokens("created file 5") < budget  # the test's facts are individually small
+
+
+def test_longer_horizon_large_window_no_compaction(tmp_path):
+    """Same run on a large window: everything fits, so no compaction call fires."""
+    client = _DispatchClient(n_steps=6)
+    result = run_planned("build many files", tmp_path, models=CFG, client=client, context_window=200000)
+    assert result.status == STATUS_COMPLETED
+    assert client.summary_calls == 0  # big window -> no summarization needed

@@ -92,6 +92,11 @@ _EXEC_PARSE_NUDGE = (
     "<question>...</question>, <done>...</done>, or <blocked>...</blocked>."
 )
 
+# Per-entry cap for the reviewer-facing transcript copy, so one huge file read or
+# bash output cannot bloat memory or the review prompt. (The executor's own
+# message context keeps the full observation -- it needs it.)
+_TRANSCRIPT_ENTRY_CAP = 2000
+
 # Callback the CLI uses to stream the run; receives whole Events.
 EventCallback = Callable[["Event"], None]
 
@@ -259,7 +264,7 @@ def _run_executor_step(
                     )
                 answer_obs = f"[question]\nANSWER: {resolution.answer}"
                 observations.append(answer_obs)
-                transcript.append(answer_obs)
+                transcript.append(answer_obs[:_TRANSCRIPT_ENTRY_CAP])
                 break  # stop this turn; feed the answer back so the executor continues
             if action.kind in ("plan", "abort"):
                 observations.append(
@@ -272,7 +277,7 @@ def _run_executor_step(
                 emit("exec_action", describe_action(action), {"kind": action.kind, "observation": observation})
             rendered = f"[{describe_action(action)}]\n{observation}"
             observations.append(rendered)
-            transcript.append(rendered)
+            transcript.append(rendered[:_TRANSCRIPT_ENTRY_CAP])
 
         messages.append(
             {"role": "user", "content": "\n\n".join(observations) if observations else "(no output)"}
@@ -337,6 +342,12 @@ def run_planned(
     used to size memory reads). ``user_decision(question) -> answer`` is the
     escalation seam; with none available, a product decision ends the run with
     status ``unresolved_escalation`` rather than guessing.
+
+    Note: a single step's executor ceiling is ``max_executor_steps *
+    (1 + max_followups_per_step)`` (each supervised follow-up re-runs the
+    executor with its own budget); ``max_total_steps`` is the hard global cap.
+    Review/answer/evolve are brain calls and do NOT count against the executor
+    budget.
     """
     ledger = ledger if ledger is not None else Ledger()
     memory = memory if memory is not None else PlanMemory()

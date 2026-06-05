@@ -167,6 +167,19 @@ def test_runs_command_shows_persisted_runs(tmp_path, monkeypatch):
 # --- run persistence wiring -------------------------------------------------
 
 
+def _patch_conversation(monkeypatch, *, committed=True):
+    """Patch plan_conversationally to a network-free fake that commits a 1-step plan."""
+    from relay.conversation import ConversationResult
+    from relay.planner import Plan
+
+    def fake_conversation(goal, root, **kwargs):
+        plan = Plan.from_instructions(["do a"]) if committed else Plan(steps=[])
+        return ConversationResult(goal=goal, scope="small", posture="propose_fast",
+                                  plan=plan, committed=committed)
+
+    monkeypatch.setattr(cli, "plan_conversationally", fake_conversation)
+
+
 def _patch_planned(monkeypatch, status="completed"):
     """Patch run_planned to a network-free fake that fills the ledger + returns a result."""
     from relay.orchestrator import PlannedTaskResult
@@ -175,6 +188,7 @@ def _patch_planned(monkeypatch, status="completed"):
 
     monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/brain", hands="vendor/hands"))
     monkeypatch.setattr(cli, "_warn_if_dirty_git", lambda root: None)
+    _patch_conversation(monkeypatch)
 
     def fake_run_planned(goal, root, **kwargs):
         ledger = kwargs["ledger"]
@@ -230,6 +244,7 @@ def _capture_run_planned(monkeypatch, *, status="completed", events=()):
     captured = {}
     monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/brain", hands="vendor/hands"))
     monkeypatch.setattr(cli, "_warn_if_dirty_git", lambda root: None)
+    _patch_conversation(monkeypatch)
 
     def fake_run_planned(goal, root, **kwargs):
         captured.update(kwargs)
@@ -288,3 +303,75 @@ def test_run_surfaces_unresolved_escalation(tmp_path, monkeypatch):
     result = runner.invoke(app, ["run", "-g", "x", "--root", str(tmp_path), "--no-log"])
     assert result.exit_code == 0
     assert "UNRESOLVED ESCALATION" in result.output
+
+
+# --- v0.08: conversation + dial CLI wiring ---------------------------------
+
+
+def test_run_assume_flag_threads_dial_to_both_sites(tmp_path, monkeypatch):
+    from relay.conversation import ConversationResult
+    from relay.orchestrator import PlannedTaskResult
+    from relay.planner import Plan
+    from relay.telemetry import CallRecord
+
+    monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/brain", hands="vendor/hands"))
+    monkeypatch.setattr(cli, "_warn_if_dirty_git", lambda root: None)
+
+    conv_kw, run_kw = {}, {}
+
+    def fake_conv(goal, root, **kwargs):
+        conv_kw.update(kwargs)
+        return ConversationResult(goal=goal, plan=Plan.from_instructions(["x"]), committed=True)
+
+    def fake_run(goal, root, **kwargs):
+        run_kw.update(kwargs)
+        kwargs["ledger"].add(CallRecord("brain", "vendor/brain", 1, 1, 0.0, 0.0))
+        return PlannedTaskResult(goal=goal, plan=Plan.from_instructions(["x"]), status="completed", ledger=kwargs["ledger"])
+
+    monkeypatch.setattr(cli, "plan_conversationally", fake_conv)
+    monkeypatch.setattr(cli, "run_planned", fake_run)
+
+    result = runner.invoke(app, ["run", "-g", "x", "--root", str(tmp_path), "--no-log", "--assume", "1"])
+    assert result.exit_code == 0
+    assert conv_kw["assumption_level"] == "1"   # dial reaches the conversation
+    assert run_kw["assumption_level"] == "1"    # ...and the autonomous loop
+
+
+def test_run_not_committed_does_not_execute(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/brain", hands="vendor/hands"))
+    monkeypatch.setattr(cli, "_warn_if_dirty_git", lambda root: None)
+    _patch_conversation(monkeypatch, committed=False)
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("run_planned must not be called when the plan is not committed")
+
+    monkeypatch.setattr(cli, "run_planned", _must_not_run)
+
+    result = runner.invoke(app, ["run", "-g", "x", "--root", str(tmp_path), "--no-log"])
+    assert result.exit_code == 0
+    assert "not committed" in result.output
+
+
+def test_confirm_plan_uses_one_round(tmp_path, monkeypatch):
+    from relay.conversation import ConversationResult
+    from relay.orchestrator import PlannedTaskResult
+    from relay.planner import Plan
+    from relay.telemetry import CallRecord
+
+    monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/brain", hands="vendor/hands"))
+    monkeypatch.setattr(cli, "_warn_if_dirty_git", lambda root: None)
+    conv_kw = {}
+
+    def fake_conv(goal, root, **kwargs):
+        conv_kw.update(kwargs)
+        return ConversationResult(goal=goal, plan=Plan.from_instructions(["x"]), committed=True)
+
+    def fake_run(goal, root, **kwargs):
+        kwargs["ledger"].add(CallRecord("brain", "vendor/brain", 1, 1, 0.0, 0.0))
+        return PlannedTaskResult(goal=goal, plan=Plan.from_instructions(["x"]), status="completed", ledger=kwargs["ledger"])
+
+    monkeypatch.setattr(cli, "plan_conversationally", fake_conv)
+    monkeypatch.setattr(cli, "run_planned", fake_run)
+
+    runner.invoke(app, ["run", "-g", "x", "--root", str(tmp_path), "--no-log", "--confirm-plan"])
+    assert conv_kw["max_rounds"] == 1  # --confirm-plan is the degenerate 1-round case

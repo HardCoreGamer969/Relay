@@ -18,8 +18,9 @@ from rich.panel import Panel
 from rich.table import Table
 
 from relay.client import build_client
-from relay.config import load_models
+from relay.config import load_models, resolve_assumption_level
 from relay.context import resolve_context_window
+from relay.conversation import DEFAULT_MAX_ROUNDS, plan_conversationally
 from relay.loop import (
     STATUS_COMPLETED,
     STATUS_MAX_STEPS,
@@ -35,6 +36,7 @@ from relay.orchestrator import (
     STATUS_PLANNING_FAILED,
     STATUS_UNRESOLVED_ESCALATION,
     Event,
+    PlannedTaskResult,
     run_planned,
 )
 from relay.runlog import append_record, build_record, default_log_path, load_records
@@ -152,21 +154,27 @@ def run(
         False, "--no-supervise",
         help="Disable brain supervision (no step-boundary review calls).",
     ),
+    assume: str = typer.Option(
+        "", "--assume",
+        help="Assumption dial: 1 (assume freely) .. 5 (follow the letter) or 'auto'. "
+        "Overrides RELAY_ASSUMPTION_LEVEL for this run.",
+    ),
     no_log: bool = typer.Option(
         False, "--no-log", help="Skip persisting this run to .relay/runs.jsonl."
     ),
 ) -> None:
     """Run the agent against a goal.
 
-    Default: the two-role brain (planner) + hands (executor) architecture. The
-    brain supervises at step boundaries, answers the executor's questions itself
-    when it can, and escalates product decisions to you. Use --solo <role> for
-    the single-model loop. Each run is persisted to <root>/.relay/runs.jsonl
-    (see `relay runs`) unless --no-log is given.
+    Default: the two-role brain (planner) + hands (executor) architecture. Planning
+    is a conversation -- the brain assesses scope, proposes (or asks, per the
+    assumption dial), you react in plain language, and only on commit does it hand
+    off to the autonomous loop. Use --solo <role> for the single-model loop. Each
+    run is persisted to <root>/.relay/runs.jsonl (see `relay runs`) unless --no-log.
     """
     cfg = load_models()
     ledger = Ledger()
     approver = None if auto_approve else _interactive_approver
+    dial = resolve_assumption_level(override=assume or None)
     _warn_if_dirty_git(root)
 
     mode = "solo" if solo else "planned"
@@ -175,7 +183,8 @@ def run(
         result = _run_solo(goal, root, solo, max_steps, cfg, ledger, auto_approve, approver)
     else:
         result = _run_planned(
-            goal, root, cfg, ledger, auto_approve, approver, confirm_plan, supervise=not no_supervise
+            goal, root, cfg, ledger, auto_approve, approver, confirm_plan,
+            supervise=not no_supervise, dial=dial,
         )
     wall_time_s = time.perf_counter() - start
 
@@ -220,30 +229,74 @@ def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver):
     return result
 
 
-def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, *, supervise=True):
-    """The two-role brain/hands architecture (the default)."""
+def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, *,
+                 supervise=True, dial="auto"):
+    """Conversational planning -> commit -> the two-role autonomous loop."""
     bash_policy = "auto-approve" if auto_approve else "interactive approval"
     console.print(
         Panel(
             f"[bold]{goal}[/bold]\nroot={root}\nbrain={cfg.brain}\nhands={cfg.hands}\n"
-            f"bash policy={bash_policy}  supervision={'on' if supervise else 'off'}",
+            f"bash policy={bash_policy}  supervision={'on' if supervise else 'off'}  "
+            f"assume={dial}",
             title="Relay run (brain + hands)",
             border_style="cyan",
         )
     )
+
+    # 1. Plan as a conversation (--confirm-plan = the degenerate 1-round case).
+    try:
+        conversation = plan_conversationally(
+            goal, root, models=cfg, ledger=ledger, client=None,
+            assumption_level=dial, user_turn=_interactive_user_turn,
+            max_rounds=1 if confirm_plan else DEFAULT_MAX_ROUNDS,
+            on_event=_print_conv_event,
+        )
+    except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
+        _print_run_error(exc)
+        raise typer.Exit(code=1)
+
+    if not conversation.committed or conversation.plan is None or not conversation.plan.steps:
+        console.print("\n[yellow]plan not committed; nothing executed[/yellow]")
+        return PlannedTaskResult(goal=goal, plan=conversation.plan, status=STATUS_DECLINED, ledger=ledger)
+
+    # 2. Execute the committed plan (the dial keeps biasing answer_or_escalate).
     try:
         result = run_planned(
             goal, root, models=cfg, ledger=ledger, client=None,
             approver=approver, auto_approve=auto_approve,
             supervise=supervise, user_decision=_interactive_user_decision,
+            assumption_level=dial, committed_plan=conversation.plan,
             on_event=_print_event,
-            plan_gate=_confirm_plan_gate if confirm_plan else None,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)
         raise typer.Exit(code=1)
     _print_planned_status(result)
     return result
+
+
+def _interactive_user_turn(prompt: str) -> str:
+    """Conversation seam: show the brain's question or proposed plan, read a reply."""
+    console.print(Panel(prompt, title="Planning", border_style="cyan"))
+    return typer.prompt("You")
+
+
+def _print_conv_event(kind: str, message: str, payload: dict) -> None:
+    """Render planning-conversation events (ASCII-safe; the prompts themselves
+    are shown by the interactive user_turn panel)."""
+    if kind == "scope_assessed":
+        console.print(
+            f"[magenta]scope:[/magenta] {payload.get('scope')} -> posture "
+            f"{payload.get('posture')}  ([dim]{payload.get('reason', '')}[/dim])"
+        )
+    elif kind == "plan_proposed":
+        console.print("[magenta]brain proposed a plan[/magenta]")
+    elif kind == "plan_revised":
+        console.print("[magenta]brain revised the plan from your reaction[/magenta]")
+    elif kind == "committed":
+        console.print("[green]plan committed -- handing to the autonomous loop[/green]")
+    elif kind == "not_committed":
+        console.print(f"[yellow]{message}[/yellow]")
 
 
 def _interactive_user_decision(question: str) -> str:

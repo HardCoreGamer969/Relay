@@ -17,6 +17,11 @@ Supported tags::
     <plan><step>...</step>...</plan>         the brain's ordered plan (v0.04)
     <abort>reason</abort>                    the brain: goal is unreachable (v0.04)
     <blocked>reason</blocked>                the executor: stuck on this step (v0.04)
+    <question>...</question>                 the executor: needs info to proceed (v0.06)
+
+``<question>`` is distinct from ``<blocked>``: a question is mid-step (the brain
+answers it or escalates, then the executor continues), whereas ``<blocked>`` ends
+the step.
 
 ``<done>`` is context-dependent in v0.04: from the **executor** it means *this
 step* is complete (not the whole task); the task completes when the plan is
@@ -33,7 +38,7 @@ import re
 from dataclasses import dataclass, field
 
 # Action kinds the parser can produce.
-KINDS = ("read", "list", "grep", "edit", "bash", "done", "plan", "abort", "blocked")
+KINDS = ("read", "list", "grep", "edit", "bash", "done", "plan", "abort", "blocked", "question")
 
 
 @dataclass
@@ -92,6 +97,7 @@ _PLAN_RE = re.compile(r"<plan>(.*?)</plan>", re.DOTALL)
 _STEP_RE = re.compile(r"<step>(.*?)</step>", re.DOTALL)
 _ABORT_RE = re.compile(r"<abort>(.*?)</abort>", re.DOTALL)
 _BLOCKED_RE = re.compile(r"<blocked>(.*?)</blocked>", re.DOTALL)
+_QUESTION_RE = re.compile(r"<question>(.*?)</question>", re.DOTALL)
 _EDIT_RE = re.compile(r"""<edit\s+([^>]*?)>(.*?)</edit>""", re.DOTALL)
 _BASH_RE = re.compile(r"<bash>(.*?)</bash>", re.DOTALL)
 _DONE_RE = re.compile(r"<done>(.*?)</done>", re.DOTALL)
@@ -183,6 +189,9 @@ def parse(text: str) -> ParseResult:
     consume(_EDIT_RE, _add_edit)
     consume(_BASH_RE, lambda m: placed.append((m.start(), Action(kind="bash", content=m.group(1).strip()))))
     consume(_DONE_RE, lambda m: placed.append((m.start(), Action(kind="done", content=m.group(1).strip()))))
+    # After edit/bash/done so a <question> mentioned inside one of their bodies
+    # (e.g. an <edit> file body) is masked first and not parsed as a loose action.
+    consume(_QUESTION_RE, lambda m: placed.append((m.start(), Action(kind="question", content=m.group(1).strip()))))
 
     # Self-closing tags last, scanned over the fully-masked text.
     for m in _SELF_CLOSING_RE.finditer(masked):

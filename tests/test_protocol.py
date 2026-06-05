@@ -117,3 +117,27 @@ def test_empty_plan_has_no_steps():
     assert plan.steps == []
     # plan_steps reflects the (empty) list, and the planner treats this as no plan.
     assert result.plan_steps == []
+
+
+# --- v0.06: executor <question> tag ----------------------------------------
+
+
+def test_question_parses_with_content():
+    result = parse("<thinking>hmm</thinking><question>Which database should I use?</question>")
+    assert not result.is_parse_failure
+    q = result.first("question")
+    assert q is not None and q.content == "Which database should I use?"
+
+
+def test_question_distinct_from_blocked():
+    result = parse("<question>need the API base url</question>")
+    assert result.first("question") is not None
+    assert result.first("blocked") is None  # a question is not a block
+
+
+def test_question_inside_edit_body_is_not_parsed_loose():
+    text = '<edit path="notes.md">TODO: ask <question>which db?</question> later</edit>'
+    result = parse(text)
+    assert [a.kind for a in result.actions] == ["edit"]
+    assert result.first("question") is None
+    assert "<question>which db?</question>" in result.actions[0].content

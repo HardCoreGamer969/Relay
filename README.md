@@ -43,11 +43,14 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.05 (durable runs + `relay doctor`)
+## Status — v0.06 (plan-memory substrate)
 
-The two-role architecture (v0.04) is live; v0.05 makes runs **comparable over
-time** by persisting each one as a structured record, and adds a **`relay doctor`**
-preflight that checks the configured model slugs before a run can 404 on them.
+The two-role architecture (v0.04) is live and runs are persisted (v0.05). v0.06
+adds the substrate for an upcoming autonomous, *learning* planner loop: a
+within-run **plan memory** store that is **context-window-aware**, so it works on
+any brain — from a 200K frontier model down to an 8K local one. (The autonomous
+loop that *reads* this memory is the next milestone; this milestone builds and
+proves only the store.)
 
 **What exists now:**
 
@@ -62,8 +65,61 @@ preflight that checks the configured model slugs before a run can 404 on them.
 - `relay/planner.py` — **the brain**: `make_plan(...)` and `replan(...)`.
 - `relay/orchestrator.py` — **the two-role loop**: `run_planned(...)`, narrow executor context, bounded escalation.
 - `relay/runlog.py` — **durable run records**: `RunRecord` + `build_record` / `append_record` / `load_records` (JSONL).
-- `relay/cli.py` — `relay models`, `relay demo`, `relay run`, **`relay runs`**, and **`relay doctor`**.
-- Network-free tests for the protocol, tools, loop, policy, planner, orchestrator, run log, and CLI.
+- `relay/memory.py` — **plan memory**: `PlanMemory` of dual-fidelity `MemoryEntry` values, budget-bounded `relevant(...)`, compress-not-truncate `compacted_context(...)`.
+- `relay/context.py` — **context-window awareness**: `resolve_context_window(...)` (override → OpenRouter metadata → local probe → default).
+- `relay/cli.py` — `relay models`, `relay demo`, `relay run`, `relay runs`, and `relay doctor` (now reports the resolved brain window).
+- Network-free tests for the protocol, tools, loop, policy, planner, orchestrator, run log, CLI, memory, and context.
+
+## Plan memory (within-run)
+
+Plan memory is the brain's **within-run knowledge** — facts it discovered,
+decisions it made (with rationale), user confirmations, and dead ends —
+accumulated as a run progresses and discarded when the run ends. It is reasoning
+state, **not** telemetry: it is in-process only and never touches `runs.jsonl`.
+(The autonomous loop that reads it lands in the next milestone; v0.06 is just the
+store and its window adaptivity.)
+
+Each `MemoryEntry` is **dual-fidelity** — a precise `detail` (for the brain and
+executors) and a plain `summary` (for humans) — plus `kind`
+(`fact`/`decision`/`confirmation`/`dead_end`), `provenance`, a monotonic
+`created_at`, and optional `tags`. `PlanMemory` is an append log (entries are
+never silently dropped), kept value-shaped so a point-in-time copy is cheap
+(`to_state()` / `from_state()`).
+
+The point is that memory is **queryable and sliceable, never a transcript blob**,
+because it must shrink to fit any brain's context window:
+
+- **Window-aware budget.** `resolve_context_window(model)` finds the brain's
+  window; `memory_budget(window)` reserves headroom and allots a fraction
+  (default 50%, minus a 1024-token reserve) to memory.
+- **Budget-driven slicing.** `relevant(query, budget_tokens=...)` ranks entries
+  (keyword/tag overlap + kind weight + recency — a dependency-light deterministic
+  heuristic, no embeddings) and returns the most relevant that *fit the budget* —
+  on a 200K window that may be everything; under an 8K-derived budget just a few.
+  Same store, same code; the budget just tightens.
+- **Compress, don't truncate.** When relevant memory overflows the budget,
+  `compacted_context(...)` keeps the top entries verbatim and replaces the
+  overflow with one brain-written compact summary (attributed in telemetry) — the
+  *knowledge* survives even when the *detail* can't. If the summarizer fails it
+  degrades to a noted hard-trim; it never crashes.
+- **Honest small-window warning.** `small_window_warning(memory, window)` fires
+  when the window is too small to slice the working set, so Relay says so rather
+  than degrading silently.
+
+### Knowing the window: declare → discover → default
+
+Relay resolves the brain's context window in strict priority order, and discovery
+never crashes a run (a failed step falls through):
+
+1. **Declare** — `RELAY_BRAIN_CONTEXT` (env) or an explicit override always wins.
+2. **Discover** — OpenRouter models report `context_length` via the API
+   (cached per process); local runtimes (Ollama / LM Studio / llama.cpp) are
+   probed best-effort.
+3. **Default** — otherwise a conservative `8192`, with a visible note that Relay
+   is guessing and you can declare it via `RELAY_BRAIN_CONTEXT`.
+
+`relay doctor` prints the resolved window and its source
+(`override` / `openrouter` / `local:<runtime>` / `default`).
 
 ### The text protocol (never native tool-calling)
 

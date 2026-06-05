@@ -17,12 +17,25 @@
   ``.relay/runs.jsonl``) so runs are comparable over time, and adds a
   ``relay doctor`` slug preflight. The persisted schema is the durable floor
   the run-matrix (v0.1) will read.
+- v0.06 (substrate) adds within-run **plan memory** (``PlanMemory`` of
+  dual-fidelity ``MemoryEntry`` values) and **context-window awareness**
+  (``resolve_context_window``) so memory is budgeted, sliced, and compressed to
+  fit any brain -- from a 200K frontier model down to an 8K local one. The
+  autonomous loop that reads it is the next milestone.
 """
 
 from __future__ import annotations
 
 from relay.config import ModelConfig, load_models
+from relay.context import DEFAULT_CONTEXT_WINDOW, resolve_context_window
 from relay.loop import StepResult, TaskResult, run_task
+from relay.memory import (
+    MemoryEntry,
+    PlanMemory,
+    estimate_tokens,
+    memory_budget,
+    small_window_warning,
+)
 from relay.models import ModelResult, call_model
 from relay.orchestrator import Event, PlannedTaskResult, run_planned
 from relay.planner import Plan, PlanStep, make_plan, project_digest, replan
@@ -39,7 +52,7 @@ from relay.runlog import (
 from relay.telemetry import CallRecord, Ledger
 from relay.tools import PathEscapeError, ToolError, Tools
 
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 
 __all__ = [
     # v0.01 -- model layer
@@ -81,5 +94,13 @@ __all__ = [
     "load_records",
     "default_log_path",
     "SCHEMA_VERSION",
+    # v0.06 -- plan memory + context-window awareness
+    "PlanMemory",
+    "MemoryEntry",
+    "memory_budget",
+    "small_window_warning",
+    "estimate_tokens",
+    "resolve_context_window",
+    "DEFAULT_CONTEXT_WINDOW",
     "__version__",
 ]

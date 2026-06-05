@@ -72,6 +72,28 @@ def test_doctor_command_exits_zero_when_all_ok(monkeypatch):
     assert "OK" in result.output
 
 
+def test_doctor_reports_context_window(monkeypatch):
+    monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/a", hands="vendor/b"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(cli, "build_client", lambda: FakeDoctorClient(good={"vendor/a", "vendor/b"}))
+    monkeypatch.setattr(cli, "resolve_context_window", lambda model, client=None: (200000, "openrouter"))
+
+    result = runner.invoke(app, ["doctor"])
+    assert "brain context window: 200000 tokens (source: openrouter)" in result.output
+    assert "guessing the window" not in result.output
+
+
+def test_doctor_warns_when_guessing_window(monkeypatch):
+    monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/a", hands="vendor/b"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(cli, "build_client", lambda: FakeDoctorClient(good={"vendor/a", "vendor/b"}))
+    monkeypatch.setattr(cli, "resolve_context_window", lambda model, client=None: (8192, "default"))
+
+    result = runner.invoke(app, ["doctor"])
+    assert "source: default" in result.output
+    assert "RELAY_BRAIN_CONTEXT" in result.output  # the guessing note
+
+
 def test_doctor_command_handles_missing_key(monkeypatch):
     # load_models is patched so it does NOT load .env; with no key, doctor must
     # exit non-zero with a clear message and never build a client.

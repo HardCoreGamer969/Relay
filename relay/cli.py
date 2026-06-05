@@ -19,6 +19,7 @@ from rich.table import Table
 
 from relay.client import build_client
 from relay.config import load_models
+from relay.context import resolve_context_window
 from relay.loop import (
     STATUS_COMPLETED,
     STATUS_MAX_STEPS,
@@ -334,6 +335,16 @@ def doctor(
 
     rows, all_ok = _run_doctor(checks, client)
     _print_doctor_table(rows)
+
+    # Report the brain's context window and how Relay determined it, so the user
+    # can see whether Relay is guessing (and declare it if so).
+    window, source = resolve_context_window(cfg.brain, client=client)
+    console.print(f"brain context window: {window} tokens (source: {source})")
+    if source == "default":
+        console.print(
+            "[yellow]note:[/yellow] guessing the window; declare it via RELAY_BRAIN_CONTEXT."
+        )
+
     raise typer.Exit(code=0 if all_ok else 1)
 
 

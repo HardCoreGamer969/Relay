@@ -12,11 +12,13 @@ import relay.conversation as conv
 from relay.config import ModelConfig
 from relay.conversation import (
     Plan,
+    _derive_headline,
     _derive_plain,
     _is_commit,
     _posture,
     plan_conversationally,
 )
+from relay.transcript import Transcript
 
 CFG = ModelConfig(brain="vendor/brain", hands="vendor/hands")
 
@@ -236,3 +238,76 @@ def test_low_dial_omits_contradiction_directive(monkeypatch):
                           user_turn=_scripted_user("ok"), assumption_level="1")
     joined = " ".join(brain.prompts)
     assert "surface genuine impossibilities or contradictions" not in joined
+
+
+# --- v0.0.10: proposal turns carry a plain HEADLINE, not the full spec -------
+
+
+def test_proposal_transcript_turn_is_headline_not_full_spec(monkeypatch):
+    brain = _install(
+        monkeypatch, "<scope>small</scope><reason>x</reason>",
+        ["<plan>"
+         "<step>Create todo.py in the project root</step>"
+         "<step>Implement add_todo() that appends to todos.json</step>"
+         "<step>Implement list_todos() that prints all todos</step>"
+         "</plan>"
+         "<headline>A single-file Python todo CLI with add and list, storing tasks in JSON.</headline>"],
+    )
+    transcript = Transcript()
+    result = plan_conversationally("a todo cli", ".", models=CFG, client=object(),
+                                   user_turn=_scripted_user("ok"), transcript=transcript)
+    assert result.committed
+    proposals = [t for t in transcript.turns if t.phase == "proposal"]
+    assert len(proposals) == 1
+    turn = proposals[0]
+
+    # The transcript turn is the plain headline...
+    assert turn.text == "A single-file Python todo CLI with add and list, storing tasks in JSON."
+    # ...NOT the full executor spec (no step body / numbered list leaked into the thread).
+    assert "todo.py" not in turn.text and "add_todo()" not in turn.text
+    assert "1." not in turn.text
+    # The FULL plan is intact in the Plan object (execution still has every step).
+    assert [s.instruction for s in result.plan.steps] == [
+        "Create todo.py in the project root",
+        "Implement add_todo() that appends to todos.json",
+        "Implement list_todos() that prints all todos",
+    ]
+    # The turn links back to the steps, so the detail stays recoverable.
+    assert turn.refs == ["step0", "step1", "step2"]
+    # The LIVE display still shows the full plan (only the transcript turn is the headline).
+    assert "add_todo()" in result.plain_plan
+
+
+def test_headline_costs_no_extra_brain_call(monkeypatch):
+    brain = _install(
+        monkeypatch, "<scope>small</scope><reason>x</reason>",
+        ["<plan><step>do a</step><step>do b</step></plan><headline>Build the thing simply.</headline>"],
+    )
+    result = plan_conversationally("g", ".", models=CFG, client=object(),
+                                   user_turn=_scripted_user("ok"))
+    assert result.committed
+    # One scope call + exactly one propose call: the headline rode along in the same
+    # propose generation -- no separate summarization call was added.
+    assert brain.scope_calls == 1
+    assert brain.propose_calls == 1
+
+
+def test_proposal_headline_falls_back_to_derived_when_omitted(monkeypatch):
+    # Brain emits a plan but NO <headline>; the turn must STILL be a short headline
+    # derived from the plan -- never the full step list.
+    _install(monkeypatch, "<scope>small</scope><reason>x</reason>",
+             ["<plan><step>Create alpha</step><step>Create beta</step></plan>"])
+    transcript = Transcript()
+    plan_conversationally("g", ".", models=CFG, client=object(),
+                          user_turn=_scripted_user("ok"), transcript=transcript)
+    turn = [t for t in transcript.turns if t.phase == "proposal"][0]
+    assert turn.text.startswith("Proposed a 2-step plan")
+    assert "Create alpha" in turn.text   # derived FROM the plan (can't describe something else)
+
+
+def test_derive_headline_prefers_brain_text_else_derives():
+    plan = Plan.from_instructions(["alpha step", "beta step"])
+    assert _derive_headline(plan, "  A clean headline.  ") == "A clean headline."
+    derived = _derive_headline(plan, "")
+    assert derived.startswith("Proposed a 2-step plan") and "alpha step" in derived
+    assert _derive_headline(Plan(steps=[]), "") == "Proposed a plan (no steps)."

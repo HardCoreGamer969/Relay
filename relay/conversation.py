@@ -102,11 +102,19 @@ When you turn vague intent into a precise choice, SURFACE that choice as an
 <assume> (plain language) so the user can confirm or correct it -- e.g.
 "make login simple" -> assume "Google sign-in only, no passwords". These surfaced
 assumptions are the consequential additions, not restatements of the goal.
+
+ALSO emit a <headline>: ONE or TWO plain sentences a non-coder can follow, saying
+what you'll build at a high level -- e.g. "A single-file Python todo CLI with
+add/list/done/delete and JSON storage in the project directory." The headline is
+the SAME plan at a plainer fidelity (it must describe THESE steps, not something
+else); keep it free of file names, code, and step-by-step detail. It is what the
+ongoing conversation record shows; the full steps stay in the plan itself.
 """
 
 _PROPOSE_GRAMMAR = (
     "Reply using ONLY these tags:\n"
     "<plan><step>precise executor-sized step</step>...</plan>\n"
+    "<headline>one or two plain sentences describing the plan at a high level</headline>\n"
     "<assume>a consequential choice you made, in plain language</assume>  (zero or more)"
 )
 
@@ -215,10 +223,30 @@ def _assess_scope(
     return ScopeAssessment(size=size, reason=_tag("reason", reply) or "", questions=_tags("ask", reply))
 
 
+def _derive_headline(plan: Plan, headline: str) -> str:
+    """The plain, human-facing headline for a proposal turn.
+
+    Prefers the brain's ``<headline>`` (emitted in the SAME generation as the plan,
+    so it costs no extra call and reflects the same intent). Falls back to a
+    deterministic line computed FROM the plan when the brain omits it, so the
+    transcript turn is always a short headline -- never the full executor spec.
+    """
+    headline = " ".join((headline or "").split())
+    if headline:
+        return headline
+    steps = plan.steps
+    if not steps:
+        return "Proposed a plan (no steps)."
+    first = " ".join(steps[0].instruction.split())
+    if len(first) > 100:
+        first = first[:97] + "..."
+    return f"Proposed a {len(steps)}-step plan; it begins by: {first}"
+
+
 def _propose(
     goal, digest, level, answers, prior_plan, reaction, mem_ctx,
     *, models, ledger, client, brain_role, max_retries=1,
-) -> tuple[Plan, list[str]]:
+) -> tuple[Plan, list[str], str]:
     system = f"{_PROPOSE_SYSTEM}\n{assumption_directive(level)}"
     answers_block = ""
     if answers:
@@ -246,13 +274,15 @@ def _propose(
         parsed = parse(reply)
         plan_action = parsed.first("plan")
         if plan_action is not None and plan_action.steps:
-            return Plan.from_instructions(plan_action.steps[:MAX_PLAN_STEPS]), _tags("assume", reply)
+            plan = Plan.from_instructions(plan_action.steps[:MAX_PLAN_STEPS])
+            # Headline is parsed from the SAME reply -- no extra brain call.
+            return plan, _tags("assume", reply), _derive_headline(plan, _tag("headline", reply) or "")
         if ledger is not None:
             ledger.record_parse_failure()
         messages.append({"role": "assistant", "content": reply})
         messages.append({"role": "user", "content": _PLAN_NUDGE})
 
-    return Plan(steps=[]), []  # bounded: give up to an empty plan rather than loop
+    return Plan(steps=[]), [], ""  # bounded: give up to an empty plan rather than loop
 
 
 def plan_conversationally(
@@ -330,7 +360,7 @@ def plan_conversationally(
             result.questions_asked += 1
 
     # 3. Propose the initial plan (precise spec + surfaced assumptions).
-    plan, assumptions = _propose(
+    plan, assumptions, headline = _propose(
         goal, digest, assumption_level, answers, None, None, mem_ctx,
         models=models, ledger=ledger, client=client, brain_role=brain_role,
     )
@@ -339,7 +369,10 @@ def plan_conversationally(
     result.plain_plan = _derive_plain(plan, assumptions)
     emit("plan_proposed", "plan proposed",
          {"plain": result.plain_plan, "steps": [s.instruction for s in plan.steps], "assumptions": assumptions})
-    transcript.record("brain", "proposal", result.plain_plan)
+    # The transcript (human-facing scroll-back) carries the plain HEADLINE, not the
+    # full executor spec; the steps live in the Plan (linked via refs). The live
+    # display (result.plain_plan, shown by user_turn) keeps the full detail.
+    transcript.record("brain", "proposal", headline, refs=[f"step{s.index}" for s in plan.steps])
 
     # 4. Reaction loop: show -> commit or fold-and-revise, bounded by max_rounds.
     while result.rounds < max_rounds:
@@ -364,7 +397,7 @@ def plan_conversationally(
         transcript.record("user", "reaction", reaction)
         if result.rounds >= max_rounds:
             break  # no further round to show a revision; stop without committing
-        plan, assumptions = _propose(
+        plan, assumptions, headline = _propose(
             goal, digest, assumption_level, answers, plan, reaction, mem_ctx,
             models=models, ledger=ledger, client=client, brain_role=brain_role,
         )
@@ -373,7 +406,7 @@ def plan_conversationally(
         result.plain_plan = _derive_plain(plan, assumptions)
         emit("plan_revised", "plan revised",
              {"plain": result.plain_plan, "steps": [s.instruction for s in plan.steps], "assumptions": assumptions})
-        transcript.record("brain", "proposal", result.plain_plan)
+        transcript.record("brain", "proposal", headline, refs=[f"step{s.index}" for s in plan.steps])
 
     emit("not_committed", f"no commit within {max_rounds} round(s)", {})
     return result

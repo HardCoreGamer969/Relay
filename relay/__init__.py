@@ -40,6 +40,11 @@
   toward **readability** (``compact_transcript`` / ``render_for_brain`` -- recent
   verbatim, older folded into a readable narrative), distinct from plan memory's
   dense compaction, window-bounded for brain reads, run as a post-execution pass.
+- v0.0.10 polishes the transcript before the TUI: a ``proposal`` turn now carries
+  a plain one/two-sentence HEADLINE (emitted in the same generation as the plan,
+  derived from it -- no extra brain call), not the full executor spec, so
+  scroll-back stays readable; and the closing result turn no longer claims it
+  "built everything" when a step failed and was replanned around.
 """
 
 from __future__ import annotations
@@ -101,7 +106,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.9"
+__version__ = "0.0.10"
 
 __all__ = [
     # v0.01 -- model layer

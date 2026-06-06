@@ -136,7 +136,14 @@ simple, so…"). When composing an escalation the brain is handed a window-bound
 slice of the recent thread, so it stays conversationally coherent.
 
 The transcript holds the **conversation**, not an execution log — granular tool
-calls stay in the event stream / `runs.jsonl`, never as turns.
+calls stay in the event stream / `runs.jsonl`, never as turns. A `proposal` turn
+carries a plain one/two-sentence **headline** (e.g. *"A single-file Python todo
+CLI with add/list/done/delete and JSON storage"*), not the full executor spec —
+the headline is emitted in the same generation as the plan (no extra brain call)
+and the full steps stay in the `Plan` (linked via the turn's `refs`), so
+scroll-back reads as prose rather than walls of implementation detail. The closing
+result turn is honest about partial outcomes: a run that recovered from a failed
+step does not claim it "built everything."
 
 **Transcript-first, memory-derived.** There are now two stores that both compact,
 and they must not drift. The transcript is human-facing, chronological, and the

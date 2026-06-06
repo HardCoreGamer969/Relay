@@ -299,12 +299,19 @@ def _result_summary(status: str, plan: Plan) -> str:
     """A plain, human-readable one-liner for the conversation's closing result turn.
 
     Composed from the run outcome (NOT a model call) so it adds no brain cost and
-    cannot drift from what actually happened.
+    cannot drift from what actually happened. Reconciles the wording with the real
+    done/failed counts: a ``completed`` run that recovered from a failed step (via
+    replan) must NOT claim it "built everything" -- that would contradict the count.
     """
     done = sum(1 for s in plan.steps if s.status == "done")
+    failed = sum(1 for s in plan.steps if s.status == "failed")
     total = len(plan.steps)
+    if status == STATUS_COMPLETED:
+        if failed:
+            reworked = f"{failed} step(s) were reworked along the way"
+            return f"Done -- reached the goal ({done} of {total} steps completed; {reworked})."
+        return f"Done -- built everything we agreed on. ({done}/{total} steps completed.)"
     phrasing = {
-        STATUS_COMPLETED: "Done -- built everything we agreed on.",
         STATUS_MAX_STEPS: "Stopped early: the step budget ran out.",
         STATUS_ESCALATION_LIMIT: "Stopped: too many steps failed to recover.",
         STATUS_ABORTED_BY_BRAIN: "Stopped: I judged the goal unreachable as specified.",

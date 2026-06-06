@@ -560,3 +560,30 @@ def test_plan_gate_decline_still_closes_the_thread(tmp_path):
     assert result.transcript_compacted is not None
     assert any(t.phase == "result" for t in result.transcript.turns)
     assert len(_hands_calls(client)) == 0  # decline still executes nothing
+
+
+# --- v0.0.10: the result turn is truthful about failed steps -----------------
+
+from relay.orchestrator import _result_summary  # noqa: E402
+from relay.planner import PlanStep  # noqa: E402
+
+
+def test_result_summary_all_succeeded_reads_clean():
+    plan = Plan(steps=[PlanStep(0, "a", status="done"), PlanStep(1, "b", status="done")])
+    text = _result_summary(STATUS_COMPLETED, plan)
+    assert "built everything we agreed on" in text
+    assert "2/2" in text
+
+
+def test_result_summary_completed_with_failed_step_is_honest():
+    # A completed run that recovered from a failed step (via replan) must NOT claim
+    # "everything" -- that contradicted the 8/9-style count the gate observed.
+    plan = Plan(steps=[
+        PlanStep(0, "a", status="done"),
+        PlanStep(1, "b", status="failed"),
+        PlanStep(2, "c", status="done"),
+    ])
+    text = _result_summary(STATUS_COMPLETED, plan)
+    assert "everything" not in text          # no longer overclaims
+    assert "2 of 3" in text                  # honest done/total
+    assert "reworked" in text                # names the failed-then-recovered step(s)

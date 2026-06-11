@@ -38,9 +38,20 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Callable
 
-from relay.orchestrator import Event
+from relay.config import ModelConfig
+from relay.conversation import DEFAULT_MAX_ROUNDS, ConversationResult, plan_conversationally
+from relay.orchestrator import (
+    STATUS_CANCELLED,
+    STATUS_DECLINED,
+    Event,
+    PlannedTaskResult,
+    run_planned,
+)
+from relay.telemetry import Ledger
+from relay.transcript import Transcript
 
 # The kinds of blocking ask the engine can park on. Each maps 1:1 to an engine
 # seam: reaction <- ``user_turn``, decision <- ``user_decision``,
@@ -52,6 +63,13 @@ REQUEST_APPROVAL = "approval"
 # Replies treated as "yes" for an approval ask (anything else denies -- the
 # safe default for a gated command). Trailing punctuation is stripped first.
 _APPROVAL_YES = {"y", "yes", "ok", "okay", "approve", "approved", "run", "run it", "go"}
+
+# RunOutcome.status beyond the engine's own terminal statuses: the engine raised.
+STATUS_ERROR = "error"
+
+# Synthetic event kind marking the planning -> executing transition, so the UI
+# (and its InputRouter) can track what "busy" currently means.
+EVENT_PHASE = "phase"
 
 
 class BridgeCancelled(Exception):
@@ -284,3 +302,134 @@ class InputRouter:
             request.deliver(text)
             return SubmitOutcome(ACTION_ANSWER, text, kind=request.kind)
         return SubmitOutcome(ACTION_IGNORED, text)  # busy: not misrouted, just dropped
+
+
+# --- the worker-thread runner -------------------------------------------------
+
+
+@dataclass
+class RunOutcome:
+    """How a bridge-driven run ended: a terminal status plus the artifacts.
+
+    ``status`` is the engine's own terminal status (``completed``,
+    ``cancelled``, ``declined_by_user``, ...) or :data:`STATUS_ERROR` when the
+    engine raised (``error`` carries the one-line reason). ``result`` is None
+    when execution never started (declined / cancelled during planning / error).
+    """
+
+    status: str
+    result: PlannedTaskResult | None = None
+    conversation: ConversationResult | None = None
+    error: str = ""
+
+
+class EngineRunner:
+    """One conversational arc (plan -> commit -> execute) on a worker thread.
+
+    Owns the :class:`EngineBridge` and the ONE :class:`Transcript` shared by
+    ``plan_conversationally`` and ``run_planned``, so a mid-run escalation is
+    the next turn of the same dialogue. Single-use: one goal per runner.
+
+    ``on_request`` / ``on_event`` / ``on_finished`` all fire ON THE WORKER
+    THREAD -- the UI must marshal them (tests consume them directly).
+    :meth:`cancel` + :meth:`join` are the clean-shutdown pair: cancel unblocks
+    any pending ask and stops the loop at the next step boundary, so a quitting
+    UI never leaves an orphaned worker still calling the API.
+    """
+
+    def __init__(
+        self,
+        project_root: str | Path,
+        *,
+        models: ModelConfig | None = None,
+        ledger: Ledger | None = None,
+        client: object | None = None,
+        assumption_level: str = "auto",
+        auto_approve: bool = False,
+        max_rounds: int = DEFAULT_MAX_ROUNDS,
+        on_request: Callable[[UiRequest], None],
+        on_event: Callable[[Event], None],
+        on_finished: Callable[[RunOutcome], None],
+        run_kwargs: dict | None = None,
+    ) -> None:
+        self.project_root = Path(project_root)
+        self.models = models
+        self.ledger = ledger if ledger is not None else Ledger()
+        self.client = client
+        self.assumption_level = assumption_level
+        self.auto_approve = auto_approve
+        self.max_rounds = max_rounds
+        self.bridge = EngineBridge(on_request=on_request, on_event=on_event)
+        self.transcript = Transcript()  # the one thread across planning + execution
+        self.outcome: RunOutcome | None = None
+        self._on_finished = on_finished
+        self._run_kwargs = dict(run_kwargs or {})  # extra run_planned knobs (tests)
+        self._thread: threading.Thread | None = None
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def start(self, goal: str) -> None:
+        """Spawn the worker and drive the arc; UI callbacks stream the run."""
+        if self._thread is not None:
+            raise RuntimeError("EngineRunner is single-use: one run per runner")
+        self._thread = threading.Thread(
+            target=self._run, args=(goal,), name="relay-engine", daemon=True
+        )
+        self._thread.start()
+
+    @property
+    def is_running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def cancel(self) -> None:
+        """Request stop: unblocks a pending ask now, stops at the next boundary."""
+        self.bridge.cancel()
+
+    def join(self, timeout: float | None = None) -> bool:
+        """Bounded wait for the worker to end. True when it is no longer alive."""
+        thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
+    # -- the worker ----------------------------------------------------------
+
+    def _run(self, goal: str) -> None:
+        bridge = self.bridge
+        try:
+            bridge.emit_event(Event(EVENT_PHASE, "planning", {"phase": "planning"}))
+            conversation = plan_conversationally(
+                goal, self.project_root, models=self.models, ledger=self.ledger,
+                client=self.client, assumption_level=self.assumption_level,
+                user_turn=bridge.user_turn, max_rounds=self.max_rounds,
+                on_event=lambda kind, message, payload: bridge.emit_event(
+                    Event(kind, message, payload)
+                ),
+                transcript=self.transcript,
+            )
+            if not conversation.committed or conversation.plan is None or not conversation.plan.steps:
+                outcome = RunOutcome(status=STATUS_DECLINED, conversation=conversation)
+            else:
+                bridge.emit_event(Event(EVENT_PHASE, "executing", {"phase": "executing"}))
+                result = run_planned(
+                    goal, self.project_root, models=self.models, ledger=self.ledger,
+                    client=self.client, approver=bridge.approver,
+                    auto_approve=self.auto_approve, user_decision=bridge.user_decision,
+                    assumption_level=self.assumption_level,
+                    committed_plan=conversation.plan, on_event=bridge.emit_event,
+                    transcript=self.transcript, cancel_check=bridge.should_cancel,
+                    **self._run_kwargs,
+                )
+                outcome = RunOutcome(status=result.status, result=result,
+                                     conversation=conversation)
+        except BridgeCancelled:
+            # A pending ask was cancelled (quit/cancel while the engine waited);
+            # the worker unwinds without guessing an answer.
+            outcome = RunOutcome(status=STATUS_CANCELLED)
+        except Exception as exc:  # noqa: BLE001 -- the UI must hear about ANY failure
+            outcome = RunOutcome(status=STATUS_ERROR,
+                                 error=f"{exc.__class__.__name__}: {exc}")
+        self.outcome = outcome
+        self._on_finished(outcome)

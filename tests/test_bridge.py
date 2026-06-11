@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
+
+import pytest
 
 from relay.bridge import (
     ACTION_ANSWER,
@@ -20,13 +23,17 @@ from relay.bridge import (
     REQUEST_APPROVAL,
     REQUEST_DECISION,
     REQUEST_REACTION,
+    STATUS_ERROR,
     BridgeCancelled,
     EngineBridge,
+    EngineRunner,
     InputRouter,
     InputState,
     UiRequest,
 )
-from relay.orchestrator import Event
+from relay.config import ModelConfig
+from relay.loop import STATUS_COMPLETED
+from relay.orchestrator import STATUS_CANCELLED, STATUS_DECLINED, Event
 
 WAIT_S = 5.0  # generous deadline; the asserts care about order, not speed
 
@@ -280,3 +287,202 @@ def test_finish_run_returns_to_idle():
     router.finish_run()
     assert router.state is InputState.IDLE
     assert router.submit("next goal").action == ACTION_START
+
+
+# --- the worker-thread runner: the full arc, headless -------------------------
+
+CFG = ModelConfig(brain="vendor/brain", hands="vendor/hands")
+
+
+def _resp(content):
+    usage = SimpleNamespace(prompt_tokens=6, completion_tokens=4, total_tokens=10, cost=0.00002)
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))], usage=usage)
+
+
+class _ArcClient:
+    """A fake engine brain+hands: routes by model, then by brain system prompt."""
+
+    def __init__(self, *, hands=(), plan="<plan><step>add login</step></plan>",
+                 headline="A small login feature.", escalate=True):
+        self._hands = list(hands)
+        self._plan = plan
+        self._headline = headline
+        self._escalate = escalate
+        self.calls: list[dict] = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, *, model, messages, **kwargs):
+        self.calls.append({"model": model, "messages": messages, **kwargs})
+        if model == "vendor/hands":
+            assert self._hands, "ran out of hands replies"
+            return _resp(self._hands.pop(0))
+        system = " ".join(messages[0]["content"].split())
+        if "assess the goal's SCOPE" in system:
+            return _resp("<scope>small</scope><reason>self-contained</reason>")
+        if "precise, executor-ready plan" in system:
+            return _resp(f"{self._plan}<headline>{self._headline}</headline>")
+        if "asked a question mid-step" in system:
+            if self._escalate:
+                return _resp("<decision>escalate</decision>"
+                             "<ask_user>Should login support OAuth?</ask_user>")
+            return _resp("<decision>self_answer</decision><answer>use cookies</answer>")
+        if "readable narrative" in system.lower():
+            return _resp("Earlier, you asked for login and committed.")
+        return _resp("<verdict>accept</verdict>")
+
+    def hands_calls(self):
+        return [c for c in self.calls if c["model"] == "vendor/hands"]
+
+
+class _UiSink:
+    """The headless stand-in for the UI: collects requests/events/outcomes."""
+
+    def __init__(self):
+        self.requests: list[UiRequest] = []
+        self.events: list[Event] = []
+        self.outcomes: list = []
+
+    def runner(self, tmp_path, client, **kwargs):
+        return EngineRunner(
+            tmp_path, models=CFG, client=client,
+            on_request=self.requests.append, on_event=self.events.append,
+            on_finished=self.outcomes.append, **kwargs,
+        )
+
+    def next_request(self, n=1):
+        assert _wait_for(lambda: len(self.requests) >= n), "no request arrived"
+        return self.requests[n - 1]
+
+    def finished(self):
+        assert _wait_for(lambda: self.outcomes), "run never finished"
+        return self.outcomes[0]
+
+
+def test_runner_full_loop_one_thread_one_transcript(tmp_path):
+    """Goal -> proposal -> commit -> escalation answered in the SAME thread -> done."""
+    client = _ArcClient(hands=[
+        "<question>do we need OAuth login?</question>",
+        '<edit path="login.py">x</edit>\n<done>added login</done>',
+    ])
+    sink = _UiSink()
+    runner = sink.runner(tmp_path, client)
+    runner.start("add login")
+
+    # 1. The proposal arrives as a blocking reaction ask (full plain plan).
+    proposal = sink.next_request(1)
+    assert proposal.kind == REQUEST_REACTION
+    assert "add login" in proposal.prompt and "ok" in proposal.prompt
+    proposal.deliver("ok")  # commit
+
+    # 2. The mid-run escalation arrives as the NEXT ask, same box, same thread.
+    escalation = sink.next_request(2)
+    assert escalation.kind == REQUEST_DECISION
+    assert "OAuth" in escalation.prompt
+    escalation.deliver("yes, Google OAuth")
+
+    # 3. The run completes; the worker is joinable; the work actually happened.
+    outcome = sink.finished()
+    assert outcome.status == STATUS_COMPLETED
+    assert outcome.result is not None and outcome.result.done
+    assert (tmp_path / "login.py").read_text(encoding="utf-8") == "x"
+    assert runner.join(WAIT_S) and not runner.is_running
+
+    # ONE continuous transcript: planning and the escalation are the same dialogue.
+    assert outcome.result.transcript is runner.transcript
+    phases = [t.phase for t in runner.transcript.turns]
+    assert {"proposal", "commit", "escalation", "decision", "result"} <= set(phases)
+    assert (phases.index("proposal") < phases.index("commit")
+            < phases.index("escalation") < phases.index("decision")
+            < phases.index("result"))
+
+    # Events arrived in order: planning phase, then executing, then steps.
+    kinds = [e.kind for e in sink.events]
+    assert kinds.index("phase") < kinds.index("plan_proposed")
+    executing = [i for i, e in enumerate(sink.events)
+                 if e.kind == "phase" and e.payload.get("phase") == "executing"]
+    assert executing and executing[0] < kinds.index("step_start")
+
+
+def test_runner_decline_leaves_nothing_executed(tmp_path):
+    client = _ArcClient()
+    sink = _UiSink()
+    runner = sink.runner(tmp_path, client, max_rounds=1)
+    runner.start("add login")
+    sink.next_request(1).deliver("no, forget it")  # not a commit phrase
+
+    outcome = sink.finished()
+    assert outcome.status == STATUS_DECLINED
+    assert outcome.result is None
+    assert client.hands_calls() == []  # nothing executed
+    assert runner.join(WAIT_S)
+
+
+def test_runner_cancel_while_parked_unblocks_and_joins(tmp_path):
+    """The clean-shutdown contract: cancel + join, no orphaned worker."""
+    client = _ArcClient()
+    sink = _UiSink()
+    runner = sink.runner(tmp_path, client)
+    runner.start("add login")
+    sink.next_request(1)  # parked on the proposal, mid-conversation
+    assert runner.is_running
+
+    runner.cancel()
+    outcome = sink.finished()
+    assert outcome.status == STATUS_CANCELLED
+    assert runner.join(WAIT_S) and not runner.is_running
+    assert client.hands_calls() == []  # no API spend after the cancel
+
+
+def test_runner_cancel_stops_at_step_boundary(tmp_path):
+    client = _ArcClient(
+        plan="<plan><step>make a.txt</step><step>make b.txt</step></plan>",
+        hands=[
+            '<edit path="a.txt">A</edit>\n<done>made a.txt</done>',
+            '<edit path="b.txt">B</edit>\n<done>made b.txt</done>',
+        ],
+    )
+    sink = _UiSink()
+    runner = sink.runner(tmp_path, client, run_kwargs={"supervise": False})
+
+    base_on_event = sink.events.append
+    def on_event(event):
+        base_on_event(event)
+        if event.kind == "step_done":
+            runner.cancel()  # the user hits cancel as step 0 settles
+    runner.bridge._on_event = on_event  # rewire before start (test-only seam)
+
+    runner.start("two files")
+    sink.next_request(1).deliver("ok")
+
+    outcome = sink.finished()
+    assert outcome.status == STATUS_CANCELLED
+    assert outcome.result is not None and outcome.result.status == STATUS_CANCELLED
+    assert len(client.hands_calls()) == 1  # step 1 never started
+    assert (tmp_path / "a.txt").exists() and not (tmp_path / "b.txt").exists()
+    assert runner.join(WAIT_S)
+
+
+def test_runner_engine_failure_surfaces_as_error_outcome(tmp_path):
+    class _Boom:
+        def __init__(self):
+            def explode(**kwargs):
+                raise RuntimeError("boom")
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=explode))
+
+    sink = _UiSink()
+    runner = sink.runner(tmp_path, _Boom())
+    runner.start("anything")
+    outcome = sink.finished()
+    assert outcome.status == STATUS_ERROR
+    assert "boom" in outcome.error
+    assert runner.join(WAIT_S)
+
+
+def test_runner_is_single_use(tmp_path):
+    sink = _UiSink()
+    runner = sink.runner(tmp_path, _ArcClient())
+    runner.start("goal one")
+    with pytest.raises(RuntimeError):
+        runner.start("goal two")
+    runner.cancel()
+    assert runner.join(WAIT_S)

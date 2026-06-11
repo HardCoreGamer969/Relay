@@ -106,6 +106,61 @@ def _build_wordmark(word: str = "RELAY", gap: str = _WORDMARK_GAP) -> str:
 
 RELAY_WORDMARK = _build_wordmark()
 
+# -- the glitch / datamosh animator -------------------------------------------
+
+# Cyberpunk static: glyphs an unlocked cell flickers through before it resolves.
+_GLITCH_GLYPHS = "▓▒░█▌▐╱╲╳<>/\\|=+*#%01"
+
+# One routed animator, short by default -- the app is relaunched constantly
+# during dev, so a long boot gets old fast. Modes: "short" (fully implemented),
+# "off" (instant, no timers), "long" (stubbed to short for now).
+_ANIM_FPS = 24
+_STARTUP_SHORT_S = 0.45      # boot decode that resolves into the wordmark
+_TRANSITION_SHORT_S = 0.4    # welcome -> working datamosh (short ALWAYS)
+
+
+def _normalize_block(target: str) -> list[str]:
+    """Split into equal-width rows so the glitch matrix is a clean rectangle."""
+    lines = target.split("\n")
+    width = max((len(line) for line in lines), default=0)
+    return [line.ljust(width) for line in lines]
+
+
+def _glitch_thresholds(lines: list[str]) -> list[list[float]]:
+    """A stable per-cell lock-threshold matrix (computed once per animation).
+
+    Each cell locks to its true value when progress crosses its threshold;
+    stable across frames so a locked cell never flickers back to noise.
+    """
+    rng = random.Random()
+    return [[rng.random() for _ in line] for line in lines]
+
+
+def glitch_frame(
+    lines: list[str],
+    thresholds: list[list[float]],
+    progress: float,
+    shimmer: random.Random,
+    *,
+    direction: str = "in",
+) -> str:
+    """One datamosh frame: locked cells show the true glyph, the rest flicker.
+
+    ``direction="in"`` resolves noise -> target (boot); ``"out"`` dissolves
+    target -> noise (the welcome handoff). ``shimmer`` is re-rolled each frame so
+    unlocked cells crackle. At ``progress>=1`` an "in" frame is fully the target;
+    at ``progress<=0`` an "out" frame is fully the target.
+    """
+    out = []
+    for row, line in enumerate(lines):
+        chars = []
+        for col, ch in enumerate(line):
+            threshold = thresholds[row][col]
+            locked = progress >= threshold if direction == "in" else progress < threshold
+            chars.append(ch if locked else shimmer.choice(_GLITCH_GLYPHS))
+        out.append("".join(chars))
+    return "\n".join(out)
+
 
 def present_prompt(text: str) -> str:
     """THE chokepoint for every user-facing question/prompt string.
@@ -194,6 +249,7 @@ class RelayTuiApp(App):
         assumption_level: str = "auto",
         auto_approve: bool = False,
         run_kwargs: dict | None = None,
+        anim_mode: str = "short",
     ) -> None:
         super().__init__()
         self._root = root
@@ -202,6 +258,11 @@ class RelayTuiApp(App):
         self._assumption_level = assumption_level
         self._auto_approve = auto_approve
         self._run_kwargs = run_kwargs
+        # TODO(prompt-2): drive anim_mode from persisted settings + a launch
+        # counter (a longer "first few launches" variant for "long"). Hardcoded
+        # "short" for now; "off" is a clean instant no-op.
+        self._anim_mode = anim_mode
+        self._anim_timer = None
         self._router = InputRouter()
         self._runner: EngineRunner | None = None
         self._quitting = False
@@ -241,6 +302,70 @@ class RelayTuiApp(App):
         self._update_status()
         self.query_one("#prompt", Input).focus()
         self.set_interval(_SYNC_INTERVAL_S, self._sync_transcript)
+        self._play_startup()
+
+    # -- startup + handoff animations (the look layer) -------------------------
+
+    def _play_startup(self) -> None:
+        """Boot glitch that resolves into the RELAY wordmark (short, non-blocking)."""
+        self._play_glitch(
+            self.query_one("#brand", Static), RELAY_WORDMARK,
+            direction="in", duration=_STARTUP_SHORT_S,
+        )
+
+    def _play_transition(self) -> None:
+        """Datamosh the welcome hero apart, then reveal the working panes."""
+        self._play_glitch(
+            self.query_one("#brand", Static), RELAY_WORDMARK,
+            direction="out", duration=_TRANSITION_SHORT_S, on_done=self._show_working,
+        )
+
+    def _play_glitch(self, widget, target, *, direction, duration, on_done=None) -> None:
+        """THE one place animations play; the mode gates the whole effect.
+
+        ``"off"`` resolves instantly (no timers); ``"short"`` runs the datamosh;
+        ``"long"`` is stubbed to short for now. Always non-blocking -- input is
+        never gated on an animation; the run (if any) has already started.
+        """
+        self._stop_anim()
+        lines = _normalize_block(target)
+        final = "\n".join(lines) if direction == "in" else ""
+        if self._anim_mode == "off":
+            widget.update(final)
+            if on_done is not None:
+                on_done()
+            return
+        frames = max(2, int(duration * _ANIM_FPS))
+        thresholds = _glitch_thresholds(lines)
+        shimmer = random.Random()
+        counter = {"frame": 0}
+
+        def tick() -> None:
+            if self._quitting:
+                self._stop_anim()
+                return
+            counter["frame"] += 1
+            progress = counter["frame"] / frames
+            try:
+                widget.update(glitch_frame(lines, thresholds, progress, shimmer, direction=direction))
+                if counter["frame"] >= frames:
+                    self._stop_anim()
+                    widget.update(final)
+                    if on_done is not None:
+                        on_done()
+            except Exception:  # noqa: BLE001 -- widget gone mid-animation; drop it
+                self._stop_anim()
+
+        self._anim_timer = self.set_interval(1 / _ANIM_FPS, tick)
+
+    def _stop_anim(self) -> None:
+        timer = self._anim_timer
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:  # noqa: BLE001 -- already stopped/torn down
+                pass
+            self._anim_timer = None
 
     # -- the input box (one box, routed by engine state) -----------------------
 
@@ -263,10 +388,15 @@ class RelayTuiApp(App):
         self._update_status()
 
     def _begin_first_run(self, goal: str) -> None:
-        """First goal of the session: hand off welcome -> working, then run."""
+        """First goal of the session: hand off welcome -> working, then run.
+
+        The run kicks off IMMEDIATELY (never gated on the animation); the
+        datamosh is a purely visual handoff that reveals the panes when it ends.
+        """
         self._view = "working"
+        self._stop_anim()  # stop the startup boot if it is still resolving
         self._start_run(goal)
-        self._show_working()
+        self._play_transition()
 
     def _show_working(self) -> None:
         """Swap the welcome screen for the working panes (the visual handoff)."""
@@ -399,6 +529,7 @@ class RelayTuiApp(App):
     async def action_quit(self) -> None:
         """Quit WITHOUT orphaning the worker: cancel, join (bounded), then exit."""
         self._quitting = True
+        self._stop_anim()
         runner = self._runner
         if runner is not None and runner.is_running:
             runner.cancel()

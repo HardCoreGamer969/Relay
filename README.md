@@ -43,17 +43,26 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.08 B (the continuous transcript + compaction)
+## Status — v0.0.11 (TUI part 1 of 2: the bridge + a minimal chat)
 
-Planning is a **conversation** (v0.08 A) and a user-owned **assumption dial**
-biases *every* assume-vs-ask decision — both the conversation and the autonomous
-loop. Part B fuses the two "the brain is asking me something" modes into **one
-continuous transcript**: the planning dialogue and the mid-run escalations are
-turns in the same thread, so a product decision raised mid-run reads as a
-continuation of the conversation, not a context-less popup. Plan memory now
-**derives from** the transcript, and the transcript compacts toward *readability*
-(recent verbatim, older folded into a readable narrative). (The scrollable
-interactive scroll-back is the TUI milestone; here it's a plain-CLI preview.)
+`relay tui` opens a **two-pane Textual chat** over the same engine: the
+conversation thread on top, the live execution feed below, one input box routed
+by what the engine is waiting for. The hard part this milestone ships is the
+**sync ↔ async bridge** (`relay/bridge.py`): the blocking engine runs on a
+worker thread and never learns it's talking to a TUI; the UI never blocks. A
+coarse **cancel** (step-boundary `cancel_check` → status `cancelled`) and a
+clean quit (cancel + join, never an orphaned worker still billing the API) are
+the money-leak guards. The plain CLI is fully intact — the TUI is additive.
+
+Underneath: planning is a **conversation** (v0.08 A) and a user-owned
+**assumption dial** biases *every* assume-vs-ask decision — both the
+conversation and the autonomous loop. v0.08 B fuses the two "the brain is
+asking me something" modes into **one continuous transcript**: the planning
+dialogue and the mid-run escalations are turns in the same thread, so a product
+decision raised mid-run reads as a continuation of the conversation, not a
+context-less popup. Plan memory **derives from** the transcript, and the
+transcript compacts toward *readability* (recent verbatim, older folded into a
+readable narrative).
 
 **What exists now:**
 
@@ -70,10 +79,12 @@ interactive scroll-back is the TUI milestone; here it's a plain-CLI preview.)
 - `relay/planner.py` — **the brain**: `make_plan` / `replan` / `evolve_plan`, `review_step` (supervise), `answer_or_escalate` (answer-vs-escalate, dial-biased).
 - `relay/conversation.py` — **conversational planning**: `plan_conversationally(...)` — scope assessment, posture, dual-fidelity proposal, free-form reactions, commit; appends its turns to the shared transcript.
 - `relay/transcript.py` — **the continuous transcript**: `Transcript` of `Turn` values (the human-facing source of truth), `record_decision` (transcript-first, memory-derived), and readability-preserving compaction (`compact_transcript` / `render_for_brain`).
-- `relay/orchestrator.py` — **the autonomous loop**: `run_planned(...)` (committed plan + the dial + the shared transcript; escalations continue the thread).
+- `relay/orchestrator.py` — **the autonomous loop**: `run_planned(...)` (committed plan + the dial + the shared transcript; escalations continue the thread; step-boundary `cancel_check`).
 - `relay/runlog.py` — **durable run records**: `RunRecord` + `build_record` / `append_record` / `load_records` (JSONL).
-- `relay/cli.py` — `relay models`, `relay demo`, `relay run` (conversational, `--assume`, `--show-transcript`), `relay runs`, `relay doctor`.
-- Network-free tests across the whole stack (incl. conversation, the dial, and the continuous transcript).
+- `relay/bridge.py` — **the sync↔async bridge**: `EngineBridge` (blocking asks ↔ thread-safe handoff), `EngineRunner` (the conversational arc on a worker thread), `InputRouter` (the input state machine). UI-framework-free; tested headless.
+- `relay/tui.py` — **the TUI**: a minimal Textual two-pane chat (conversation + activity), one routed input box, the `present_prompt` chokepoint, cancel + clean shutdown.
+- `relay/cli.py` — `relay models`, `relay demo`, `relay run` (conversational, `--assume`, `--show-transcript`), `relay tui`, `relay runs`, `relay doctor`.
+- Network-free tests across the whole stack (incl. conversation, the dial, the continuous transcript, the bridge, and the headless TUI).
 
 ## Conversational planning + the assumption dial
 
@@ -164,9 +175,57 @@ its durable readable form (`compact_transcript`). A failing summarizer degrades
 gracefully (keeps more verbatim, notes it) — it never crashes the run.
 
 `relay run --show-transcript` prints the compacted thread after a run — the
-plain-CLI preview of scroll-back. (The scrollable interactive view is the TUI
-milestone; the transcript is in-process for one run, but snapshot-shaped
+plain-CLI preview of scroll-back. (`relay tui` is the scrollable interactive
+view; the transcript is in-process for one run, but snapshot-shaped
 —`to_state()` / `from_state()`— so cross-session scroll-back is cheap to add.)
+
+## The TUI (part 1 of 2): the bridge + a minimal chat
+
+**The TUI is just another renderer.** The engine already emits events
+(`on_event`) and asks through blocking callbacks (`user_turn`, `user_decision`,
+`approver`, `plan_gate`); the TUI renders the events and answers the callbacks.
+No planning or execution logic lives in the UI.
+
+The risky part is the **sync ↔ async bridge** (`relay/bridge.py`). Relay's
+engine is synchronous and *blocks*; Textual's event loop must *never* block. So
+the engine runs on a **worker thread** (`EngineRunner`: the full conversational
+arc — `plan_conversationally` → commit → `run_planned` — on ONE shared
+`Transcript`), and:
+
+- **Engine → UI:** events and "I need an answer" requests are marshaled onto
+  the UI thread (Textual's `call_from_thread`); nothing touches a widget
+  cross-thread.
+- **UI → engine:** each blocking callback parks the worker on a thread-safe
+  handoff (`UiRequest`: a `threading.Event` + answer slot) until the UI
+  delivers the user's typed answer — only the worker ever blocks. The engine
+  never knows it's talking to a TUI instead of a terminal.
+
+**One input box, routed explicitly.** `InputRouter` is a small state machine
+(`idle` / `planning` / `executing` / `awaiting_reaction` / `awaiting_decision`
+/ `awaiting_approval`): a submit in `idle` starts a goal; in an awaiting state
+it answers the parked callback (a mid-run escalation is just the next turn in
+the same box); while the engine is busy it's ignored, never misrouted.
+
+**Layout (minimal, v1).** Conversation pane on top — the transcript thread
+(proposal *headlines*, reactions, escalations, decisions, result), rendered
+**unicode-clean** (no ASCII sanitizing on this path, unlike the legacy
+console). Activity pane below — the noisy `on_event` firehose (steps, tool
+calls, verdicts, memory writes), kept out of the conversation. Then a one-line
+status + **model indicator** (the brain/hands pairing, visible from launch,
+before the first message) and the input box. Every user-facing prompt passes
+through one chokepoint (`present_prompt`) — prompt 2's experience-level
+projection slots in there.
+
+**Cancellation + clean shutdown (the money-leak guard).** `Esc` requests a
+coarse cancel: a pending ask unblocks immediately; a running plan stops at the
+next **step boundary** (`cancel_check` in `run_planned`, terminal status
+`cancelled` — result turn + compaction still happen). Quitting cancels and
+**joins** the worker (bounded wait) so no orphaned thread keeps calling the
+API.
+
+**Not here yet (part 2):** onboarding, the model picker (the indicator is the
+read-only stand-in), the experience-level dial / question-rephrasing, diff
+viewer, theming, streaming tokens.
 
 ## Plan memory (within-run)
 
@@ -350,6 +409,10 @@ relay demo --goal "build a CLI todo app"
 # Drive the two-role brain + hands loop against a goal (the default)
 relay run --goal "create a file hello.txt containing the text: hi from relay"
 relay run -g "add a hello route to a tiny flask app" --root .
+
+# The interactive TUI: a two-pane chat over the same engine (type a goal to start)
+relay tui
+relay tui --root . --assume 3
 
 # Preview: pause for approval after the brain produces the plan, before executing
 relay run -g "refactor utils.py" --confirm-plan

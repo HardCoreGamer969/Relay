@@ -45,10 +45,29 @@
   derived from it -- no extra brain call), not the full executor spec, so
   scroll-back stays readable; and the closing result turn no longer claims it
   "built everything" when a step failed and was replanned around.
+- v0.0.11 (TUI 1 of 2) ships the **sync<->async bridge** and a minimal two-pane
+  Textual chat (``relay tui``). ``EngineBridge`` parks the engine's blocking
+  seams on a thread-safe handoff (``UiRequest``) so the engine -- running on
+  ``EngineRunner``'s worker thread -- never knows it is talking to a TUI;
+  ``InputRouter`` routes the one input box by what the engine awaits. The
+  money-leak guards: an additive step-boundary ``cancel_check`` in
+  ``run_planned`` (terminal status ``cancelled``) and a quit path that cancels
+  and JOINS the worker. The TUI render path is unicode-clean; the plain CLI is
+  untouched. Onboarding/model-picker/experience dial are TUI part 2.
 """
 
 from __future__ import annotations
 
+from relay.bridge import (
+    BridgeCancelled,
+    EngineBridge,
+    EngineRunner,
+    InputRouter,
+    InputState,
+    RunOutcome,
+    SubmitOutcome,
+    UiRequest,
+)
 from relay.config import (
     ASSUMPTION_LEVELS,
     DEFAULT_ASSUMPTION_LEVEL,
@@ -69,6 +88,7 @@ from relay.memory import (
 )
 from relay.models import ModelResult, call_model
 from relay.orchestrator import (
+    STATUS_CANCELLED,
     STATUS_UNRESOLVED_ESCALATION,
     Event,
     PlannedTaskResult,
@@ -106,7 +126,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.10"
+__version__ = "0.0.11"
 
 __all__ = [
     # v0.01 -- model layer
@@ -177,5 +197,15 @@ __all__ = [
     "record_decision",
     "compact_transcript",
     "render_for_brain",
+    # v0.0.11 (TUI 1 of 2) -- the sync<->async bridge + step-boundary cancel
+    "EngineBridge",
+    "EngineRunner",
+    "RunOutcome",
+    "UiRequest",
+    "BridgeCancelled",
+    "InputRouter",
+    "InputState",
+    "SubmitOutcome",
+    "STATUS_CANCELLED",
     "__version__",
 ]

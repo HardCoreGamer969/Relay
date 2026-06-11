@@ -1,4 +1,4 @@
-"""The Relay TUI: a two-pane chat over the engine, via the v0.0.11 bridge.
+"""The Relay TUI: a welcome screen + a two-pane chat over the v0.0.11 bridge.
 
 The TUI is JUST ANOTHER RENDERER. The engine already emits events
 (``on_event``) and asks through blocking callbacks (``user_turn``,
@@ -12,11 +12,19 @@ the worker and is marshaled here with ``App.call_from_thread`` -- nothing
 touches a widget cross-thread. Answers travel back through
 :class:`~relay.bridge.InputRouter`'s single deliver-this-answer path.
 
-Layout (minimal, v1): a Conversation pane (the transcript thread -- the star),
-an Activity pane (the noisy event firehose, kept OUT of the conversation), a
-one-line status/model indicator, and the input box. The conversation render
-path is UNICODE-CLEAN: turn text is never ASCII-sanitized here (the recurring
-cp1252 hazard belongs to the legacy console, not Textual).
+Two states:
+
+- **Welcome** (no work yet): a composed, centered screen -- the letterspaced
+  ``RELAY`` wordmark hero, a rotating greeting, the brain/hands pairing promoted
+  as identity, and a dim hint. The working panes are NOT shown here.
+- **Working** (after the first goal): the Conversation pane (the transcript
+  thread -- the star) over the Activity pane (the noisy event firehose, kept
+  OUT of the conversation), a status/model line, and the input box. The first
+  submit hands off from welcome to working (see :mod:`relay.tui` animations).
+
+The conversation render path is UNICODE-CLEAN: turn text is never ASCII-
+sanitized here (the recurring cp1252 hazard belongs to the legacy console, not
+Textual). The welcome art uses unicode block glyphs freely.
 
 :func:`present_prompt` is the ONE chokepoint every user-facing question/prompt
 string passes through before display. Today it is a pass-through; prompt 2's
@@ -26,8 +34,10 @@ experience-level projection slots in there without a refactor.
 from __future__ import annotations
 
 import asyncio
+import random
 
 from textual.app import App, ComposeResult
+from textual.containers import Container, Vertical
 from textual.widgets import Input, RichLog, Static
 
 from relay.bridge import (
@@ -61,6 +71,41 @@ _STATE_HINTS = {
     InputState.AWAITING_APPROVAL: "approve the command? (yes/no)",
 }
 
+# The rotating welcome greetings -- one shown per launch. Warmer than "Goal:";
+# productive, inviting, a little character. Edit freely.
+GREETINGS = (
+    "What are we building today?",
+    "What should we work on?",
+    "Point me at something.",
+    "What's the mission?",
+    "Give me a goal.",
+    "What are we shipping?",
+    "Where do we start?",
+)
+
+# The RELAY wordmark hero: hand-built 5-row block glyphs, letterspaced wide. We
+# can't reproduce the curved interlocking-R logo glyph in text, so the confident
+# letterspaced wordmark IS the hero (legible beats a janky knockoff). Each glyph
+# is a fixed 5x5 cell grid, so the assembled banner is a clean rectangle (which
+# the glitch animator wants -- see below).
+_WORDMARK_GLYPHS = {
+    "R": ["████ ", "█   █", "████ ", "█  █ ", "█   █"],
+    "E": ["█████", "█    ", "████ ", "█    ", "█████"],
+    "L": ["█    ", "█    ", "█    ", "█    ", "█████"],
+    "A": [" ███ ", "█   █", "█████", "█   █", "█   █"],
+    "Y": ["█   █", " █ █ ", "  █  ", "  █  ", "  █  "],
+}
+_WORDMARK_GAP = "   "
+
+
+def _build_wordmark(word: str = "RELAY", gap: str = _WORDMARK_GAP) -> str:
+    """Assemble the letterspaced block wordmark as one multi-line string."""
+    rows = [gap.join(_WORDMARK_GLYPHS[ch][r] for ch in word) for r in range(5)]
+    return "\n".join(rows)
+
+
+RELAY_WORDMARK = _build_wordmark()
+
 
 def present_prompt(text: str) -> str:
     """THE chokepoint for every user-facing question/prompt string.
@@ -83,13 +128,44 @@ def format_turn(turn: Turn) -> str:
     return f"{who} ({turn.phase}): {turn.text}"
 
 
+def model_identity(models: ModelConfig) -> str:
+    """The brain/hands pairing as IDENTITY (welcome screen), not a status note.
+
+    This is the user knowing which pairing they're about to spend money on,
+    front and center -- so it reads as the machine's name, cleanly styled.
+    """
+    return f"brain ~{models.brain}  ·  hands ~{models.hands}"
+
+
+def pick_greeting() -> str:
+    """One greeting for this launch (rotation is by random choice)."""
+    return random.choice(GREETINGS)
+
+
 class RelayTuiApp(App):
-    """Two panes + one input box over a worker-thread engine run."""
+    """A welcome screen that hands off to a two-pane chat over the engine."""
 
     TITLE = "Relay"
 
     CSS = """
     Screen { layout: vertical; }
+
+    /* -- the welcome state (shown first; hidden once work begins) -- */
+    #welcome { height: 1fr; align: center middle; }
+    #welcome-inner {
+        width: auto;
+        height: auto;
+        align: center middle;
+        padding: 1 4;
+        border: double $primary;
+    }
+    #brand { width: auto; content-align: center middle; text-style: bold; }
+    #greeting { width: auto; content-align: center middle; text-style: bold; margin-top: 1; }
+    #indicator { width: auto; content-align: center middle; color: $text-muted; margin-top: 1; }
+    #hint { width: auto; content-align: center middle; color: $text-muted; text-style: dim; margin-top: 1; }
+
+    /* -- the working state (hidden until the first goal) -- */
+    #working { height: 1fr; layout: vertical; display: none; }
     #conversation {
         height: 2fr;
         border: round $primary;
@@ -129,6 +205,10 @@ class RelayTuiApp(App):
         self._router = InputRouter()
         self._runner: EngineRunner | None = None
         self._quitting = False
+        # "welcome" until the first goal hands off to "working" (one-way).
+        self._view = "welcome"
+        self._greeting = pick_greeting()
+        self._indicator_text = model_identity(self._models)
         # The render-path buffers: exactly the strings handed to the widgets,
         # kept so headless tests can assert on the render path directly.
         self._conversation_lines: list[str] = []
@@ -139,17 +219,25 @@ class RelayTuiApp(App):
     # -- layout ---------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        conversation = RichLog(id="conversation", wrap=True, markup=False, highlight=False)
-        conversation.border_title = "Conversation"
-        activity = RichLog(id="activity", wrap=True, markup=False, highlight=False)
-        activity.border_title = "Activity"
-        yield conversation
-        yield activity
-        yield Static(id="status")
+        with Container(id="welcome"):
+            with Vertical(id="welcome-inner"):
+                yield Static(RELAY_WORDMARK, id="brand")
+                yield Static(self._greeting, id="greeting")
+                yield Static(self._indicator_text, id="indicator")
+                yield Static("esc to cancel  ·  ctrl+q to quit", id="hint")
+        with Container(id="working"):
+            conversation = RichLog(id="conversation", wrap=True, markup=False, highlight=False)
+            conversation.border_title = "Conversation"
+            yield conversation
+            activity = RichLog(id="activity", wrap=True, markup=False, highlight=False)
+            activity.border_title = "Activity"
+            yield activity
+            yield Static(id="status")
         yield Input(id="prompt", placeholder="Type a goal and press Enter...")
 
     def on_mount(self) -> None:
-        # The model indicator is visible from launch, BEFORE the first message.
+        # The model indicator is visible from launch, BEFORE the first message
+        # (promoted on the welcome screen; mirrored into the status buffer too).
         self._update_status()
         self.query_one("#prompt", Input).focus()
         self.set_interval(_SYNC_INTERVAL_S, self._sync_transcript)
@@ -161,7 +249,10 @@ class RelayTuiApp(App):
         event.input.value = ""
         outcome = self._router.submit(text)
         if outcome.action == ACTION_START:
-            self._start_run(text)
+            if self._view == "welcome":
+                self._begin_first_run(text)
+            else:
+                self._start_run(text)
         elif outcome.action == ACTION_ANSWER:
             # Answers that become transcript turns render via the sync pass;
             # approval answers never reach the transcript, so echo them here.
@@ -170,6 +261,17 @@ class RelayTuiApp(App):
         elif text.strip():
             self._write_activity("(input ignored: the engine is busy)")
         self._update_status()
+
+    def _begin_first_run(self, goal: str) -> None:
+        """First goal of the session: hand off welcome -> working, then run."""
+        self._view = "working"
+        self._start_run(goal)
+        self._show_working()
+
+    def _show_working(self) -> None:
+        """Swap the welcome screen for the working panes (the visual handoff)."""
+        self.query_one("#welcome").display = False
+        self.query_one("#working").display = True
 
     def _start_run(self, goal: str) -> None:
         self._seen_turn_ids.clear()  # fresh transcript: turn ids restart at t0

@@ -59,6 +59,10 @@ STATUS_DECLINED = "declined_by_user"  # plan shown but not approved (--confirm-p
 # A genuine product decision was needed but no user_decision callback was
 # available, so the run stopped rather than guessing (the silent-wrong-build trap).
 STATUS_UNRESOLVED_ESCALATION = "unresolved_escalation"
+# The user asked to stop (v0.0.11 cancel_check, polled at step boundaries). A
+# clean terminal status, not an error: a cancelled run still gets its result
+# turn and compacted transcript.
+STATUS_CANCELLED = "cancelled"
 
 EXECUTOR_SYSTEM_PROMPT = """\
 You are the EXECUTOR (the "hands") of Relay. You carry out ONE step of a larger
@@ -313,6 +317,7 @@ def _result_summary(status: str, plan: Plan) -> str:
         return f"Done -- built everything we agreed on. ({done}/{total} steps completed.)"
     phrasing = {
         STATUS_MAX_STEPS: "Stopped early: the step budget ran out.",
+        STATUS_CANCELLED: "Stopped: you cancelled the run.",
         STATUS_ESCALATION_LIMIT: "Stopped: too many steps failed to recover.",
         STATUS_ABORTED_BY_BRAIN: "Stopped: I judged the goal unreachable as specified.",
         STATUS_UNRESOLVED_ESCALATION: "Paused: I needed a decision from you that I could not get.",
@@ -362,6 +367,7 @@ def run_planned(
     committed_plan: Plan | None = None,
     assumption_level: str = "auto",
     transcript: Transcript | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> PlannedTaskResult:
     """Drive the autonomous two-role planner/executor loop.
 
@@ -389,6 +395,12 @@ def run_planned(
     brain composes an escalation it is given a window-bounded slice of the recent
     thread, so the question reads as a continuation. After the run a readable,
     post-execution compaction pass produces ``result.transcript_compacted``.
+
+    ``cancel_check`` is the coarse cancel seam (a TUI/UI hands it a "did the
+    user ask to stop?" probe): consulted at STEP BOUNDARIES only -- before each
+    step starts, never mid-model-call. When it returns True the run ends with
+    the clean terminal status ``cancelled`` (result turn + compaction still
+    happen, like every other terminal path).
 
     Note: a single step's executor ceiling is ``max_executor_steps *
     (1 + max_followups_per_step)`` (each supervised follow-up re-runs the
@@ -566,6 +578,15 @@ def run_planned(
 
     # --- Execute phase -----------------------------------------------------
     while True:
+        # Coarse cancellation: polled at the step boundary, before any work or
+        # model call for the next step is spent. Mid-step interruption is
+        # deliberately NOT attempted (v1 is coarse by design).
+        if cancel_check is not None and cancel_check():
+            result.status = STATUS_CANCELLED
+            emit("status", "run cancelled by user at a step boundary",
+                 {"status": STATUS_CANCELLED})
+            break
+
         step = plan.next_pending()
         if step is None:
             result.status = STATUS_COMPLETED

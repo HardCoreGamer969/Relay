@@ -587,3 +587,82 @@ def test_result_summary_completed_with_failed_step_is_honest():
     assert "everything" not in text          # no longer overclaims
     assert "2 of 3" in text                  # honest done/total
     assert "reworked" in text                # names the failed-then-recovered step(s)
+
+
+# --- v0.0.11: coarse cancellation at step boundaries (cancel_check) ----------
+
+from relay.orchestrator import STATUS_CANCELLED  # noqa: E402
+from relay.transcript import Transcript  # noqa: E402
+
+
+def _committed(*instructions):
+    return Plan.from_instructions(list(instructions))
+
+
+def test_cancel_check_stops_at_the_next_step_boundary(tmp_path):
+    """Cancel after step 0 settles: step 1 never starts, status is cancelled."""
+    cancelled = {"flag": False}
+
+    def on_event(event):
+        if event.kind == "step_done":
+            cancelled["flag"] = True  # the user "presses cancel" mid-run
+
+    client = RoutedClient(
+        brain=[],
+        hands=[
+            '<edit path="a.txt">A</edit>\n<done>made a.txt</done>',
+            '<edit path="b.txt">B</edit>\n<done>made b.txt</done>',  # must NOT be consumed
+        ],
+    )
+    result = run_planned(
+        "two files", tmp_path, models=CFG, client=client, supervise=False,
+        committed_plan=_committed("create a.txt", "create b.txt"),
+        cancel_check=lambda: cancelled["flag"], on_event=on_event,
+    )
+
+    assert result.status == STATUS_CANCELLED
+    assert [s.status for s in result.plan.steps] == ["done", "pending"]  # no further steps ran
+    assert len(_hands_calls(client)) == 1  # the second hands reply was never consumed
+    assert (tmp_path / "a.txt").exists() and not (tmp_path / "b.txt").exists()
+
+
+def test_cancel_check_true_before_first_step_runs_nothing(tmp_path):
+    client = RoutedClient(brain=[], hands=["<done>never consumed</done>"])
+    result = run_planned(
+        "g", tmp_path, models=CFG, client=client, supervise=False,
+        committed_plan=_committed("step one"), cancel_check=lambda: True,
+    )
+    assert result.status == STATUS_CANCELLED
+    assert len(_hands_calls(client)) == 0
+    assert all(s.status == "pending" for s in result.plan.steps)
+
+
+def test_cancelled_run_still_closes_the_thread_cleanly(tmp_path):
+    """Cancellation is a clean terminal path: result turn + compaction, like any other."""
+    transcript = Transcript()
+    client = RoutedClient(brain=[], hands=[])
+    result = run_planned(
+        "g", tmp_path, models=CFG, client=client, supervise=False,
+        committed_plan=_committed("step one"), cancel_check=lambda: True,
+        transcript=transcript,
+    )
+    assert result.status == STATUS_CANCELLED
+    assert result.transcript_compacted is not None
+    result_turns = [t for t in transcript.turns if t.phase == "result"]
+    assert len(result_turns) == 1
+    assert "cancelled" in result_turns[0].text  # the closing turn says what happened
+    assert any(e.kind == "status" and e.payload.get("status") == STATUS_CANCELLED
+               for e in result.events)
+
+
+def test_no_cancel_check_changes_nothing(tmp_path):
+    """The knob is additive: omitted, the loop behaves exactly as before."""
+    client = RoutedClient(
+        brain=[],
+        hands=['<edit path="a.txt">A</edit>\n<done>made a.txt</done>'],
+    )
+    result = run_planned(
+        "one file", tmp_path, models=CFG, client=client, supervise=False,
+        committed_plan=_committed("create a.txt"),
+    )
+    assert result.status == STATUS_COMPLETED

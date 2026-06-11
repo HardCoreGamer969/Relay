@@ -16,6 +16,7 @@ dependencies = [
     "typer",
     "rich",
     "python-dotenv",
+    "textual",
 ]
 
 [project.optional-dependencies]

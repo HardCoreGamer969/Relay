@@ -442,3 +442,19 @@ def test_show_transcript_prints_compacted_thread(tmp_path, monkeypatch):
     assert "Conversation thread" in result.output       # the scroll-back preview header
     assert "PROPOSAL_TEXT_MARKER" in result.output      # turn text is shown
     assert "proposal" in result.output and "commit" in result.output
+
+
+# --- v0.0.11: the TUI is additive; the plain CLI stays intact ----------------
+
+
+def test_tui_command_is_registered():
+    result = runner.invoke(app, ["tui", "--help"])
+    assert result.exit_code == 0
+    assert "Launch the Relay TUI" in result.output
+
+
+def test_plain_cli_commands_are_all_still_present():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    for command in ("run", "runs", "doctor", "models", "demo", "tui"):
+        assert command in result.output

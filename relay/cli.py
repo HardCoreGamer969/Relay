@@ -498,6 +498,42 @@ def _print_doctor_table(rows) -> None:
     console.print(table)
 
 
+@app.command()
+def tui(
+    root: str = typer.Option(
+        ".", "--root", help="Project root the agent's tools are confined to."
+    ),
+    auto_approve: bool = typer.Option(
+        False,
+        "--auto-approve",
+        "-y",
+        help="Auto-approve CONFIRM-category commands (BLOCKED stays refused).",
+    ),
+    assume: str = typer.Option(
+        "", "--assume",
+        help="Assumption dial: 1 (assume freely) .. 5 (follow the letter) or 'auto'. "
+        "Overrides RELAY_ASSUMPTION_LEVEL for this run.",
+    ),
+) -> None:
+    """Launch the Relay TUI: an interactive chat over the brain + hands loop.
+
+    Opens straight to an empty chat on the env-configured models (the model
+    indicator shows the brain/hands pairing before the first message). The
+    plain CLI (`relay run`, `--solo`, `runs`, `doctor`, ...) is unchanged --
+    the TUI is additive, for interactive use; the plain path stays for
+    scripting/headless.
+    """
+    # Lazy import: textual is only loaded when the TUI is actually launched.
+    from relay.tui import RelayTuiApp
+
+    cfg = load_models()
+    dial = resolve_assumption_level(override=assume or None)
+    _warn_if_dirty_git(root)
+    RelayTuiApp(
+        root=root, models=cfg, assumption_level=dial, auto_approve=auto_approve
+    ).run()
+
+
 def _confirm_plan_gate(plan) -> bool:
     """Ask the user to approve the plan before execution (the plan is already shown)."""
     return typer.confirm("Proceed with this plan?", default=True)

@@ -43,16 +43,25 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.11 (TUI part 1 of 2: the bridge + a minimal chat)
+## Status — v0.0.12 (TUI part 2a: the welcome state + glitch polish)
 
-`relay tui` opens a **two-pane Textual chat** over the same engine: the
+`relay tui` now opens on a composed, cyberpunk-terminal **welcome screen** — the
+letterspaced `RELAY` block wordmark hero, a rotating greeting, the brain/hands
+pairing promoted as identity, and a dim keybind hint — that **glitch/datamosh-
+transitions** into the two working panes when you send your first goal. A short
+boot decode resolves into the wordmark on launch; the handoff to the panes is a
+~400ms dissolve. It's a **look-only** pass: no engine/bridge change, and the run
+kicks off immediately (never gated on an animation). Onboarding, the model
+picker, and the experience dial are still ahead.
+
+Under that, `relay tui` is the **two-pane Textual chat** over the engine: the
 conversation thread on top, the live execution feed below, one input box routed
-by what the engine is waiting for. The hard part this milestone ships is the
-**sync ↔ async bridge** (`relay/bridge.py`): the blocking engine runs on a
-worker thread and never learns it's talking to a TUI; the UI never blocks. A
-coarse **cancel** (step-boundary `cancel_check` → status `cancelled`) and a
-clean quit (cancel + join, never an orphaned worker still billing the API) are
-the money-leak guards. The plain CLI is fully intact — the TUI is additive.
+by what the engine is waiting for. The hard part (v0.0.11) is the **sync ↔ async
+bridge** (`relay/bridge.py`): the blocking engine runs on a worker thread and
+never learns it's talking to a TUI; the UI never blocks. A coarse **cancel**
+(step-boundary `cancel_check` → status `cancelled`) and a clean quit (cancel +
+join, never an orphaned worker still billing the API) are the money-leak guards.
+The plain CLI is fully intact — the TUI is additive.
 
 Underneath: planning is a **conversation** (v0.08 A) and a user-owned
 **assumption dial** biases *every* assume-vs-ask decision — both the
@@ -82,7 +91,7 @@ readable narrative).
 - `relay/orchestrator.py` — **the autonomous loop**: `run_planned(...)` (committed plan + the dial + the shared transcript; escalations continue the thread; step-boundary `cancel_check`).
 - `relay/runlog.py` — **durable run records**: `RunRecord` + `build_record` / `append_record` / `load_records` (JSONL).
 - `relay/bridge.py` — **the sync↔async bridge**: `EngineBridge` (blocking asks ↔ thread-safe handoff), `EngineRunner` (the conversational arc on a worker thread), `InputRouter` (the input state machine). UI-framework-free; tested headless.
-- `relay/tui.py` — **the TUI**: a minimal Textual two-pane chat (conversation + activity), one routed input box, the `present_prompt` chokepoint, cancel + clean shutdown.
+- `relay/tui.py` — **the TUI**: a composed welcome screen (the `RELAY` wordmark hero, rotating greeting, promoted model identity) that glitch/datamosh-transitions into a two-pane chat (conversation + activity); one routed input box, the `present_prompt` chokepoint, cancel + clean shutdown.
 - `relay/cli.py` — `relay models`, `relay demo`, `relay run` (conversational, `--assume`, `--show-transcript`), `relay tui`, `relay runs`, `relay doctor`.
 - Network-free tests across the whole stack (incl. conversation, the dial, the continuous transcript, the bridge, and the headless TUI).
 
@@ -223,9 +232,24 @@ next **step boundary** (`cancel_check` in `run_planned`, terminal status
 **joins** the worker (bounded wait) so no orphaned thread keeps calling the
 API.
 
+**The welcome state + glitch handoff (v0.0.12, look-only).** Launch lands on a
+composed, cyberpunk-terminal welcome screen — a genuinely separate state, not
+the working view with empty panes. The hero is the letterspaced `RELAY` block
+wordmark; below it a rotating greeting (`GREETINGS`, one per launch), the
+brain/hands pairing promoted as identity, and a dim keybind hint. A short boot
+**glitch decode** resolves into the wordmark on launch; the first goal
+**datamosh-dissolves** the welcome screen into the two working panes (~400ms,
+short *always* — it fires every session). All animations route through one
+mode-gated chokepoint (`"short"` live, `"off"` instant no-op, `"long"` stubbed
+to short) so the next milestone drives the mode from persisted settings + a
+launch counter without restructuring. The handoff is purely visual — the run
+starts immediately, never gated on an animation, and no engine/bridge behavior
+changes.
+
 **Not here yet (part 2):** onboarding, the model picker (the indicator is the
-read-only stand-in), the experience-level dial / question-rephrasing, diff
-viewer, theming, streaming tokens.
+read-only stand-in), the experience-level dial / question-rephrasing, the
+config-persisted animation toggle + launch-counter (the `"long"` first-run
+variant), diff viewer, theming, streaming tokens.
 
 ## Plan memory (within-run)
 

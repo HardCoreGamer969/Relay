@@ -54,6 +54,15 @@
   ``run_planned`` (terminal status ``cancelled``) and a quit path that cancels
   and JOINS the worker. The TUI render path is unicode-clean; the plain CLI is
   untouched. Onboarding/model-picker/experience dial are TUI part 2.
+- v0.0.12 is a TUI **visual polish** pass (look layer only -- no engine/bridge
+  change): a genuinely separate **welcome state** (the letterspaced ``RELAY``
+  block wordmark hero, a rotating greeting, the brain/hands pairing promoted as
+  identity, a dim hint) that **glitch/datamosh-transitions** into the two
+  working panes on the first goal. Animations route through one mode-gated
+  chokepoint (``"short"`` live, ``"off"`` instant, ``"long"`` stubbed) so the
+  next milestone's config/launch-counter slots in without a refactor. The
+  handoff is purely visual -- the run kicks off immediately, never gated on an
+  animation.
 """
 
 from __future__ import annotations
@@ -126,7 +135,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.11"
+__version__ = "0.0.12"
 
 __all__ = [
     # v0.01 -- model layer

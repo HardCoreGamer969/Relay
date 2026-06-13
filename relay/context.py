@@ -15,8 +15,14 @@ window is resolved in strict priority order, and discovery NEVER crashes a run
    report the source as ``"default"`` so callers can note Relay is guessing.
 
 ``resolve_context_window`` returns ``(window, source)`` where source is one of
-``"override"`` / ``"openrouter"`` / ``"local:<runtime>"`` / ``"default"`` so the
-provenance is visible and testable.
+``"override"`` / ``"catalog"`` / ``"openrouter"`` / ``"local:<runtime>"`` /
+``"default"`` so the provenance is visible and testable.
+
+The model **catalog** (``relay/catalog.py``) is now a better source than the
+OpenRouter-metadata probe -- it carries ``limit.context`` for every provider's
+models -- so when a ``catalog`` (and ``provider``) is supplied it is consulted
+*ahead* of the probe, with the probe kept as a fallback rung. Callers that pass
+neither (the autonomous loop) keep the exact prior behavior.
 """
 
 from __future__ import annotations
@@ -40,12 +46,22 @@ _PROBE_TIMEOUT_S = 1.5
 
 
 def resolve_context_window(
-    model: str, *, client=None, override: int | None = None
+    model: str,
+    *,
+    provider: str | None = None,
+    client=None,
+    override: int | None = None,
+    catalog=None,
 ) -> tuple[int, str]:
-    """Resolve the brain model's context window and how it was determined.
+    """Resolve a model's context window and how it was determined.
 
     Returns ``(window, source)``. Never raises -- every discovery step is guarded
     and falls through to the conservative default.
+
+    When ``catalog`` and ``provider`` are supplied, the catalog's ``limit.context``
+    is consulted *ahead* of the OpenRouter probe (it's the better source); the probe
+    remains a fallback rung. Omit them (the autonomous loop does) for the prior
+    override -> probe -> default behavior, unchanged.
     """
     # 1. explicit override (param beats env; both are "override")
     declared = _coerce_int(override)
@@ -55,7 +71,16 @@ def resolve_context_window(
     if env_declared is not None:
         return (env_declared, "override")
 
-    # 2. auto-detect
+    # 2. catalog (better than the probe; only when one is supplied)
+    if catalog is not None and provider:
+        try:
+            limit = catalog.context_limit(provider, model)
+        except Exception:  # noqa: BLE001 -- catalog lookups must never crash a run
+            limit = None
+        if limit:
+            return (int(limit), "catalog")
+
+    # 3. auto-detect
     if _is_local_slug(model):
         probed = probe_local_context(model)
         if probed is not None:
@@ -66,7 +91,7 @@ def resolve_context_window(
         if length:
             return (length, "openrouter")
 
-    # 3. conservative default
+    # 4. conservative default
     return (DEFAULT_CONTEXT_WINDOW, "default")
 
 

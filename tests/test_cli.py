@@ -35,9 +35,22 @@ class FakeDoctorClient:
         self.chat = SimpleNamespace(completions=_DoctorCompletions(good))
 
 
+def _fake_catalog():
+    """A real (empty) Catalog so doctor's status line + context lookups don't fetch."""
+    from relay.catalog import Catalog
+
+    return Catalog(providers={}, status="bundled", source="test://fixture")
+
+
+def _patch_catalog(monkeypatch):
+    monkeypatch.setattr(cli, "load_catalog", lambda *a, **k: _fake_catalog())
+
+
 def test_run_doctor_classifies_ok_and_failed():
-    client = FakeDoctorClient(good={"vendor/ok"})
-    rows, all_ok = _run_doctor([("brain", "vendor/ok"), ("hands", "vendor/bad")], client)
+    clients = {"openrouter": FakeDoctorClient(good={"vendor/ok"})}
+    rows, all_ok = _run_doctor(
+        [("brain", "openrouter", "vendor/ok"), ("hands", "openrouter", "vendor/bad")], clients
+    )
 
     assert rows[0]["status"] == "OK"
     assert rows[1]["status"] == "FAILED"
@@ -46,16 +59,26 @@ def test_run_doctor_classifies_ok_and_failed():
 
 
 def test_run_doctor_all_ok():
-    client = FakeDoctorClient(good={"a", "b"})
-    rows, all_ok = _run_doctor([("brain", "a"), ("hands", "b")], client)
+    clients = {"openrouter": FakeDoctorClient(good={"a", "b"})}
+    rows, all_ok = _run_doctor(
+        [("brain", "openrouter", "a"), ("hands", "openrouter", "b")], clients
+    )
     assert all_ok is True
     assert all(r["status"] == "OK" for r in rows)
+
+
+def test_run_doctor_unknown_provider_has_no_client():
+    rows, all_ok = _run_doctor([("hands", "mystery", "m")], clients={})
+    assert all_ok is False
+    assert rows[0]["status"] == "FAILED"
+    assert "mystery" in rows[0]["note"]
 
 
 def test_doctor_command_exits_nonzero_on_failure(monkeypatch):
     monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/ok", hands="vendor/bad"))
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    monkeypatch.setattr(cli, "build_client", lambda: FakeDoctorClient(good={"vendor/ok"}))
+    monkeypatch.setattr(cli, "build_client", lambda provider="openrouter", api_key=None: FakeDoctorClient(good={"vendor/ok"}))
+    _patch_catalog(monkeypatch)
 
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code != 0
@@ -65,33 +88,90 @@ def test_doctor_command_exits_nonzero_on_failure(monkeypatch):
 def test_doctor_command_exits_zero_when_all_ok(monkeypatch):
     monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/a", hands="vendor/b"))
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    monkeypatch.setattr(cli, "build_client", lambda: FakeDoctorClient(good={"vendor/a", "vendor/b"}))
+    monkeypatch.setattr(cli, "build_client", lambda provider="openrouter", api_key=None: FakeDoctorClient(good={"vendor/a", "vendor/b"}))
+    _patch_catalog(monkeypatch)
 
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0
     assert "OK" in result.output
 
 
+def test_doctor_reports_catalog_status(monkeypatch):
+    monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/a", hands="vendor/b"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(cli, "build_client", lambda provider="openrouter", api_key=None: FakeDoctorClient(good={"vendor/a", "vendor/b"}))
+    _patch_catalog(monkeypatch)
+
+    result = runner.invoke(app, ["doctor"])
+    assert "model catalog: bundled (source: test://fixture)" in result.output
+
+
 def test_doctor_reports_context_window(monkeypatch):
     monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/a", hands="vendor/b"))
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    monkeypatch.setattr(cli, "build_client", lambda: FakeDoctorClient(good={"vendor/a", "vendor/b"}))
-    monkeypatch.setattr(cli, "resolve_context_window", lambda model, client=None: (200000, "openrouter"))
+    monkeypatch.setattr(cli, "build_client", lambda provider="openrouter", api_key=None: FakeDoctorClient(good={"vendor/a", "vendor/b"}))
+    _patch_catalog(monkeypatch)
+    monkeypatch.setattr(cli, "resolve_context_window", lambda model, **kw: (200000, "catalog"))
 
     result = runner.invoke(app, ["doctor"])
-    assert "brain context window: 200000 tokens (source: openrouter)" in result.output
+    assert "brain context window: 200000 tokens (source: catalog)" in result.output
+    assert "hands context window: 200000 tokens (source: catalog)" in result.output
     assert "guessing the window" not in result.output
 
 
 def test_doctor_warns_when_guessing_window(monkeypatch):
     monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/a", hands="vendor/b"))
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    monkeypatch.setattr(cli, "build_client", lambda: FakeDoctorClient(good={"vendor/a", "vendor/b"}))
-    monkeypatch.setattr(cli, "resolve_context_window", lambda model, client=None: (8192, "default"))
+    monkeypatch.setattr(cli, "build_client", lambda provider="openrouter", api_key=None: FakeDoctorClient(good={"vendor/a", "vendor/b"}))
+    _patch_catalog(monkeypatch)
+    monkeypatch.setattr(cli, "resolve_context_window", lambda model, **kw: (8192, "default"))
 
     result = runner.invoke(app, ["doctor"])
     assert "source: default" in result.output
     assert "RELAY_BRAIN_CONTEXT" in result.output  # the guessing note
+
+
+def test_doctor_preflights_deepseek_role_against_its_provider(monkeypatch):
+    # A DeepSeek-configured role is probed against a DeepSeek client (its own key),
+    # while an OpenRouter role uses the OpenRouter client.
+    monkeypatch.setattr(
+        cli, "load_models",
+        lambda: ModelConfig(brain="anthropic/x", hands="deepseek-v4-pro", hands_provider="deepseek"),
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-key")
+    built = {}
+
+    def fake_build(provider="openrouter", api_key=None):
+        built[provider] = True
+        good = {"anthropic/x"} if provider == "openrouter" else {"deepseek-v4-pro"}
+        return FakeDoctorClient(good=good)
+
+    monkeypatch.setattr(cli, "build_client", fake_build)
+    _patch_catalog(monkeypatch)
+
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0
+    assert built == {"openrouter": True, "deepseek": True}  # one client per provider
+    assert "deepseek" in result.output and "deepseek-v4-pro" in result.output
+
+
+def test_doctor_missing_deepseek_key_blocks_before_build(monkeypatch):
+    monkeypatch.setattr(
+        cli, "load_models",
+        lambda: ModelConfig(brain="anthropic/x", hands="deepseek-v4-pro", hands_provider="deepseek"),
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    def _no_build(*a, **k):
+        raise AssertionError("build_client must not be called when a key is missing")
+
+    monkeypatch.setattr(cli, "build_client", _no_build)
+
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code != 0
+    assert "DEEPSEEK_API_KEY is not set" in result.output
 
 
 def test_doctor_command_handles_missing_key(monkeypatch):
@@ -100,7 +180,7 @@ def test_doctor_command_handles_missing_key(monkeypatch):
     monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="b", hands="h"))
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
-    def _no_build():
+    def _no_build(*a, **k):
         raise AssertionError("build_client must not be called without a key")
 
     monkeypatch.setattr(cli, "build_client", _no_build)

@@ -17,9 +17,11 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from relay.catalog import load_catalog
 from relay.client import build_client
 from relay.config import load_models, resolve_assumption_level
 from relay.context import resolve_context_window
+from relay.providers import DEFAULT_PROVIDER, resolve_provider
 from relay.conversation import DEFAULT_MAX_ROUNDS, plan_conversationally
 from relay.loop import (
     STATUS_COMPLETED,
@@ -421,53 +423,115 @@ def _runs_table(records, limit: int) -> Table:
 @app.command()
 def doctor(
     slugs: list[str] = typer.Argument(
-        None, help="Optional model slugs to probe ad-hoc; default checks the configured roles."
+        None,
+        help="Optional model slugs to probe ad-hoc (assumed on the default "
+        "provider); default checks the configured roles against their providers.",
     ),
 ) -> None:
-    """Preflight: check that configured (or given) model slugs resolve on OpenRouter.
+    """Preflight: check each role's (provider, model) resolves on its provider's API.
 
-    Each check is a minimal (max_tokens=1) live call. Exits non-zero if any slug
-    failed, so it is usable as a preflight in scripts -- catching the kind of
-    retired-slug 404 ("no endpoints found") that bit a run in v0.04.
+    Each check is a minimal (max_tokens=1) live call against the role's provider
+    (OpenRouter, DeepSeek, ...). It also reports the resolved context window + its
+    source per role (catalog vs probe vs default) and the model-catalog status,
+    then exits non-zero if any check failed -- usable as a scripted preflight that
+    catches a retired-slug 404 (or a mis-wired provider) before a run spends money.
     """
-    cfg = load_models()  # loads .env so the key is visible
-    if not os.environ.get("OPENROUTER_API_KEY"):
+    cfg = load_models()  # loads .env so the provider keys are visible
+    checks = _doctor_checks(cfg, slugs)
+
+    # Provider-aware key precheck: every provider in play needs its key env set --
+    # checked BEFORE building any client (so a missing key never builds/charges).
+    missing = _missing_provider_keys(checks)
+    if missing:
+        names = missing[0] if len(missing) == 1 else ", ".join(missing)
+        verb = "is" if len(missing) == 1 else "are"
         console.print(
-            "[red]OPENROUTER_API_KEY is not set[/red] - cannot probe models. "
-            "Copy .env.example to .env and add your key."
+            f"[red]{names} {verb} not set[/red] - cannot probe models. "
+            "Copy .env.example to .env and add your key(s)."
         )
         raise typer.Exit(code=1)
 
-    checks = [("arg", s) for s in slugs] if slugs else [("brain", cfg.brain), ("hands", cfg.hands)]
-    try:
-        client = build_client()
-    except Exception as exc:  # noqa: BLE001 — surface a clear message, don't traceback
-        console.print(f"[red]could not build the OpenRouter client:[/red] {exc}")
-        raise typer.Exit(code=1)
-
-    rows, all_ok = _run_doctor(checks, client)
+    clients = _build_provider_clients(checks)
+    rows, all_ok = _run_doctor(checks, clients)
     _print_doctor_table(rows)
 
-    # Report the brain's context window and how Relay determined it, so the user
-    # can see whether Relay is guessing (and declare it if so).
-    window, source = resolve_context_window(cfg.brain, client=client)
-    console.print(f"brain context window: {window} tokens (source: {source})")
-    if source == "default":
-        console.print(
-            "[yellow]note:[/yellow] guessing the window; declare it via RELAY_BRAIN_CONTEXT."
+    # Surface the catalog source/status so a silent fallback (stale/bundled) shows.
+    catalog = _safe_load_catalog()
+    if catalog is not None:
+        console.print(f"model catalog: {catalog.status} (source: {catalog.source})")
+
+    # Per-role context window + its provenance (catalog vs probe vs default).
+    for label, provider, model in checks:
+        window, source = resolve_context_window(
+            model, provider=provider, client=clients.get(provider), catalog=catalog
         )
+        console.print(f"{label} context window: {window} tokens (source: {source})")
+        if source == "default":
+            console.print(
+                "[yellow]note:[/yellow] guessing the window; declare it via RELAY_BRAIN_CONTEXT."
+            )
 
     raise typer.Exit(code=0 if all_ok else 1)
 
 
-def _probe_model(client, slug: str) -> tuple[bool, str]:
-    """Minimal (max_tokens=1) call to check a slug resolves. Never raises."""
+def _doctor_checks(cfg, slugs) -> list[tuple[str, str, str]]:
+    """The ``(label, provider, model)`` checks: ad-hoc slugs or the configured roles."""
+    if slugs:
+        return [("arg", DEFAULT_PROVIDER, s) for s in slugs]
+    return [("brain", cfg.brain_provider, cfg.brain), ("hands", cfg.hands_provider, cfg.hands)]
+
+
+def _missing_provider_keys(checks) -> list[str]:
+    """Key env-vars (deduped, in order) that are needed by some provider but unset."""
+    missing: list[str] = []
+    seen: set[str] = set()
+    for _, provider, _ in checks:
+        if provider in seen:
+            continue
+        seen.add(provider)
+        try:
+            profile = resolve_provider(provider)
+        except ValueError:
+            continue  # unknown provider surfaces as a failed probe, not a key error
+        if not os.environ.get(profile.key_env) and profile.key_env not in missing:
+            missing.append(profile.key_env)
+    return missing
+
+
+def _build_provider_clients(checks) -> dict:
+    """Build one client per distinct provider; a build failure is a failed probe."""
+    clients: dict = {}
+    for _, provider, _ in checks:
+        if provider in clients:
+            continue
+        try:
+            clients[provider] = build_client(provider)
+        except Exception as exc:  # noqa: BLE001 — surface as a failed probe, not a traceback
+            console.print(f"[red]could not build the {provider} client:[/red] {exc}")
+    return clients
+
+
+def _safe_load_catalog():
+    """Load the catalog for the status line; never let it crash doctor."""
     try:
+        return load_catalog()
+    except Exception:  # noqa: BLE001 — catalog status is informational only
+        return None
+
+
+def _probe_model(client, slug: str, provider: str = DEFAULT_PROVIDER) -> tuple[bool, str]:
+    """Minimal (max_tokens=1) call to check a slug resolves. Never raises.
+
+    Only the OpenRouter path asks for usage cost (its include flag); other
+    providers get a plain probe.
+    """
+    try:
+        extra_body = {"usage": {"include": True}} if provider == DEFAULT_PROVIDER else {}
         client.chat.completions.create(
             model=slug,
             messages=[{"role": "user", "content": "ping"}],
             max_tokens=1,
-            extra_body={"usage": {"include": True}},
+            extra_body=extra_body,
         )
         return True, "resolved"
     except Exception as exc:  # noqa: BLE001 — classify any failure as the note
@@ -475,26 +539,37 @@ def _probe_model(client, slug: str) -> tuple[bool, str]:
         return False, text[:120]
 
 
-def _run_doctor(checks, client) -> tuple[list[dict], bool]:
-    """Probe each ``(label, slug)``; return the rows and whether all succeeded."""
+def _run_doctor(checks, clients) -> tuple[list[dict], bool]:
+    """Probe each ``(label, provider, slug)`` against its provider's client."""
     rows: list[dict] = []
     all_ok = True
-    for label, slug in checks:
-        ok, note = _probe_model(client, slug)
-        rows.append({"role": label, "model": slug, "status": "OK" if ok else "FAILED", "note": note})
+    for label, provider, slug in checks:
+        client = clients.get(provider)
+        if client is None:
+            ok, note = False, f"no client for provider {provider!r}"
+        else:
+            ok, note = _probe_model(client, slug, provider)
+        rows.append(
+            {"role": label, "provider": provider, "model": slug,
+             "status": "OK" if ok else "FAILED", "note": note}
+        )
         all_ok = all_ok and ok
     return rows, all_ok
 
 
 def _print_doctor_table(rows) -> None:
-    table = Table(title="Relay doctor: model slug preflight")
+    table = Table(title="Relay doctor: provider/model preflight")
     table.add_column("Role", style="bold")
+    table.add_column("Provider")
     table.add_column("Model slug", overflow="fold")
     table.add_column("Status")
     table.add_column("Note", overflow="fold")
     for row in rows:
         style = "green" if row["status"] == "OK" else "bold red"
-        table.add_row(row["role"], row["model"], f"[{style}]{row['status']}[/{style}]", row["note"])
+        table.add_row(
+            row["role"], row.get("provider", ""), row["model"],
+            f"[{style}]{row['status']}[/{style}]", row["note"],
+        )
     console.print(table)
 
 

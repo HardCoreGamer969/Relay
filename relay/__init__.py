@@ -80,6 +80,14 @@
   protocol stays the universal execution mechanism; the OpenRouter path is
   byte-for-byte unchanged. The in-TUI key entry / model picker sits on top of
   this and is the next milestone.
+- v0.0.14 is a one-line **bug fix** with the test that was missing: Relay now loads
+  a project ``.env`` from the **current working directory** (``config.load_env`` via
+  ``find_dotenv(usecwd=True)``), not from Relay's install/module tree. The shipped
+  ``load_dotenv()`` resolved relative to the caller module's file, so under a global/
+  editable install a project ``.env`` was silently ignored -- breaking the "swap via
+  env, never code" promise with no error. Process env vars still override the file
+  (``override=False``); an absent ``.env`` is harmless. Config key resolution is
+  unchanged -- only *when/where* the file is loaded.
 """
 
 from __future__ import annotations
@@ -169,7 +177,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.13"
+__version__ = "0.0.14"
 
 __all__ = [
     # v0.01 -- model layer

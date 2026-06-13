@@ -454,6 +454,11 @@ use: `OPENROUTER_API_KEY` (the default for both roles) and/or `DEEPSEEK_API_KEY`
 (if a role uses `provider=deepseek`). With the defaults, an `OPENROUTER_API_KEY`
 is all you need.
 
+The `.env` is read from the **directory you run `relay` in** (the nearest `.env`
+walking up from the current working directory), so per-project config works no
+matter where Relay itself is installed. Real environment variables you export
+override the file.
+
 ## Usage
 
 ```bash

@@ -168,7 +168,7 @@ def call_model(
     client: Any | None = None,
     **kwargs: Any,
 ) -> ModelResult:
-    """Call the model bound to ``role`` through OpenRouter and record telemetry.
+    """Call the model bound to ``role`` through its provider and record telemetry.
 
     Args:
         role: ``"brain"`` or ``"hands"``.
@@ -183,6 +183,7 @@ def call_model(
     models = models or load_models()
     model = models.for_role(role)
     provider = models.provider_for_role(role)
+    thinking = models.thinking_for_role(role)
     client = client or build_client(provider)
 
     extra_body = dict(kwargs.pop("extra_body", {}) or {})
@@ -190,6 +191,20 @@ def call_model(
         # OpenRouter: ask for the actual per-generation cost in ``usage``, while
         # preserving any caller-provided extra_body / usage options. (Unchanged.)
         extra_body["usage"] = {"include": True, **dict(extra_body.get("usage", {}) or {})}
+    elif thinking:
+        # Thinking mode is a per-role opt-in and OFF by default, by design: (a)
+        # thinking splits output into a separate ``reasoning_content`` stream that
+        # Relay's single-``content`` text protocol would discard; (b) some multi-turn
+        # patterns 400 unless ``reasoning_content`` is passed back -- staying
+        # non-thinking sidesteps that landmine entirely; (c) it's cheaper/faster and
+        # the executor should act on the brain's plan, not re-deliberate. When opted
+        # in, enable thinking and still read ``content`` (below) for the protocol.
+        extra_body["thinking"] = {"type": "enabled", **dict(extra_body.get("thinking", {}) or {})}
+        # temperature / top_p are silently ignored in thinking mode -- don't send
+        # them, so no one later debugs a "temperature does nothing" ghost. (An
+        # optional ``reasoning_effort`` could be added to extra_body here.)
+        kwargs.pop("temperature", None)
+        kwargs.pop("top_p", None)
 
     with timer() as elapsed:
         response = client.chat.completions.create(

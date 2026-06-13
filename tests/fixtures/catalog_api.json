@@ -1,0 +1,46 @@
+{
+  "deepseek": {
+    "id": "deepseek",
+    "name": "DeepSeek",
+    "env": ["DEEPSEEK_API_KEY"],
+    "api": "https://api.deepseek.com",
+    "models": {
+      "deepseek-v4-pro": {
+        "id": "deepseek-v4-pro",
+        "name": "DeepSeek V4 Pro",
+        "reasoning": true,
+        "tool_call": true,
+        "temperature": true,
+        "limit": {"context": 131072, "output": 8192},
+        "cost": {"input": 0.56, "output": 1.68, "cache_read": 0.07, "cache_write": 0.0},
+        "this_field_is_unknown": "must be ignored without breaking the parse"
+      },
+      "deepseek-v4-flash": {
+        "id": "deepseek-v4-flash",
+        "name": "DeepSeek V4 Flash",
+        "reasoning": true,
+        "tool_call": true,
+        "temperature": true,
+        "limit": {"context": 131072, "output": 8192},
+        "cost": {"input": 0.28, "output": 0.42}
+      }
+    }
+  },
+  "openrouter": {
+    "id": "openrouter",
+    "name": "OpenRouter",
+    "env": ["OPENROUTER_API_KEY"],
+    "api": "https://openrouter.ai/api/v1",
+    "models": {
+      "anthropic/claude-sonnet-4.5": {
+        "id": "anthropic/claude-sonnet-4.5",
+        "name": "Claude Sonnet 4.5",
+        "reasoning": true,
+        "tool_call": true,
+        "temperature": true,
+        "limit": {"context": 200000, "output": 64000},
+        "cost": {"input": 3.0, "output": 15.0, "cache_read": 0.3}
+      }
+    }
+  }
+}

@@ -28,3 +28,6 @@ dist/
 
 # Relay run logs (running Relay on its own repo writes here)
 .relay/
+
+# Local diagnostics (pairing/cost checks; not part of Relay, kept for re-runs)
+pairing_check/

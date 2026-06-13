@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from relay.catalog import get_catalog
 from relay.client import build_client
 from relay.config import ModelConfig, load_models
 from relay.providers import DEFAULT_PROVIDER
@@ -96,17 +97,66 @@ def _openrouter_cost(usage: Any) -> float | None:
         return None
 
 
+def _token(usage: Any, key: str) -> int:
+    """Read an integer token count from the usage block (0 when absent/odd)."""
+    try:
+        return int(_get(usage, key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _catalog_cost(usage: Any, *, provider: str, model: str) -> float | None:
+    """Price a call from the catalog using the provider's cache hit/miss split.
+
+    DeepSeek's usage carries ``prompt_cache_hit_tokens`` /
+    ``prompt_cache_miss_tokens`` plus completion tokens, and the documented cost is
+
+        cost = hit  * cache_read_price
+             + miss * input_price
+             + completion * output_price
+
+    Catalog prices are per-1M tokens, so each is divided by 1e6. A naive
+    ``total_input * input_price`` is wrong by up to ~50x once caching kicks in --
+    and it WILL, because Relay's loop reuses long shared prefixes (system prompt,
+    plan context) call after call, exactly what DeepSeek caches. So read the split
+    and apply the two input rates.
+
+    If the catalog entry lacks ``cache_read``, fall back to pricing all input at the
+    input (miss) rate -- never zero. Likewise, if no split is present at all, price
+    the whole ``prompt_tokens`` at the input rate. Returns ``None`` (unknown) only
+    when the catalog has no usable price for the model.
+    """
+    if usage is None:
+        return None
+    cost = get_catalog().cost(provider, model)
+    if cost is None or cost.input is None or cost.output is None:
+        return None  # genuinely unpriced -> unknown (shown as "-"), not a wrong 0
+
+    hit = _token(usage, "prompt_cache_hit_tokens")
+    miss = _token(usage, "prompt_cache_miss_tokens")
+    completion = _token(usage, "completion_tokens")
+    if hit == 0 and miss == 0:
+        # No cache split surfaced; price all prompt tokens at the input rate.
+        miss = _token(usage, "prompt_tokens")
+
+    input_rate = cost.input / 1_000_000.0
+    output_rate = cost.output / 1_000_000.0
+    # cache_read absent -> treat cache hits at the input rate (never zero).
+    cache_rate = (cost.cache_read / 1_000_000.0) if cost.cache_read is not None else input_rate
+
+    return hit * cache_rate + miss * input_rate + completion * output_rate
+
+
 def _extract_cost(usage: Any, *, provider: str, model: str) -> float | None:
     """Per-provider cost extraction. Never raises -- pricing can't crash a run.
 
     OpenRouter returns the real per-generation ``cost`` in the usage block, so we
-    read it directly (unchanged). Other providers are priced from the catalog (the
-    DeepSeek cache hit/miss split lands in the next commit); until then they report
-    no cost (``None`` = unknown, shown as ``-``) rather than a wrong number.
+    read it directly (unchanged). Every other provider is priced from the catalog
+    via the cache hit/miss split (:func:`_catalog_cost`).
     """
     if provider == DEFAULT_PROVIDER:
         return _openrouter_cost(usage)
-    return None
+    return _catalog_cost(usage, provider=provider, model=model)
 
 
 def call_model(

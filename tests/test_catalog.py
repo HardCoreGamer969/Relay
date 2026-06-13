@@ -190,6 +190,35 @@ def test_load_never_raises_on_garbage_source(monkeypatch, tmp_path):
     assert cat.cost("deepseek", "deepseek-v4-pro") is not None
 
 
+# --- http fetch headers -----------------------------------------------------
+
+
+def test_http_fetch_sets_a_non_default_user_agent(monkeypatch):
+    # models.dev (behind a CDN) 403s the default Python-urllib agent, so the HTTP
+    # fetch must identify itself -- otherwise every real run silently falls back.
+    captured = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"x": {"id": "x", "models": {}}}'
+
+    def fake_urlopen(request, timeout=None):
+        captured["ua"] = request.get_header("User-agent")
+        return _Resp()
+
+    monkeypatch.setattr(catalog.urllib.request, "urlopen", fake_urlopen)
+    catalog._fetch_raw("https://models.dev/api.json")
+    ua = (captured["ua"] or "").lower()
+    assert "relay" in ua
+    assert "python-urllib" not in ua
+
+
 # --- endpoint resolution ----------------------------------------------------
 
 

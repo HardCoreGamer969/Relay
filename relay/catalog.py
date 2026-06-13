@@ -53,6 +53,11 @@ CACHE_TTL_S = 3600  # 1 hour
 # through to cache/bundled instead.
 FETCH_TIMEOUT_S = 4.0
 
+# A descriptive User-Agent. models.dev (behind a CDN) returns 403 to the default
+# ``Python-urllib`` agent, which would silently force the bundled fallback on
+# every real run -- so we identify ourselves with a normal UA.
+_USER_AGENT = "relay-cli (model-catalog)"
+
 
 # --- schema -----------------------------------------------------------------
 
@@ -332,7 +337,8 @@ def _fetch_raw(endpoint: str) -> str:
     """
     lowered = endpoint.lower()
     if lowered.startswith(("http://", "https://")):
-        with urllib.request.urlopen(endpoint, timeout=FETCH_TIMEOUT_S) as response:  # noqa: S310
+        request = urllib.request.Request(endpoint, headers={"User-Agent": _USER_AGENT})
+        with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT_S) as response:  # noqa: S310
             return response.read().decode("utf-8")
     path = endpoint[len("file://"):] if lowered.startswith("file://") else endpoint
     return Path(path).read_text(encoding="utf-8")

@@ -63,6 +63,23 @@
   next milestone's config/launch-counter slots in without a refactor. The
   handoff is purely visual -- the run kicks off immediately, never gated on an
   animation.
+- v0.0.13 makes Relay genuinely **multi-provider** (the backend milestone under
+  the next TUI picker). Three additions: (1) a **model catalog** (``relay/catalog.py``)
+  that fetches model metadata + pricing from an external source (default
+  ``models.dev``), validates/caches it, and serves cost/capabilities/context-limit
+  lookups -- with a fetch -> fresh-cache -> stale-cache -> bundled-fallback chain
+  so a network blip never bricks Relay or zeros cost; (2) thin **provider profiles**
+  (``relay/providers.py`` -- ``{id, base_url, key_env}``) selected **per role**
+  (``RELAY_BRAIN_PROVIDER`` / ``RELAY_HANDS_PROVIDER``, default ``openrouter`` so
+  all prior behavior is unchanged); and (3) **DeepSeek direct** as the first
+  non-OpenRouter provider, with **catalog-driven cost** that respects DeepSeek's
+  cache hit/miss split (``hit*cache_read + miss*input + out*output``) instead of a
+  naive single rate. Thinking mode is off by default and per-role-toggleable.
+  ``relay doctor`` is now provider-aware (preflights each role against its own
+  provider, reports the catalog source and per-role context window). The text
+  protocol stays the universal execution mechanism; the OpenRouter path is
+  byte-for-byte unchanged. The in-TUI key entry / model picker sits on top of
+  this and is the next milestone.
 """
 
 from __future__ import annotations
@@ -151,7 +168,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.12"
+__version__ = "0.0.13"
 
 __all__ = [
     # v0.01 -- model layer

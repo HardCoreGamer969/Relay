@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "relay-cli"
-version = "0.0.12"
-description = "Relay — a planner/executor coding agent built on a model-agnostic OpenRouter seam."
+version = "0.0.13"
+description = "Relay — a planner/executor coding agent built on a model-agnostic, multi-provider seam."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Relay" }]
-keywords = ["openrouter", "llm", "coding-agent", "planner-executor"]
+keywords = ["openrouter", "deepseek", "llm", "coding-agent", "planner-executor"]
 dependencies = [
     "openai",
     "typer",

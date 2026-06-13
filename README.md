@@ -43,9 +43,38 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.12 (TUI part 2a: the welcome state + glitch polish)
+## Status — v0.0.13 (multi-provider: model catalog + provider profiles + DeepSeek)
 
-`relay tui` now opens on a composed, cyberpunk-terminal **welcome screen** — the
+Relay is now genuinely **multi-provider**. Three backend pieces land together (the
+in-TUI key entry / model picker sits on top of these and is the next milestone):
+
+1. **A model catalog** (`relay/catalog.py`). Model metadata + pricing are pulled
+   from an external catalog (default [`models.dev`](https://models.dev), endpoint
+   `/api.json`), validated, cached to disk, and served via a small lookup API
+   (cost / capabilities / context-limit / list-models). A **fallback chain** means
+   a network blip can never brick Relay or zero out cost: fresh disk cache →
+   network fetch → stale cache → a small **bundled fallback** (DeepSeek + OpenRouter
+   pricing baked in). The rung actually used is surfaced as the catalog *status*.
+2. **Provider profiles** (`relay/providers.py`). A provider is a thin
+   `{id, base_url, key_env}` entry over the one shared OpenAI-compatible client —
+   adding one is a registry line, not new code. The provider is chosen **per role**
+   (`RELAY_BRAIN_PROVIDER` / `RELAY_HANDS_PROVIDER`), defaulting to `openrouter` so
+   **every prior behavior is byte-for-byte unchanged**.
+3. **DeepSeek direct** — the first non-OpenRouter provider, with **catalog-driven
+   cost** that respects DeepSeek's cache hit/miss split (`prompt_cache_hit_tokens`
+   priced at the cache-read rate, `prompt_cache_miss_tokens` at the input rate). A
+   naive single-rate calc is wrong by up to ~50× once Relay's reused prompt prefixes
+   start hitting DeepSeek's cache, so the split matters. Thinking mode is **off by
+   default** and per-role-toggleable.
+
+`relay doctor` is now provider-aware: it preflights each role against *its own*
+provider's API, prints the catalog source/status, and reports the resolved context
+window + source per role. The text protocol stays the universal execution mechanism
+(no native tool-calling), and the OpenRouter path is untouched.
+
+Under that, v0.0.12's TUI visual-polish pass still stands:
+
+`relay tui` opens on a composed, cyberpunk-terminal **welcome screen** — the
 letterspaced `RELAY` block wordmark hero, a rotating greeting, the brain/hands
 pairing promoted as identity, and a dim keybind hint — that **glitch/datamosh-
 transitions** into the two working panes when you send your first goal. A short
@@ -75,16 +104,18 @@ readable narrative).
 
 **What exists now:**
 
-- `relay/client.py` — the one place that touches the OpenRouter (OpenAI-compatible) SDK.
-- `relay/config.py` — role → model mapping, **and the assumption dial** (`resolve_assumption_level`, `assumption_directive`).
+- `relay/client.py` — the one place that touches the OpenAI-compatible SDK; **provider-aware** `build_client(provider)` (defaults to OpenRouter).
+- `relay/providers.py` — **provider profiles**: `ProviderProfile {id, base_url, key_env}` + registry (`openrouter`, `deepseek`), `resolve_provider`.
+- `relay/catalog.py` — **the model catalog**: fetch → validate → cache → serve model metadata + pricing, with the fresh→network→stale→bundled fallback chain; cost / capability / context-limit lookups.
+- `relay/config.py` — **per-role** provider + model + thinking mapping, **and the assumption dial** (`resolve_assumption_level`, `assumption_directive`).
 - `relay/telemetry.py` — `CallRecord` / `Ledger` recording tokens, cost, latency, and parse-failure count, **split per role**.
-- `relay/models.py` — `call_model(...)`, **the seam** everything else builds on.
+- `relay/models.py` — `call_model(...)`, **the seam** everything else builds on; selects the role's provider and extracts cost per provider (OpenRouter's returned cost; DeepSeek's cache hit/miss split via the catalog).
 - `relay/protocol.py` — the text action protocol + a tolerant `parse()` (`<plan>`/`<step>`, `<abort>`, `<blocked>`, `<question>`).
 - `relay/policy.py` — the command policy: `classify()` → `BLOCKED` / `CONFIRM` / `ALLOW`.
 - `relay/tools.py` — `read` / `list` / `grep` / `edit` / `bash`; `bash` consults the policy and an approver.
 - `relay/loop.py` — `run_task(...)`, the single-model loop (kept for `--solo`).
 - `relay/memory.py` — **plan memory**: `PlanMemory` of dual-fidelity `MemoryEntry` values, budget-bounded `relevant(...)`, compress-not-truncate `compacted_context(...)`.
-- `relay/context.py` — **context-window awareness**: `resolve_context_window(...)` (override → OpenRouter metadata → local probe → default).
+- `relay/context.py` — **context-window awareness**: `resolve_context_window(...)` (override → catalog `limit.context` → OpenRouter metadata → local probe → default).
 - `relay/planner.py` — **the brain**: `make_plan` / `replan` / `evolve_plan`, `review_step` (supervise), `answer_or_escalate` (answer-vs-escalate, dial-biased).
 - `relay/conversation.py` — **conversational planning**: `plan_conversationally(...)` — scope assessment, posture, dual-fidelity proposal, free-form reactions, commit; appends its turns to the shared transcript.
 - `relay/transcript.py` — **the continuous transcript**: `Transcript` of `Turn` values (the human-facing source of truth), `record_decision` (transcript-first, memory-derived), and readability-preserving compaction (`compact_transcript` / `render_for_brain`).
@@ -92,8 +123,8 @@ readable narrative).
 - `relay/runlog.py` — **durable run records**: `RunRecord` + `build_record` / `append_record` / `load_records` (JSONL).
 - `relay/bridge.py` — **the sync↔async bridge**: `EngineBridge` (blocking asks ↔ thread-safe handoff), `EngineRunner` (the conversational arc on a worker thread), `InputRouter` (the input state machine). UI-framework-free; tested headless.
 - `relay/tui.py` — **the TUI**: a composed welcome screen (the `RELAY` wordmark hero, rotating greeting, promoted model identity) that glitch/datamosh-transitions into a two-pane chat (conversation + activity); one routed input box, the `present_prompt` chokepoint, cancel + clean shutdown.
-- `relay/cli.py` — `relay models`, `relay demo`, `relay run` (conversational, `--assume`, `--show-transcript`), `relay tui`, `relay runs`, `relay doctor`.
-- Network-free tests across the whole stack (incl. conversation, the dial, the continuous transcript, the bridge, and the headless TUI).
+- `relay/cli.py` — `relay models`, `relay demo`, `relay run` (conversational, `--assume`, `--show-transcript`), `relay tui`, `relay runs`, `relay doctor` (**provider-aware**: preflights each role against its provider, shows catalog status + per-role context window).
+- Network-free tests across the whole stack (incl. conversation, the dial, the continuous transcript, the bridge, the headless TUI, **the catalog + fallback chain, provider selection, and the DeepSeek cost split** — all via a local catalog fixture, no sockets).
 
 ## Conversational planning + the assumption dial
 
@@ -415,11 +446,13 @@ features in later milestones, so it's baked in from commit one.
 
 ```bash
 pip install -e .
-cp .env.example .env   # then add your OPENROUTER_API_KEY
+cp .env.example .env   # then add a key for the provider(s) you use
 ```
 
-`.env.example` only needs an `OPENROUTER_API_KEY` — OpenRouter is the single
-backend, so there are no other provider keys.
+Relay is multi-provider. You only need the key for the provider(s) you actually
+use: `OPENROUTER_API_KEY` (the default for both roles) and/or `DEEPSEEK_API_KEY`
+(if a role uses `provider=deepseek`). With the defaults, an `OPENROUTER_API_KEY`
+is all you need.
 
 ## Usage
 
@@ -447,7 +480,8 @@ relay run -g "create hello.txt" --solo hands
 # Unattended: auto-approve CONFIRM-category bash commands (BLOCKED still refused)
 relay run -g "clean build artifacts" --auto-approve
 
-# Preflight: check the configured model slugs resolve before they 404 mid-run
+# Preflight: check each role's (provider, model) resolves on its provider before
+# it 404s mid-run; also shows the catalog source/status + per-role context window
 relay doctor
 relay doctor anthropic/claude-sonnet-4.5 openai/gpt-4o-mini   # probe slugs ad-hoc
 
@@ -530,17 +564,41 @@ planned-only. `cost_usd` is `null` when OpenRouter didn't report a cost, and
 `totals.cost_usd` sums only known costs. `wall_time_s` is real wall-clock,
 distinct from the summed model latency in `totals.time_s`.
 
-## Swapping models
+## Swapping models & providers
 
-Models are resolved by role from the environment — no code change needed:
+Each role names **both** a provider and a model, resolved from the environment —
+no code change needed:
 
 ```bash
+# Same provider (OpenRouter), different models:
 export RELAY_BRAIN_MODEL="openai/gpt-4o"
 export RELAY_HANDS_MODEL="anthropic/claude-3.5-haiku"
+
+# Mixed providers — keep the planner on OpenRouter, run the executor on DeepSeek:
+export RELAY_HANDS_PROVIDER="deepseek"
+export RELAY_HANDS_MODEL="deepseek-v4-flash"   # use the v4 ids, not the legacy aliases
+
 relay models
+relay doctor   # confirm both roles resolve on their providers before spending
 ```
 
-(Or set them in `.env`.) Any OpenRouter model slug works.
+(Or set them in `.env`.) The provider defaults to `openrouter`; known providers
+are `openrouter` and `deepseek`. Adding another OpenAI-compatible provider is a
+one-line `ProviderProfile` in `relay/providers.py`.
+
+**Thinking mode** is off by default and per-role: set `RELAY_HANDS_THINKING=1`
+(or `RELAY_BRAIN_THINKING=1`) to opt a role in. It's off by default because
+Relay's text protocol parses a single `content` blob — thinking mode splits
+output into a separate `reasoning_content` stream Relay would discard, and some
+multi-turn patterns 400 unless it's passed back; staying non-thinking sidesteps
+that.
+
+**The model catalog.** Pricing/capabilities/limits come from a catalog (default
+`https://models.dev`), cached locally with a fresh→network→stale→bundled fallback
+so cost is never silently zero. Power-user env overrides (rarely needed):
+`RELAY_MODELS_URL` (source override), `RELAY_DISABLE_MODELS_FETCH` (cache/bundled
+only), `RELAY_CACHE_DIR` (cache location). `relay doctor` prints which rung the
+catalog resolved from.
 
 ## Develop
 
@@ -549,8 +607,9 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Tests are network-free — the OpenRouter client is mocked, so `pytest` never
-makes a real API call.
+Tests are network-free — the OpenAI-compatible client is mocked and the catalog
+is served from a local fixture (`RELAY_MODELS_URL`) with the cache isolated to a
+tmp dir, so `pytest` never makes a real API call.
 
 ## Naming
 

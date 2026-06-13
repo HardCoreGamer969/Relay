@@ -109,6 +109,7 @@ from relay.config import (
     DEFAULT_ASSUMPTION_LEVEL,
     ModelConfig,
     assumption_directive,
+    load_env,
     load_models,
     resolve_assumption_level,
 )
@@ -176,6 +177,7 @@ __all__ = [
     "ModelResult",
     "ModelConfig",
     "load_models",
+    "load_env",
     "Ledger",
     "CallRecord",
     # v0.02 -- protocol, tools, loop

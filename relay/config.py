@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
 from relay.providers import DEFAULT_PROVIDER
 
@@ -141,16 +141,39 @@ def _env_bool(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in ("1", "true", "yes", "on")
 
 
+def load_env() -> str:
+    """Load a ``.env`` from the CURRENT WORKING DIRECTORY (walking up), and return
+    the path loaded (``""`` when none was found).
+
+    This is the fix for the silent-config bug: a bare ``load_dotenv()`` (and
+    ``find_dotenv()``) default to ``usecwd=False``, which resolves the search
+    relative to the *caller module's file* -- under a global/editable install that
+    is Relay's own install tree, NOT the user's project, so a project ``.env`` was
+    silently ignored. ``usecwd=True`` keys the search off ``os.getcwd()`` (the
+    directory the user ran ``relay`` in), giving the natural "nearest ``.env`` up
+    the tree" behavior regardless of where Relay is installed.
+
+    Precedence is conventional and deliberate: real process environment variables
+    are NOT overridden (``override=False``), so a session var the user exports still
+    wins over the file. An absent ``.env`` is harmless -- no error, no warning.
+    """
+    path = find_dotenv(usecwd=True)
+    if path:
+        load_dotenv(path)
+    return path
+
+
 def load_models() -> ModelConfig:
     """Build a :class:`ModelConfig` from the environment.
 
-    Loads ``.env`` (via python-dotenv) and resolves, per role: the model from
-    ``RELAY_BRAIN_MODEL`` / ``RELAY_HANDS_MODEL``, the provider from
+    Loads a project ``.env`` from the current working directory (:func:`load_env`,
+    cwd-based so it works under any install location) and resolves, per role: the
+    model from ``RELAY_BRAIN_MODEL`` / ``RELAY_HANDS_MODEL``, the provider from
     ``RELAY_BRAIN_PROVIDER`` / ``RELAY_HANDS_PROVIDER`` (default ``openrouter``),
     and the thinking toggle from ``RELAY_BRAIN_THINKING`` / ``RELAY_HANDS_THINKING``
     (default off). Provider/thinking defaults keep the OpenRouter behavior intact.
     """
-    load_dotenv()
+    load_env()
     return ModelConfig(
         brain=os.environ.get("RELAY_BRAIN_MODEL", DEFAULT_BRAIN_MODEL),
         hands=os.environ.get("RELAY_HANDS_MODEL", DEFAULT_HANDS_MODEL),

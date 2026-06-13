@@ -1,9 +1,14 @@
 """The seam.
 
 ``call_model`` is THE abstraction every later part of Relay is built on: it
-resolves a model by role, calls OpenRouter through the shared client, times the
-call, records telemetry (tokens + OpenRouter's real per-generation cost), and
-returns the text. Keep it clean.
+resolves a model by role, selects that role's *provider* (OpenRouter, DeepSeek,
+...), calls it through the shared OpenAI-compatible client, times the call,
+records telemetry (tokens + the real per-generation cost, extracted per provider),
+and returns the text. Keep it clean.
+
+Provider selection is per role and defaults to OpenRouter, so the historical
+single-provider behavior is unchanged: an OpenRouter role still asks for and reads
+OpenRouter's returned ``cost`` exactly as before.
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ from typing import Any
 
 from relay.client import build_client
 from relay.config import ModelConfig, load_models
+from relay.providers import DEFAULT_PROVIDER
 from relay.telemetry import CallRecord, Ledger, timer
 
 
@@ -25,10 +31,20 @@ class ModelResult:
 
 
 def _get(obj: Any, key: str) -> Any:
-    """Read ``key`` from an attribute-style or dict-style object."""
+    """Read ``key`` from an attribute-style, pydantic-extra, or dict-style object.
+
+    Providers surface extra usage fields differently: the openai SDK's pydantic v2
+    usage models put unknown fields (OpenRouter's ``cost``, DeepSeek's
+    ``prompt_cache_hit_tokens`` / ``prompt_cache_miss_tokens``) in ``model_extra``,
+    not as first-class attributes. Try attribute, then ``model_extra``, then dict.
+    """
     if obj is None:
         return None
     value = getattr(obj, key, None)
+    if value is None:
+        extra = getattr(obj, "model_extra", None)
+        if isinstance(extra, dict):
+            value = extra.get(key)
     if value is None and isinstance(obj, dict):
         value = obj.get(key)
     return value
@@ -66,7 +82,7 @@ def _read_cost_field(usage: Any) -> Any:
     return None
 
 
-def _extract_cost(usage: Any) -> float | None:
+def _openrouter_cost(usage: Any) -> float | None:
     """Read OpenRouter's real per-generation cost from the usage block.
 
     Guarded so pricing can never crash a run: any missing/odd value → None.
@@ -78,6 +94,19 @@ def _extract_cost(usage: Any) -> float | None:
         return float(cost)
     except (TypeError, ValueError):
         return None
+
+
+def _extract_cost(usage: Any, *, provider: str, model: str) -> float | None:
+    """Per-provider cost extraction. Never raises -- pricing can't crash a run.
+
+    OpenRouter returns the real per-generation ``cost`` in the usage block, so we
+    read it directly (unchanged). Other providers are priced from the catalog (the
+    DeepSeek cache hit/miss split lands in the next commit); until then they report
+    no cost (``None`` = unknown, shown as ``-``) rather than a wrong number.
+    """
+    if provider == DEFAULT_PROVIDER:
+        return _openrouter_cost(usage)
+    return None
 
 
 def call_model(
@@ -94,19 +123,23 @@ def call_model(
     Args:
         role: ``"brain"`` or ``"hands"``.
         messages: OpenAI-style chat messages.
-        models: Role→model config (defaults to :func:`load_models`).
+        models: Role→(provider, model) config (defaults to :func:`load_models`).
         ledger: If given, the resulting :class:`CallRecord` is appended to it.
-        client: OpenRouter client (defaults to :func:`build_client`).
+        client: Pre-built client (tests inject a fake). When ``None``, a client is
+            built for the role's provider profile. An explicitly-passed client is
+            used as-is, but the provider still drives request/cost handling.
         **kwargs: Forwarded to ``chat.completions.create`` (e.g. temperature).
     """
     models = models or load_models()
     model = models.for_role(role)
-    client = client or build_client()
+    provider = models.provider_for_role(role)
+    client = client or build_client(provider)
 
-    # Ask OpenRouter to include the actual per-generation cost in ``usage``,
-    # while preserving any caller-provided extra_body / usage options.
     extra_body = dict(kwargs.pop("extra_body", {}) or {})
-    extra_body["usage"] = {"include": True, **dict(extra_body.get("usage", {}) or {})}
+    if provider == DEFAULT_PROVIDER:
+        # OpenRouter: ask for the actual per-generation cost in ``usage``, while
+        # preserving any caller-provided extra_body / usage options. (Unchanged.)
+        extra_body["usage"] = {"include": True, **dict(extra_body.get("usage", {}) or {})}
 
     with timer() as elapsed:
         response = client.chat.completions.create(
@@ -126,7 +159,7 @@ def call_model(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         latency_s=elapsed.seconds,
-        cost_usd=_extract_cost(usage),
+        cost_usd=_extract_cost(usage, provider=provider, model=model),
     )
     if ledger is not None:
         ledger.add(record)

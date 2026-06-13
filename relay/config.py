@@ -17,6 +17,8 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from relay.providers import DEFAULT_PROVIDER
+
 # The two roles Relay knows about.
 ROLES = ("brain", "hands")
 
@@ -98,14 +100,35 @@ DEFAULT_HANDS_MODEL = "anthropic/claude-3.5-haiku"
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """Immutable mapping of role → OpenRouter model slug."""
+    """Immutable per-role mapping of provider + model slug (+ thinking toggle).
+
+    A role names BOTH its provider and its model id. The provider/thinking fields
+    default so the historical ``ModelConfig(brain=..., hands=...)`` construction --
+    and every caller of it -- keeps working unchanged: both roles default to
+    OpenRouter with thinking off.
+    """
 
     brain: str
     hands: str
+    brain_provider: str = DEFAULT_PROVIDER
+    hands_provider: str = DEFAULT_PROVIDER
+    brain_thinking: bool = False
+    hands_thinking: bool = False
 
     def for_role(self, role: str) -> str:
         """Resolve the model slug for ``role``, raising on unknown roles."""
-        mapping = {"brain": self.brain, "hands": self.hands}
+        return self._pick(role, {"brain": self.brain, "hands": self.hands})
+
+    def provider_for_role(self, role: str) -> str:
+        """Resolve the provider id for ``role`` (e.g. ``"openrouter"`` / ``"deepseek"``)."""
+        return self._pick(role, {"brain": self.brain_provider, "hands": self.hands_provider})
+
+    def thinking_for_role(self, role: str) -> bool:
+        """Whether thinking mode is enabled for ``role`` (default off)."""
+        return self._pick(role, {"brain": self.brain_thinking, "hands": self.hands_thinking})
+
+    @staticmethod
+    def _pick(role: str, mapping: dict):
         if role not in mapping:
             raise ValueError(
                 f"Unknown role {role!r}. Valid roles: {', '.join(ROLES)}."
@@ -113,14 +136,26 @@ class ModelConfig:
         return mapping[role]
 
 
+def _env_bool(name: str) -> bool:
+    """Read a boolean env flag (``1`` / ``true`` / ``yes`` / ``on`` → True)."""
+    return str(os.environ.get(name, "")).strip().lower() in ("1", "true", "yes", "on")
+
+
 def load_models() -> ModelConfig:
     """Build a :class:`ModelConfig` from the environment.
 
-    Loads ``.env`` (via python-dotenv) and resolves each role from
-    ``RELAY_BRAIN_MODEL`` / ``RELAY_HANDS_MODEL``, falling back to the defaults.
+    Loads ``.env`` (via python-dotenv) and resolves, per role: the model from
+    ``RELAY_BRAIN_MODEL`` / ``RELAY_HANDS_MODEL``, the provider from
+    ``RELAY_BRAIN_PROVIDER`` / ``RELAY_HANDS_PROVIDER`` (default ``openrouter``),
+    and the thinking toggle from ``RELAY_BRAIN_THINKING`` / ``RELAY_HANDS_THINKING``
+    (default off). Provider/thinking defaults keep the OpenRouter behavior intact.
     """
     load_dotenv()
     return ModelConfig(
         brain=os.environ.get("RELAY_BRAIN_MODEL", DEFAULT_BRAIN_MODEL),
         hands=os.environ.get("RELAY_HANDS_MODEL", DEFAULT_HANDS_MODEL),
+        brain_provider=os.environ.get("RELAY_BRAIN_PROVIDER", DEFAULT_PROVIDER),
+        hands_provider=os.environ.get("RELAY_HANDS_PROVIDER", DEFAULT_PROVIDER),
+        brain_thinking=_env_bool("RELAY_BRAIN_THINKING"),
+        hands_thinking=_env_bool("RELAY_HANDS_THINKING"),
     )

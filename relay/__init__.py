@@ -77,6 +77,16 @@ from relay.bridge import (
     SubmitOutcome,
     UiRequest,
 )
+from relay.catalog import (
+    Catalog,
+    Cost,
+    Limit,
+    Model,
+    Provider,
+    get_catalog,
+    load_catalog,
+    reset_catalog_cache,
+)
 from relay.config import (
     ASSUMPTION_LEVELS,
     DEFAULT_ASSUMPTION_LEVEL,
@@ -86,6 +96,12 @@ from relay.config import (
     resolve_assumption_level,
 )
 from relay.context import DEFAULT_CONTEXT_WINDOW, resolve_context_window
+from relay.providers import (
+    DEFAULT_PROVIDER,
+    ProviderProfile,
+    known_providers,
+    resolve_provider,
+)
 from relay.conversation import ConversationResult, ScopeAssessment, plan_conversationally
 from relay.loop import StepResult, TaskResult, run_task
 from relay.memory import (
@@ -216,5 +232,18 @@ __all__ = [
     "InputState",
     "SubmitOutcome",
     "STATUS_CANCELLED",
+    # v0.0.13 -- model catalog + provider profiles (multi-provider seam)
+    "Catalog",
+    "Cost",
+    "Limit",
+    "Model",
+    "Provider",
+    "load_catalog",
+    "get_catalog",
+    "reset_catalog_cache",
+    "ProviderProfile",
+    "resolve_provider",
+    "known_providers",
+    "DEFAULT_PROVIDER",
     "__version__",
 ]

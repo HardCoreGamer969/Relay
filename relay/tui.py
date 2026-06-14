@@ -45,6 +45,7 @@ from relay.bridge import (
     ACTION_START,
     EVENT_PHASE,
     REQUEST_APPROVAL,
+    REQUEST_REACTION,
     STATUS_ERROR,
     EngineRunner,
     InputRouter,
@@ -478,13 +479,17 @@ class RelayTuiApp(App):
         """A blocking ask arrived: show it, point the input box at it."""
         self._router.on_request(request)
         self._sync_transcript()
-        # The transcript already carries most asks as turns (questions,
-        # escalations); render the prompt only when it ADDS detail -- e.g. the
-        # proposal's full plain plan behind its one-line headline turn.
-        last_turn_text = self._last_synced_turn_text()
-        if request.prompt.strip() != (last_turn_text or "").strip():
-            for line in present_prompt(request.prompt).splitlines():
-                self._write_conversation(f"brain: {line}" if line.strip() else "")
+        # A REACTION ask is the proposal: its full numbered plan is NOT dumped into
+        # the conversation -- that pane keeps only the human story (the headline
+        # turn + the surfaced assumptions, both rendered from the plan_proposed
+        # event via _render_plan_split); the full steps live in Activity. Other
+        # asks (decision/approval) still surface their prompt when it adds detail
+        # beyond the last transcript turn (e.g. the approval command).
+        if request.kind != REQUEST_REACTION:
+            last_turn_text = self._last_synced_turn_text()
+            if request.prompt.strip() != (last_turn_text or "").strip():
+                for line in present_prompt(request.prompt).splitlines():
+                    self._write_conversation(f"brain: {line}" if line.strip() else "")
         self._update_status()
 
     def _handle_event(self, event: Event) -> None:
@@ -492,8 +497,31 @@ class RelayTuiApp(App):
         if event.kind == EVENT_PHASE:
             self._router.set_phase(event.payload.get("phase", ""))
         self._write_activity(f"[{event.kind}] {event.message}")
+        self._render_plan_split(event)
         self._sync_transcript()
         self._update_status()
+
+    def _render_plan_split(self, event: Event) -> None:
+        """Dual-fidelity split, rendered from data the engine ALREADY emitted:
+
+        - numbered executor **steps** -> Activity (the "what's actually being
+          built" detail);
+        - surfaced **assumptions** (the ``<assume>`` items) -> Conversation (what a
+          human reacts to and can judge).
+
+        The headline is the transcript proposal turn (rendered by the sync pass).
+        Nothing is regenerated or re-summarized -- both lists come straight off the
+        plan_proposed / plan_revised event payload.
+        """
+        payload = event.payload or {}
+        steps = payload.get("steps")
+        if isinstance(steps, list) and steps:
+            for i, step in enumerate(steps, 1):
+                self._write_activity(f"    {i}. {step}")
+        assumptions = payload.get("assumptions")
+        if isinstance(assumptions, list) and assumptions:
+            for assumption in assumptions:
+                self._write_conversation(f"brain (assumes): {assumption}")
 
     def _handle_finished(self, outcome: RunOutcome) -> None:
         self._sync_transcript()  # the result turn is in the transcript by now

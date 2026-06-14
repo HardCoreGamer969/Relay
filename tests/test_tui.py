@@ -134,11 +134,14 @@ def test_full_loop_in_the_tui_one_box_one_thread(tmp_path):
             assert await _until(
                 pilot, lambda: app._router.state is InputState.AWAITING_REACTION
             )
-            # The proposal headline (a transcript turn) AND its full plain plan
-            # (the request prompt) are both in the conversation pane.
-            joined = "\n".join(app._conversation_lines)
-            assert UNICODE_HEADLINE in joined  # unicode survived, un-sanitized
-            assert "1. add login" in joined    # the derived plain plan detail
+            # Dual-fidelity split: the conversation pane shows the human-readable
+            # headline (a transcript turn), NOT the numbered executor plan; the
+            # full numbered plan lives in the activity pane.
+            convo = "\n".join(app._conversation_lines)
+            activity = "\n".join(app._activity_lines)
+            assert UNICODE_HEADLINE in convo       # unicode survived, un-sanitized
+            assert "1. add login" not in convo     # numbered steps stay OUT of convo
+            assert "1. add login" in activity      # ...they render in the activity pane
 
             await _submit(pilot, app, "ok")  # commit
             assert await _until(
@@ -161,6 +164,68 @@ def test_full_loop_in_the_tui_one_box_one_thread(tmp_path):
             assert any("step_start" in line for line in app._activity_lines)
             assert not any("step_start" in line for line in app._conversation_lines)
             assert "[idle]" in app._status_text
+
+    asyncio.run(main())
+
+
+class _AssumeClient:
+    """A brain that proposes 2 steps + 2 surfaced assumptions (with a headline)."""
+
+    def __init__(self, *, hands):
+        self._hands = list(hands)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, *, model, messages, **kwargs):
+        if model == "vendor/hands":
+            return _resp(self._hands.pop(0))
+        system = " ".join(messages[0]["content"].split())
+        if "assess the goal's SCOPE" in system:
+            return _resp("<scope>small</scope><reason>self-contained</reason>")
+        if "precise, executor-ready plan" in system:
+            return _resp(
+                "<plan><step>create schema</step><step>wire it up</step></plan>"
+                "<headline>Build the store.</headline>"
+                "<assume>use SQLite</assume><assume>no auth</assume>"
+            )
+        if "readable narrative" in system.lower():
+            return _resp("Earlier you committed a small plan.")
+        return _resp("<verdict>accept</verdict>")
+
+
+def test_proposal_split_conversation_is_headline_plus_assumptions_only(tmp_path):
+    """Conversation pane = headline + surfaced assumptions; the numbered executor
+    steps render in the activity pane. Holds pre-commit AND in scroll-back."""
+
+    async def main():
+        client = _AssumeClient(hands=["<done>schema made</done>", "<done>wired</done>"])
+        app = _app(tmp_path, client)
+        async with app.run_test() as pilot:
+            await _submit(pilot, app, "build a store")
+            assert await _until(
+                pilot, lambda: app._router.state is InputState.AWAITING_REACTION
+            )
+
+            # -- pre-commit: the split holds while the user is reacting --
+            convo = "\n".join(app._conversation_lines)
+            activity = "\n".join(app._activity_lines)
+            assert "Build the store." in convo                 # the headline (transcript)
+            assert "brain (assumes): use SQLite" in convo      # surfaced assumptions
+            assert "brain (assumes): no auth" in convo
+            assert "create schema" not in convo                # NO executor steps in convo
+            assert "wire it up" not in convo
+            assert "1. create schema" in activity              # ...steps live in activity
+            assert "2. wire it up" in activity
+
+            await _submit(pilot, app, "ok")
+            assert await _until(pilot, lambda: app._runner.outcome is not None)
+            assert await _until(pilot, lambda: app._router.state is InputState.IDLE)
+
+            # -- scroll-back: the conversation pane is STILL the clean story --
+            convo = "\n".join(app._conversation_lines)
+            assert "Build the store." in convo
+            assert "brain (assumes): use SQLite" in convo
+            assert "create schema" not in convo  # the executor plan never leaked in
+            assert "wire it up" not in convo
 
     asyncio.run(main())
 

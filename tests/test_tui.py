@@ -17,8 +17,17 @@ from types import SimpleNamespace
 from relay.bridge import InputState
 from relay.config import ModelConfig
 from relay.loop import STATUS_COMPLETED
+from relay.orchestrator import Event
 from relay.transcript import Turn
-from relay.tui import RelayTuiApp, format_turn, present_prompt
+from relay.tui import (
+    ACTOR_BRAIN,
+    ACTOR_HANDS,
+    ACTOR_YOU,
+    RelayTuiApp,
+    describe_event_for_activity,
+    format_turn,
+    present_prompt,
+)
 
 CFG = ModelConfig(brain="vendor/brain", hands="vendor/hands")
 WAIT_S = 8.0
@@ -101,6 +110,27 @@ def test_format_turn_labels_speakers_plainly():
                             text="ok", created_at=1)) == "you (reaction): ok"
 
 
+def test_describe_event_attributes_brain_hands_you_system():
+    """The activity feed maps each emitted event to the right voice."""
+    def actor(kind, payload=None):
+        return describe_event_for_activity(Event(kind, kind, payload or {}))[0]
+
+    # hands (the executor): its actions, output, questions, step results.
+    assert actor("exec_action") == ACTOR_HANDS
+    assert actor("executor_question", {"question": "q"}) == ACTOR_HANDS
+    assert actor("step_done", {"index": 0, "outcome": "x"}) == ACTOR_HANDS
+    assert actor("step_failed", {"index": 0, "reason": "x"}) == ACTOR_HANDS
+    # brain (the planner): dispatch, review, answers, escalations, plan moves.
+    assert actor("step_start", {"index": 0, "instruction": "x"}) == ACTOR_BRAIN
+    assert actor("step_reviewed", {"index": 0, "verdict": "accept"}) == ACTOR_BRAIN
+    assert actor("brain_self_answered", {"answer": "a"}) == ACTOR_BRAIN
+    assert actor("brain_escalated", {"question": "q"}) == ACTOR_BRAIN
+    assert actor("plan_created", {"steps": ["a"]}) == ACTOR_BRAIN
+    # you (the human) + system.
+    assert actor("user_decided", {"answer": "yes"}) == ACTOR_YOU
+    assert actor("status", {"status": "completed"}) is None
+
+
 # --- the mounted app (headless) -------------------------------------------------
 
 
@@ -160,9 +190,14 @@ def test_full_loop_in_the_tui_one_box_one_thread(tmp_path):
             assert "you (goal): add login" in joined
             assert "you (decision): yes, Google OAuth" in joined
             assert "(result)" in joined  # the closing result turn rendered
-            # The activity pane got the firehose; the conversation did not.
-            assert any("step_start" in line for line in app._activity_lines)
-            assert not any("step_start" in line for line in app._conversation_lines)
+            # The activity pane carries the attributed brain<->hands feed; the
+            # conversation pane never gets those feed lines.
+            assert any(line.startswith("brain | ") for line in app._activity_lines)
+            assert any(line.startswith("hands | ") for line in app._activity_lines)
+            assert not any(
+                line.startswith("brain | ") or line.startswith("hands | ")
+                for line in app._conversation_lines
+            )
             assert "[idle]" in app._status_text
 
     asyncio.run(main())
@@ -226,6 +261,63 @@ def test_proposal_split_conversation_is_headline_plus_assumptions_only(tmp_path)
             assert "brain (assumes): use SQLite" in convo
             assert "create schema" not in convo  # the executor plan never leaked in
             assert "wire it up" not in convo
+
+    asyncio.run(main())
+
+
+class _CountingClient:
+    """A client that counts every model call (chat.completions.create)."""
+
+    def __init__(self):
+        self.calls = 0
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        self.calls += 1
+        return _resp("<done>noop</done>")
+
+
+def test_rendering_events_makes_zero_model_calls(tmp_path):
+    """The load-bearing constraint: rendering the activity/conversation from
+    already-emitted events adds ZERO model calls / token spend. Feed a proposal +
+    an execution event stream straight into the render path and assert the model
+    client is never touched -- so a future change can't silently start narrating
+    the exchange with a generation."""
+
+    async def main():
+        client = _CountingClient()
+        app = _app(tmp_path, client)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert client.calls == 0  # nothing has run; the baseline is zero
+
+            events = [
+                Event("scope_assessed", "scope", {"scope": "small", "posture": "propose_fast"}),
+                Event("plan_proposed", "plan proposed",
+                      {"steps": ["create schema", "wire it up"], "assumptions": ["use SQLite"]}),
+                Event("step_start", "step 0", {"index": 0, "instruction": "create schema"}),
+                Event("exec_action", "edit schema.py", {"kind": "edit", "observation": "wrote schema.py"}),
+                Event("executor_question", "do we need OAuth?", {"index": 0, "question": "do we need OAuth?"}),
+                Event("brain_self_answered", "answered", {"question": "do we need OAuth?", "answer": "no"}),
+                Event("step_reviewed", "review", {"index": 0, "verdict": "accept"}),
+                Event("step_done", "done", {"index": 0, "outcome": "schema created"}),
+                Event("memory_write", "mem", {"kind": "fact", "summary": "schema created"}),
+                Event("status", "all steps complete", {"status": "completed"}),
+            ]
+            for event in events:
+                app._handle_event(event)
+
+            # Rendering the whole brain<->hands stream called the model ZERO times.
+            assert client.calls == 0
+
+            # ...and it genuinely rendered: attributed feed + the dual-fidelity split.
+            activity = "\n".join(app._activity_lines)
+            convo = "\n".join(app._conversation_lines)
+            assert any(line.startswith("brain | ") for line in app._activity_lines)
+            assert any(line.startswith("hands | ") for line in app._activity_lines)
+            assert "brain (assumes): use SQLite" in convo  # assumptions -> conversation
+            assert "1. create schema" in activity          # steps -> activity
+            assert "create schema" not in convo            # steps stay OUT of conversation
 
     asyncio.run(main())
 

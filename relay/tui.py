@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import random
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Container, Vertical
 from textual.widgets import Input, RichLog, Static
@@ -232,6 +233,72 @@ def placeholder_for_state(state: InputState, idle_placeholder: str) -> str:
     chosen for this launch.
     """
     return _STATE_PLACEHOLDERS.get(state, idle_placeholder)
+
+
+# -- the brain<->hands activity feed (rendered from ALREADY-EMITTED events) ----
+#
+# Attribution so the back-and-forth reads as a dialogue: the brain (planner) and
+# the hands (executor) are the two voices; "you" is the human; system lines carry
+# no tag. This is PURE PRESENTATION of data the engine already put on the event
+# stream -- it must never trigger a model call (see the zero-new-tokens guard test).
+ACTOR_BRAIN = "brain"
+ACTOR_HANDS = "hands"
+ACTOR_YOU = "you"
+
+_ACTOR_STYLES = {ACTOR_BRAIN: "magenta", ACTOR_HANDS: "green", ACTOR_YOU: "bold cyan"}
+
+
+def describe_event_for_activity(event: Event) -> tuple[str | None, str]:
+    """Map one engine event to ``(actor, line)`` for the activity feed.
+
+    ``actor`` is ``brain`` / ``hands`` / ``you`` (or ``None`` for a system line).
+    Every field read here is already present on the emitted event -- nothing is
+    fetched, narrated, or summarized by a model.
+    """
+    kind = event.kind
+    p = event.payload or {}
+    msg = event.message
+
+    if kind == "step_start":
+        return ACTOR_BRAIN, f"-> step {p.get('index')}: {p.get('instruction', msg)}"
+    if kind == "exec_action":
+        return ACTOR_HANDS, msg  # describe_action text; observation appended by caller
+    if kind == "exec_parse_failure":
+        return ACTOR_HANDS, f"! parse failure: {p.get('snippet', '')}"
+    if kind == "executor_question":
+        return ACTOR_HANDS, f"? {p.get('question', msg)}"
+    if kind == "brain_self_answered":
+        return ACTOR_BRAIN, f"answers: {p.get('answer', '')}"
+    if kind == "brain_escalated":
+        return ACTOR_BRAIN, f"escalates: {p.get('question', msg)}"
+    if kind == "user_decided":
+        return ACTOR_YOU, f"decided: {p.get('answer', msg)}"
+    if kind == "step_reviewed":
+        return ACTOR_BRAIN, f"reviews step {p.get('index')}: {p.get('verdict', '')}"
+    if kind == "step_done":
+        return ACTOR_HANDS, f"done step {p.get('index')}: {p.get('outcome', '')}"
+    if kind == "step_failed":
+        return ACTOR_HANDS, f"failed step {p.get('index')}: {p.get('reason', '')}"
+    if kind == "plan_created":
+        return ACTOR_BRAIN, f"plan: {len(p.get('steps') or [])} step(s)"
+    if kind == "plan_proposed":
+        return ACTOR_BRAIN, f"proposed a plan ({len(p.get('steps') or [])} step(s))"
+    if kind in ("plan_revised", "replanned"):
+        return ACTOR_BRAIN, f"revised the plan ({len(p.get('steps') or [])} step(s))"
+    if kind == "escalation":
+        return ACTOR_BRAIN, msg
+    if kind == "memory_write":
+        return ACTOR_BRAIN, f"memory += [{p.get('kind', '')}] {p.get('summary', '')}"
+    if kind == "scope_assessed":
+        return ACTOR_BRAIN, f"scope: {p.get('scope', '')} -> {p.get('posture', '')}"
+    if kind in ("scoping_question", "elicitation"):
+        return ACTOR_BRAIN, f"asks: {p.get('question', msg)}"
+    if kind == "user_reacted":
+        return ACTOR_YOU, f"reacted: {p.get('reaction', msg)}"
+    if kind == "committed":
+        return ACTOR_YOU, "committed the plan"
+    # status / transcript_compacted / not_committed / anything else: a system line.
+    return None, msg
 
 
 class RelayTuiApp(App):
@@ -493,11 +560,26 @@ class RelayTuiApp(App):
         self._update_status()
 
     def _handle_event(self, event: Event) -> None:
-        """One engine event: phase changes steer the router; all land in Activity."""
+        """One engine event: phase changes steer the router; the rest stream into
+        the Activity pane as an attributed brain<->hands feed.
+
+        Everything shown here is read from the event the engine ALREADY emitted --
+        the render path makes no model call (proven by the zero-new-tokens guard).
+        """
         if event.kind == EVENT_PHASE:
+            # Internal routing only -- not surfaced as a feed line.
             self._router.set_phase(event.payload.get("phase", ""))
-        self._write_activity(f"[{event.kind}] {event.message}")
-        self._render_plan_split(event)
+        else:
+            actor, line = describe_event_for_activity(event)
+            if line:
+                self._write_activity(line, actor=actor)
+            # The hands' raw output is already captured on exec_action -- show a
+            # snippet so the gears are visible (no generation to obtain it).
+            if event.kind == "exec_action":
+                observation = " ".join((event.payload.get("observation") or "").split())
+                if observation:
+                    self._write_activity(f"    {observation[:200]}", dim=True)
+            self._render_plan_split(event)
         self._sync_transcript()
         self._update_status()
 
@@ -517,7 +599,7 @@ class RelayTuiApp(App):
         steps = payload.get("steps")
         if isinstance(steps, list) and steps:
             for i, step in enumerate(steps, 1):
-                self._write_activity(f"    {i}. {step}")
+                self._write_activity(f"    {i}. {step}", dim=True)
         assumptions = payload.get("assumptions")
         if isinstance(assumptions, list) and assumptions:
             for assumption in assumptions:
@@ -570,9 +652,21 @@ class RelayTuiApp(App):
         self._conversation_lines.append(line)
         self.query_one("#conversation", RichLog).write(line)
 
-    def _write_activity(self, line: str) -> None:
-        self._activity_lines.append(line)
-        self.query_one("#activity", RichLog).write(line)
+    def _write_activity(self, line: str, *, actor: str | None = None, dim: bool = False) -> None:
+        """Append one activity line. ``actor`` (brain/hands/you) prefixes a colored
+        tag so the feed reads as a dialogue; ``dim`` styles detail lines.
+
+        The buffer keeps a plain tagged string (what tests assert on); the widget
+        gets a pre-styled ``Text`` -- built via ``Text.append`` so untrusted content
+        (tool output, model text) is never parsed as console markup.
+        """
+        self._activity_lines.append(f"{actor} | {line}" if actor else line)
+        text = Text()
+        if actor:
+            text.append(actor, style=_ACTOR_STYLES.get(actor, ""))
+            text.append(" | ", style="dim")
+        text.append(line, style="dim" if dim else "")
+        self.query_one("#activity", RichLog).write(text)
 
     def _update_status(self) -> None:
         state = self._router.state

@@ -43,10 +43,23 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.13 (multi-provider: model catalog + provider profiles + DeepSeek)
+## Status — v0.0.15 (TUI polish: placeholder, proposal split, brain↔hands feed)
 
-Relay is now genuinely **multi-provider**. Three backend pieces land together (the
-in-TUI key entry / model picker sits on top of these and is the next milestone):
+The latest pass is **render-layer TUI polish** (no engine/bridge change, no new
+tokens): (1) the input placeholder rotates through a small set and is
+**state-aware** — idle vs awaiting a reaction / decision / approval; (2) the
+**proposal split** — the conversation pane shows only the human-readable headline
+plus the surfaced assumptions, while the full numbered executor plan moves to the
+activity pane (dual fidelity, both pre-commit and in scroll-back); and (3) the
+activity pane now surfaces the **brain↔hands exchange** as an attributed,
+scrollable feed, built **entirely from events the engine already emits** — adding
+zero model calls / token spend (codified by a guard test; no narration via a
+generation). The conversation pane is the clean human story; the activity pane is
+the technical detail.
+
+Under that, Relay is genuinely **multi-provider** (v0.0.13). Three backend pieces
+land together (the in-TUI key entry / model picker sits on top of these and is a
+coming milestone):
 
 1. **A model catalog** (`relay/catalog.py`). Model metadata + pricing are pulled
    from an external catalog (default [`models.dev`](https://models.dev), endpoint

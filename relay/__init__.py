@@ -88,6 +88,16 @@
   env, never code" promise with no error. Process env vars still override the file
   (``override=False``); an absent ``.env`` is harmless. Config key resolution is
   unchanged -- only *when/where* the file is loaded.
+- v0.0.15 is a TUI **render-layer polish** pass (no engine/bridge/token change):
+  (1) the input placeholder rotates through a small set and is **state-aware**
+  (idle vs awaiting-reaction/decision/approval); (2) the **proposal split** -- the
+  conversation pane shows only the human-readable headline + surfaced assumptions
+  while the full numbered executor plan moves to the activity pane (dual fidelity,
+  pre-commit AND in scroll-back); and (3) the activity pane surfaces the
+  **brain<->hands exchange** as an attributed, scrollable feed built ENTIRELY from
+  events the engine already emits (``describe_event_for_activity``) -- adding zero
+  model calls / token spend, codified by a guard test. Pure presentation: nothing
+  here narrates or summarizes via a generation.
 """
 
 from __future__ import annotations
@@ -177,7 +187,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.14"
+__version__ = "0.0.15"
 
 __all__ = [
     # v0.01 -- model layer

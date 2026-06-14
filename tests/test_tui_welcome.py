@@ -19,11 +19,14 @@ from relay.bridge import InputState
 from relay.config import ModelConfig
 from relay.tui import (
     GREETINGS,
+    INPUT_PLACEHOLDERS,
     RELAY_WORDMARK,
     RelayTuiApp,
     glitch_frame,
     model_identity,
     pick_greeting,
+    pick_placeholder,
+    placeholder_for_state,
     _normalize_block,
     _glitch_thresholds,
 )
@@ -92,6 +95,63 @@ def test_model_identity_reflects_the_configured_pairing():
     identity = model_identity(CFG)
     assert "vendor/brain" in identity and "vendor/hands" in identity
     assert "brain" in identity and "hands" in identity
+
+
+def test_input_placeholders_rotate_and_do_not_echo_the_greeting():
+    # A small rotating set, same voice as the greetings...
+    assert len(INPUT_PLACEHOLDERS) >= 4
+    assert all(isinstance(p, str) and p for p in INPUT_PLACEHOLDERS)
+    for _ in range(20):
+        assert pick_placeholder() in INPUT_PLACEHOLDERS
+    # ...but DISJOINT from GREETINGS, so the box never echoes the greeting above it.
+    assert set(INPUT_PLACEHOLDERS).isdisjoint(set(GREETINGS))
+
+
+def test_placeholder_is_state_aware():
+    idle = "Describe the goal..."
+    # Awaiting states each get their own short cue.
+    assert placeholder_for_state(InputState.AWAITING_REACTION, idle) != idle
+    assert "ok" in placeholder_for_state(InputState.AWAITING_REACTION, idle)
+    assert placeholder_for_state(InputState.AWAITING_DECISION, idle) == "Your answer..."
+    assert "y/n" in placeholder_for_state(InputState.AWAITING_APPROVAL, idle)
+    # Idle (and welcome) falls back to the per-launch rotating phrase.
+    assert placeholder_for_state(InputState.IDLE, idle) == idle
+
+
+def test_launch_uses_a_rotating_idle_placeholder(tmp_path):
+    async def main():
+        app = RelayTuiApp(root=str(tmp_path), models=CFG, client=_ParkingClient())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            from textual.widgets import Input
+
+            assert app._placeholder in INPUT_PLACEHOLDERS
+            # The real Input widget shows that rotating idle phrase at launch.
+            assert app.query_one("#prompt", Input).placeholder == app._placeholder
+            await _teardown(pilot, app)
+
+    asyncio.run(main())
+
+
+def test_placeholder_follows_engine_state(tmp_path):
+    async def main():
+        app = RelayTuiApp(root=str(tmp_path), models=CFG, client=_ParkingClient())
+        async with app.run_test() as pilot:
+            from textual.widgets import Input
+
+            await _submit(pilot, app, "build a thing")
+            assert await _until(
+                pilot, lambda: app._router.state is InputState.AWAITING_REACTION
+            )
+            # The box now reflects what a submit means: reacting to the plan.
+            placeholder = app.query_one("#prompt", Input).placeholder
+            assert placeholder == placeholder_for_state(
+                InputState.AWAITING_REACTION, app._placeholder
+            )
+            assert "ok" in placeholder
+            await _teardown(pilot, app)
+
+    asyncio.run(main())
 
 
 def test_wordmark_is_a_clean_rectangular_block():

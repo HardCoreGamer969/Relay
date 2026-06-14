@@ -83,6 +83,27 @@ GREETINGS = (
     "Where do we start?",
 )
 
+# The rotating IDLE input placeholders -- one chosen per launch. Same warm voice
+# as GREETINGS, but kept DISJOINT from it so the box never echoes the greeting
+# shown right above it (a guarantee, not a coincidence -- see the test).
+INPUT_PLACEHOLDERS = (
+    "Describe the goal...",
+    "What are we making?",
+    "What needs doing?",
+    "Name the task...",
+    "What's the goal?",
+)
+
+# State-aware placeholders: the one box's PURPOSE changes with what the engine is
+# waiting for, so the prompt should say what a submit now means. Short.
+_STATE_PLACEHOLDERS = {
+    InputState.AWAITING_REACTION: "React to the plan, or type 'ok'...",
+    InputState.AWAITING_DECISION: "Your answer...",
+    InputState.AWAITING_APPROVAL: "Approve this command? (y/n)...",
+    InputState.PLANNING: "The agent is working... (esc to cancel)",
+    InputState.EXECUTING: "The agent is working... (esc to cancel)",
+}
+
 # The RELAY wordmark hero: hand-built 5-row block glyphs, letterspaced wide. We
 # can't reproduce the curved interlocking-R logo glyph in text, so the confident
 # letterspaced wordmark IS the hero (legible beats a janky knockoff). Each glyph
@@ -197,6 +218,21 @@ def pick_greeting() -> str:
     return random.choice(GREETINGS)
 
 
+def pick_placeholder() -> str:
+    """One idle input placeholder for this launch (rotation by random choice)."""
+    return random.choice(INPUT_PLACEHOLDERS)
+
+
+def placeholder_for_state(state: InputState, idle_placeholder: str) -> str:
+    """Resolve the input placeholder for the current router state (pure, testable).
+
+    The awaiting/busy states get their fixed cue from :data:`_STATE_PLACEHOLDERS`;
+    idle (and the welcome screen) shows ``idle_placeholder`` -- the rotating phrase
+    chosen for this launch.
+    """
+    return _STATE_PLACEHOLDERS.get(state, idle_placeholder)
+
+
 class RelayTuiApp(App):
     """A welcome screen that hands off to a two-pane chat over the engine."""
 
@@ -269,6 +305,7 @@ class RelayTuiApp(App):
         # "welcome" until the first goal hands off to "working" (one-way).
         self._view = "welcome"
         self._greeting = pick_greeting()
+        self._placeholder = pick_placeholder()  # the idle prompt phrase for this launch
         self._indicator_text = model_identity(self._models)
         # The render-path buffers: exactly the strings handed to the widgets,
         # kept so headless tests can assert on the render path directly.
@@ -294,7 +331,7 @@ class RelayTuiApp(App):
             activity.border_title = "Activity"
             yield activity
             yield Static(id="status")
-        yield Input(id="prompt", placeholder="Type a goal and press Enter...")
+        yield Input(id="prompt", placeholder=self._placeholder)
 
     def on_mount(self) -> None:
         # The model indicator is visible from launch, BEFORE the first message
@@ -517,6 +554,10 @@ class RelayTuiApp(App):
             f"brain={self._models.brain}  hands={self._models.hands}"
         )
         self.query_one("#status", Static).update(self._status_text)
+        # The input box's placeholder tracks what a submit now means (Fix 1).
+        self.query_one("#prompt", Input).placeholder = placeholder_for_state(
+            state, self._placeholder
+        )
 
     # -- cancel + clean shutdown (the money-leak guard) --------------------------
 

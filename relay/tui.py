@@ -946,6 +946,8 @@ COMMANDS: list[Command] = [
             run=lambda app: app._cmd_help()),
     Command("model", "Model", "Pick the model for a role", "config",
             run=lambda app: app._cmd_model()),
+    Command("provider", "Provider", "Set a role's provider, then its model", "config",
+            run=lambda app: app._cmd_provider()),
     Command("key", "Key", "Add a provider API key (masked)", "config",
             run=lambda app: app._cmd_key()),
     Command("config", "Config", "Show the resolved config", "config",
@@ -1532,31 +1534,103 @@ class RelayTuiApp(App):
         self.push_screen(SelectDialog(title="Set the model for which role?", options=options))
 
     def _pick_model_for(self, role: str) -> None:
-        provider = self._models.provider_for_role(role)
+        """/model's model step: pick a model for the role's CURRENT provider."""
+        self._pick_model_step(role, self._models.provider_for_role(role))
+
+    def _pick_model_step(self, role: str, provider: str, *, then=None) -> None:
+        """The SHARED model-pick step (used by both /model and /provider).
+
+        ``provider`` is explicit (so /provider can pick a model for a JUST-CHOSEN
+        provider, not the stale config one). A ``list`` provider (DeepSeek) shows
+        the live ``/models`` SelectDialog; a ``manual`` provider (OpenRouter) a slug
+        TextEntryDialog validated live. On a successful save, ``then`` (if given) is
+        scheduled AFTER this dialog tears down -- the chaining seam ``both`` uses to
+        run brain then hands in sequence.
+        """
         try:
             profile = resolve_provider(provider)
         except ValueError:
             profile = None
+
+        def after_save(ok: bool) -> None:
+            if ok and then is not None:
+                self.call_after_refresh(then)  # next step, after this dialog dismisses
+
         if profile is not None and profile.discovery == DISCOVERY_LIST:
             list_fn = self._list_models_fn or provider_list_models
             try:
                 ids = list(list_fn(provider))
             except Exception:  # noqa: BLE001 -- no key/network -> empty, handled below
                 ids = []
+
+            def on_pick(value, r=role, p=provider) -> None:
+                ok, _ = self._save_role_model(r, p, value)
+                after_save(ok)
+
             options = [
-                {"title": mid, "value": mid, "category": provider,
-                 "on_select": (lambda v, r=role, p=provider: self._save_role_model(r, p, v))}
+                {"title": mid, "value": mid, "category": provider, "on_select": on_pick}
                 for mid in ids
             ] or [{"title": "(no models listed -- add a key with /key)", "value": "__none__"}]
             self.push_screen(SelectDialog(title=f"Pick a {role} model ({provider})", options=options))
         else:
             # manual aggregator: a slug field validated live before saving.
+            def on_submit(slug, r=role, p=provider):
+                ok, note = self._save_role_model(r, p, slug)
+                after_save(ok)
+                return ok, note
+
             self.push_screen(TextEntryDialog(
                 title=f"{role} model ({provider})",
                 label="Type a model slug (validated live before saving):",
                 password=False, placeholder="e.g. openai/gpt-4o",
-                on_submit=(lambda slug, r=role, p=provider: self._save_role_model(r, p, slug)),
+                on_submit=on_submit,
             ))
+
+    # -- /provider: set a role's provider, then its model ----------------------
+
+    def _cmd_provider(self) -> None:
+        """Pick a role (segmented toggle), then its provider, then its model.
+
+        Reuses the provider SelectDialog (/key's list) and the SHARED model-pick
+        step (/model's), plus persist_role -- no forked logic. Per-role isolation:
+        the role chosen here is the ONLY role touched (``both`` runs the model step
+        twice, brain then hands, each self-contained and each persisted).
+        """
+        options = [
+            {"label": "brain", "value": "brain"},
+            {"label": "hands", "value": "hands"},
+            {"label": "both", "value": "both"},
+        ]
+        self.push_screen(SegmentedControl(
+            title="Set the provider for which role?",
+            options=options, start_index=0,
+            on_select=(lambda scope: self._provider_choose_provider(scope)),
+        ))
+
+    def _provider_choose_provider(self, scope: str) -> None:
+        """Step 2: pick the provider for the chosen role(s) -- the same provider
+        SelectDialog /key and setup use (``known_providers()``)."""
+        options = [
+            {"title": pid, "value": pid,
+             "on_select": (lambda p, s=scope: self._provider_set(s, p))}
+            for pid in known_providers()
+        ]
+        self.push_screen(SelectDialog(title=f"Provider for {scope}", options=options))
+
+    def _provider_set(self, scope: str, provider: str) -> None:
+        """Step 3: chain into the model pick for the chosen provider. ``both`` runs
+        the model step TWICE -- brain, then (on success) hands -- each persisted."""
+        roles = ["brain", "hands"] if scope == "both" else [scope]
+        self._provider_model_chain(roles, provider, 0)
+
+    def _provider_model_chain(self, roles: list[str], provider: str, index: int) -> None:
+        if index >= len(roles):
+            return
+        role = roles[index]
+        self._pick_model_step(
+            role, provider,
+            then=(lambda: self._provider_model_chain(roles, provider, index + 1)),
+        )
 
     def _save_role_model(self, role: str, provider: str, model: str, thinking=None) -> tuple[bool, str]:
         """Persist a role's model via the SHARED persist_role path, then live-reload.

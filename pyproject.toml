@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "relay-cli"
-version = "0.0.19"
+version = "0.0.20"
 description = "Relay — a planner/executor coding agent built on a model-agnostic, multi-provider seam."
 readme = "README.md"
 requires-python = ">=3.10"

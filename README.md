@@ -43,12 +43,34 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.19 (surface fixes: reachable slash, friendly errors, honest saves)
+## Status — v0.0.20 (live cost counter, `/cost`, fast esc-to-stop)
 
-A pass over rough edges found in live use — the kind the headless suite missed
-because they live at the boundary of real env vars, live validation, display
-refresh, and interactive state. Two were genuine bugs; three turned out already
-sound and are now pinned by regression tests so they can't quietly break later.
+Relay's philosophy on spend is explicit: it does **not** impose a cap or judge what
+you want to build — it shows cost live and lets **you** stop whenever you decide. This
+release surfaces two cost figures and makes stopping feel instant.
+
+- **A live per-goal cost counter** in the status line (e.g. `$0.0234`), animated with
+  a brief highlight as it climbs and toggleable via `/cost`. It resets when a new goal
+  starts but keeps showing the **last goal's total while idle** (it never blinks to
+  `$0` on finish), and shows an **`esc to stop`** affordance while a run is in flight.
+- **A session-cumulative total** that accumulates across all goals, surfaced and
+  **resettable** via the new **`/cost`** command (which also toggles the live counter).
+  A new goal doesn't clear it; it's cleared only on quit or a deliberate reset.
+- **Fast `esc`-to-stop.** Pressing `esc` acknowledges **instantly** (`stopping…` in the
+  status line + activity — never silent) and halts at the next **executor-call**
+  boundary inside a step, not only at step boundaries — so a long multi-call step stops
+  within ~one call's latency. The in-flight call is **never torn down** (its tokens are
+  already committed); we stop cleanly before the next one. The money-leak guard and the
+  clean worker-join are untouched — this is a finer cancel-check point, nothing more.
+
+All cost data already existed (`Ledger.total_cost()`); this is pure surfacing plus a
+finer cancellation boundary — **no spend cap, no new model calls, no judgment.** The
+per-run finished-line cost is unchanged; the two counters are additional.
+
+Under that, **v0.0.19** (surface fixes: reachable slash, friendly errors, honest saves)
+still stands — a pass over rough edges found in live use, at the boundary of real env
+vars, live validation, display refresh, and interactive state. Two were genuine bugs;
+three turned out already sound and are now pinned by regression tests:
 
 - **`/` is reachable whenever the engine isn't generating.** The popover used to
   open **only** when idle, so once a goal was in flight you often couldn't reach

@@ -624,13 +624,14 @@ class FilterInput(Input):
 
 
 _DIALOG_CSS = """
-SelectDialog, TextEntryDialog { align: center middle; }
+SelectDialog, TextEntryDialog, SegmentedControl { align: center middle; }
 #dialog-box {
     width: 80%; max-width: 100; height: auto; max-height: 90%;
     padding: 1 2; border: double $primary; background: $surface;
 }
 #dialog-title { text-style: bold; content-align: center middle; }
 #dialog-list { margin: 1 0; }
+#segment-row { margin: 1 0; content-align: center middle; }
 #dialog-hint, #entry-hint { color: $text-muted; text-style: dim; margin-top: 1; }
 #dialog-filter, #entry-input { margin-bottom: 1; }
 #entry-status { margin-top: 1; }
@@ -812,6 +813,127 @@ class TextEntryDialog(ModalScreen):
         if event.input.id == "entry-input":
             event.stop()
             self.submit()
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+
+class SegmentRow(Static):
+    """The focusable key-sink for a :class:`SegmentedControl` (no text field, so
+    the row itself takes focus and routes left/right/enter/escape to the screen)."""
+
+    can_focus = True
+
+    def on_key(self, event) -> None:
+        screen = self.screen
+        if not hasattr(screen, "move"):
+            return
+        if event.key in ("left", "h"):
+            screen.move(-1); event.prevent_default(); event.stop()
+        elif event.key in ("right", "l"):
+            screen.move(1); event.prevent_default(); event.stop()
+        elif event.key == "enter":
+            screen.select_highlighted(); event.prevent_default(); event.stop()
+        elif event.key == "escape":
+            screen.action_close(); event.prevent_default(); event.stop()
+
+
+class SegmentedControl(ModalScreen):
+    """A reusable horizontal choose-one toggle (the analog of :class:`SelectDialog`
+    for a small fixed set picked with LEFT/RIGHT, with wrap-around).
+
+    ``options`` is an ordered list of ``{label, value}``; LEFT/RIGHT move the
+    highlight (wrapping at both ends), Enter commits the highlighted option (calls
+    ``on_select(value)`` then dismisses), Esc cancels. It's a ModalScreen (same CSS
+    family / aesthetic as the other dialogs), so it never touches the prompt input
+    or the InputRouter. The testable core (``move`` / ``highlighted_value`` /
+    ``select_highlighted``) is kept separate from rendering -- mirroring SelectDialog.
+    """
+
+    BINDINGS = [
+        ("left", "move_left", "Prev"),
+        ("right", "move_right", "Next"),
+        ("escape", "close", "Cancel"),
+    ]
+    CSS = _DIALOG_CSS
+
+    def __init__(
+        self, *, title: str, options: list[dict], start_index: int = 0, on_select=None
+    ) -> None:
+        super().__init__()
+        self._title = title
+        self._options = list(options)
+        n = len(self._options)
+        self._index = (start_index % n) if n else 0
+        self._on_select = on_select
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="dialog-box"):
+            yield Static(self._title, id="dialog-title")
+            yield SegmentRow(id="segment-row")
+            yield Static("left/right to choose  ·  enter to confirm  ·  esc to cancel",
+                         id="dialog-hint")
+
+    def on_mount(self) -> None:
+        self._refresh_segments()
+        self.query_one("#segment-row", SegmentRow).focus()
+
+    # -- testable core (no rendering) ----------------------------------------
+
+    def move(self, delta: int) -> None:
+        """Move the highlight by ``delta`` with WRAP-AROUND at both ends."""
+        n = len(self._options)
+        if n == 0:
+            return
+        self._index = (self._index + delta) % n
+        self._refresh_segments()
+
+    def highlighted_value(self):
+        """The currently highlighted option's value (``None`` if there are none)."""
+        if not self._options:
+            return None
+        return self._options[self._index].get("value")
+
+    def select_highlighted(self) -> None:
+        """Commit the highlighted option: dismiss, then call ``on_select(value)``."""
+        if not self._options:
+            self.dismiss()
+            return
+        value = self._options[self._index].get("value")
+        self.dismiss()
+        if self._on_select is not None:
+            self._on_select(value)
+
+    # -- rendering ------------------------------------------------------------
+
+    def _refresh_segments(self) -> None:
+        try:
+            self.query_one("#segment-row", SegmentRow).update(self._segments_text())
+        except Exception:  # noqa: BLE001 -- not mounted (logic-only use in tests)
+            pass
+
+    def _segments_text(self) -> Text:
+        text = Text()
+        if not self._options:
+            text.append("(no options)", style="dim")
+            return text
+        for i, option in enumerate(self._options):
+            if i:
+                text.append("  <  >  ", style="dim")  # the toggle's left/right hint
+            label = str(option.get("label", option.get("value", "")))
+            if i == self._index:
+                text.append(f"[ {label} ]", style="reverse bold")
+            else:
+                text.append(f"  {label}  ")
+        return text
+
+    # -- key actions (real-terminal bindings; tests drive the core directly) --
+
+    def action_move_left(self) -> None:
+        self.move(-1)
+
+    def action_move_right(self) -> None:
+        self.move(1)
 
     def action_close(self) -> None:
         self.dismiss()

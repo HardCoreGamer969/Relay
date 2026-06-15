@@ -19,9 +19,23 @@ from rich.table import Table
 
 from relay.catalog import load_catalog
 from relay.client import build_client
-from relay.config import load_models, resolve_assumption_level
+from relay.config import (
+    ROLES,
+    default_config,
+    describe_resolution,
+    load_models,
+    resolve_assumption_level,
+)
 from relay.context import resolve_context_window
-from relay.providers import DEFAULT_PROVIDER, resolve_provider
+from relay.providers import (
+    DEFAULT_PROVIDER,
+    DISCOVERY_LIST,
+    known_providers,
+    list_models,
+    resolve_provider,
+)
+from relay.secrets import remove_key, set_key
+from relay.store import CONFIG_VERSION, load_config, save_config
 from relay.conversation import DEFAULT_MAX_ROUNDS, plan_conversationally
 from relay.loop import (
     STATUS_COMPLETED,
@@ -570,6 +584,184 @@ def _print_doctor_table(rows) -> None:
             row["role"], row.get("provider", ""), row["model"],
             f"[{style}]{row['status']}[/{style}]", row["note"],
         )
+    console.print(table)
+
+
+# --- `relay config`: manage providers, models, and keys ---------------------
+
+config_app = typer.Typer(
+    help="Manage providers, per-role models, and provider keys (persistent global config).",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(config_app, name="config")
+
+
+def _validate_role_model(provider: str, model: str) -> tuple[bool, str]:
+    """Validate a (provider, model) before saving it. Never raises.
+
+    For a ``manual`` provider (OpenRouter): a live preflight probe (the same kind
+    ``doctor`` uses) so a typo'd slug is rejected at entry, not at first run. For a
+    ``list`` provider (DeepSeek): the id must appear in the live ``/models`` list.
+    """
+    try:
+        profile = resolve_provider(provider)
+    except ValueError as exc:
+        return False, str(exc)
+    try:
+        client = build_client(provider)
+    except Exception as exc:  # noqa: BLE001 -- missing key etc.: a clear note, not a traceback
+        return False, str(exc).splitlines()[0]
+    if profile.discovery == DISCOVERY_LIST:
+        try:
+            ids = list_models(provider, client=client)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"could not list {provider} models: {str(exc).splitlines()[0]}"
+        if ids and model not in ids:
+            return False, f"{model!r} is not in {provider}'s live model list"
+        return True, "in live model list"
+    return _probe_model(client, model, provider)
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Show the resolved config (provider/model/thinking + source per role) and
+    whether a key is present per provider. NEVER prints a key."""
+    resolution = describe_resolution()
+    table = Table(title="Relay config (resolved: env > config.json > default)")
+    table.add_column("Role", style="bold")
+    table.add_column("Provider", overflow="fold")
+    table.add_column("Model", overflow="fold")
+    table.add_column("Thinking")
+    table.add_column("Source", overflow="fold")
+    for role in ROLES:
+        fields = resolution["roles"][role]
+        provider, p_src = fields["provider"]
+        model, m_src = fields["model"]
+        thinking, t_src = fields["thinking"]
+        table.add_row(
+            role, provider, model, "on" if thinking else "off",
+            f"provider={p_src} model={m_src} thinking={t_src}",
+        )
+    console.print(table)
+
+    keys = Table(title="Provider keys (env var or stored auth.json)")
+    keys.add_column("Provider", style="bold")
+    keys.add_column("Key")
+    for pid in known_providers():
+        present = resolution["providers"][pid]["key_present"]
+        status = "[green]present[/green]" if present else "[yellow]absent[/yellow]"
+        keys.add_row(pid, status)  # presence only -- the key value is NEVER shown
+    console.print(keys)
+
+
+@config_app.command("set-role")
+def config_set_role(
+    role: str = typer.Argument(..., help="Which role to configure: brain or hands."),
+    provider: str = typer.Option(..., "--provider", "-p", help="Provider id (openrouter / deepseek)."),
+    model: str = typer.Option(..., "--model", "-m", help="Model id/slug for this role."),
+    thinking: bool = typer.Option(False, "--thinking/--no-thinking", help="Enable thinking mode for this role."),
+) -> None:
+    """Set a role's provider + model (+ thinking) in config.json.
+
+    The (provider, model) is validated LIVE before saving -- a typo'd slug is
+    rejected here, not at first run.
+    """
+    if role not in ROLES:
+        console.print(f"[red]unknown role {role!r}[/red] -- valid roles: {', '.join(ROLES)}")
+        raise typer.Exit(code=1)
+    try:
+        resolve_provider(provider)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+    ok, note = _validate_role_model(provider, model)
+    if not ok:
+        console.print(f"[red]rejected:[/red] {note}")
+        console.print("[dim]nothing was saved.[/dim]")
+        raise typer.Exit(code=1)
+
+    config = load_config() or default_config()
+    config.setdefault("version", CONFIG_VERSION)
+    config.setdefault("roles", {})[role] = {
+        "provider": provider, "model": model, "thinking": bool(thinking),
+    }
+    path = save_config(config)
+    console.print(
+        f"[green]saved[/green] {role}: {provider} / {model} "
+        f"(thinking {'on' if thinking else 'off'})  [dim]-> {path}[/dim]  ({note})"
+    )
+
+
+@config_app.command("set-key")
+def config_set_key(
+    provider: str = typer.Argument(..., help="Provider to store a key for (openrouter / deepseek)."),
+) -> None:
+    """Store a provider API key in auth.json (0o600). The key is read WITHOUT echo
+    and is never printed or shell-historied."""
+    try:
+        resolve_provider(provider)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    key = typer.prompt(f"API key for {provider}", hide_input=True)  # no echo
+    if not key.strip():
+        console.print("[yellow]no key entered; nothing saved.[/yellow]")
+        raise typer.Exit(code=1)
+    path = set_key(provider, key.strip())
+    console.print(f"[green]stored a key for {provider}[/green] [dim]-> {path} (0o600)[/dim]")
+
+
+@config_app.command("remove-key")
+def config_remove_key(
+    provider: str = typer.Argument(..., help="Provider whose stored key to remove."),
+) -> None:
+    """Remove a provider's stored key from auth.json (no-op if none stored)."""
+    remove_key(provider)
+    console.print(f"[green]removed any stored key for {provider}[/green]")
+
+
+@config_app.command("list-models")
+def config_list_models(
+    provider: str = typer.Argument(..., help="Provider to list models for (openrouter / deepseek)."),
+) -> None:
+    """List a provider's models. Direct providers (DeepSeek) list live from
+    ``/models``; aggregators (OpenRouter) are manual slug entry."""
+    try:
+        profile = resolve_provider(provider)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+    if profile.discovery != DISCOVERY_LIST:
+        console.print(
+            f"[yellow]{provider} is manual slug entry[/yellow] -- any {provider} model slug "
+            "works; there is no live list to enumerate."
+        )
+        return
+
+    try:
+        ids = list_models(provider)
+    except Exception as exc:  # noqa: BLE001 -- missing key / network: a clear message
+        console.print(f"[red]could not list {provider} models:[/red] {str(exc).splitlines()[0]}")
+        raise typer.Exit(code=1)
+    if not ids:
+        console.print(f"[yellow]no models returned for {provider}.[/yellow]")
+        return
+
+    catalog = _safe_load_catalog()
+    table = Table(title=f"{provider}: live models (/models)")
+    table.add_column("Model id", style="green", overflow="fold")
+    table.add_column("Context", justify="right")
+    table.add_column("In $/1M", justify="right")
+    table.add_column("Out $/1M", justify="right")
+    for mid in ids:
+        ctx = catalog.context_limit(provider, mid) if catalog is not None else None
+        cost = catalog.cost(provider, mid) if catalog is not None else None
+        in_p = "-" if cost is None or cost.input is None else f"{cost.input:g}"
+        out_p = "-" if cost is None or cost.output is None else f"{cost.output:g}"
+        table.add_row(mid, "-" if ctx is None else str(ctx), in_p, out_p)
     console.print(table)
 
 

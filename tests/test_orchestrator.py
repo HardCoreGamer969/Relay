@@ -428,12 +428,26 @@ def test_memory_entries_are_dual_form_with_provenance(tmp_path):
 # --- longer-horizon: real accumulated memory overflows a small window -------
 
 
+# Genuinely-distinct per-step outcomes (different subjects, not a templated
+# index) so v0.0.21 near-duplicate suppression keeps all six -- the test needs
+# real, distinct facts to accumulate and overflow the small window.
+_STEP_OUTCOMES = [
+    "created the config loader that reads settings from a toml file",
+    "added the month grid renderer with seven weekday columns",
+    "wired keyboard navigation for moving between days and weeks",
+    "implemented the event store backed by a json file on disk",
+    "built the command parser for add, delete, and list actions",
+    "wrote the help screen describing every keyboard shortcut",
+]
+
+
 class _DispatchClient:
     """A dispatching fake: routes brain calls by their system prompt so the
     compaction summarizer call (fired by compacted_context on real overflow) is
     handled and counted, alongside plan/review calls and the hands."""
 
     def __init__(self, n_steps):
+        assert n_steps <= len(_STEP_OUTCOMES)  # each step gets a distinct outcome
         self.n_steps = n_steps
         self.summary_calls = 0      # compaction invocations on accumulated memory
         self.review_prompts = []    # captured brain-review user prompts
@@ -448,7 +462,7 @@ class _DispatchClient:
             self._hands_idx += 1
             return _resp(
                 f'<edit path="f{i}.txt">content {i}</edit>\n'
-                f"<done>created file {i} with the standard boilerplate and a docstring</done>"
+                f"<done>{_STEP_OUTCOMES[i]}</done>"
             )
         # brain calls, dispatched by their system prompt:
         if "compacting a coding agent's plan memory" in system:

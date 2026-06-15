@@ -444,8 +444,12 @@ def run_planned(
             on_event(event)
 
     def remember(kind: str, detail: str, summary: str, *, provenance: str, tags=None) -> None:
-        memory.remember(kind, detail, summary, provenance=provenance, tags=list(tags or []))
-        emit("memory_write", f"{kind}: {summary}", {"kind": kind, "summary": summary, "provenance": provenance})
+        # Suppressed near-duplicates return None; don't surface a memory_write for
+        # an entry that was not actually stored (else the activity feed would show
+        # the very restatements dedup just dropped).
+        stored = memory.remember(kind, detail, summary, provenance=provenance, tags=list(tags or []))
+        if stored is not None:
+            emit("memory_write", f"{kind}: {summary}", {"kind": kind, "summary": summary, "provenance": provenance})
 
     def finalize(plan_for_summary: Plan | None) -> PlannedTaskResult:
         """Close the conversation thread on ANY terminal path: a deterministic

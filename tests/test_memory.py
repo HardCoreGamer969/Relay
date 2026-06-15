@@ -63,11 +63,16 @@ def test_snapshot_round_trips_equal_and_continues_ordinals():
 # --- budget slicing: the headline behavior at both window extremes ----------
 
 
+# Twelve genuinely-distinct subjects (each its own content word, so v0.0.21
+# near-duplicate suppression keeps them all -- they are not restatements).
+_SUBJECTS = "alpha beta gamma delta epsilon zeta eta theta iota kappa lamb mu".split()
+
+
 def test_relevant_large_budget_returns_all():
     mem = PlanMemory()
-    for i in range(12):
-        mem.remember("fact", f"detail number {i} about alpha subsystem", f"s{i}", tags=["alpha"])
-    got = mem.relevant("alpha subsystem", budget_tokens=100_000)
+    for word in _SUBJECTS:
+        mem.remember("fact", f"the {word} subsystem endpoint is configured", word, tags=["sub"])
+    got = mem.relevant("subsystem endpoint", budget_tokens=100_000)
     assert len(got) == 12  # a 200K-style budget: everything fits
 
 
@@ -181,3 +186,92 @@ def test_memory_budget_scales_with_window():
     assert memory_budget(200_000) > memory_budget(8192)
     assert memory_budget(8192) == int(8192 * 0.5) - 1024
     assert memory_budget(100) == 0  # tiny window -> no budget after reserve
+
+
+# --- v0.0.21: near-duplicate suppression ------------------------------------
+#
+# The observed loop: across a stuck step's reviews the brain restated the same
+# finding three ways and re-made the same decision verbatim, and those
+# restatements piled up and dominated the slice fed back into the next review.
+
+# The exact wordings seen live ("create a terminal calendar" run).
+_LACKS_LOOP = [
+    "The main function in terminal_calendar.py lacks an input loop to handle user navigation commands",
+    "The main() function in terminal_calendar.py lacks the input loop implementation for handling user navigation commands",
+    "The main function in terminal_calendar.py does not contain the required input loop for handling navigation commands",
+]
+_REPEAT_DECISION = (
+    "Focus on implementing the text command processing loop in main() rather than keyboard input handling"
+)
+
+
+def test_reworded_restatements_collapse_to_one():
+    mem = PlanMemory()
+    for text in _LACKS_LOOP:
+        mem.remember("fact", text, "main lacks the input loop")
+    facts = [e for e in mem.entries if e.kind == "fact"]
+    assert len(facts) == 1  # three rewordings of the same finding -> one entry
+
+
+def test_identical_decision_collapses():
+    mem = PlanMemory()
+    first = mem.remember("decision", _REPEAT_DECISION, "focus on the command loop")
+    second = mem.remember("decision", _REPEAT_DECISION, "focus on the command loop")
+    assert first is not None and second is None  # the byte-identical repeat is suppressed
+    assert len([e for e in mem.entries if e.kind == "decision"]) == 1
+
+
+def test_ranked_slice_not_dominated_by_restatements():
+    """The fed-back review slice no longer returns three copies of the same fact."""
+    mem = PlanMemory()
+    for text in _LACKS_LOOP:
+        mem.remember("fact", text, "main lacks the input loop")
+    got = mem.relevant("input loop main navigation", budget_tokens=100_000)
+    assert len(got) == 1
+
+
+def test_genuinely_new_fact_is_kept():
+    mem = PlanMemory()
+    mem.remember("fact", _LACKS_LOOP[0], "s")
+    # A fact that ADDS information (a new failure mode) is not a restatement.
+    added = mem.remember(
+        "fact",
+        "main() in terminal_calendar.py also crashes with an IndexError on an empty events file",
+        "crash on empty events file",
+    )
+    assert added is not None
+    assert len([e for e in mem.entries if e.kind == "fact"]) == 2
+
+
+def test_dedup_is_per_kind():
+    """A fact does not suppress a same-text decision (different kinds are separate)."""
+    mem = PlanMemory()
+    mem.remember("fact", _REPEAT_DECISION, "s")
+    other = mem.remember("decision", _REPEAT_DECISION, "s")
+    assert other is not None
+    assert {e.kind for e in mem.entries} == {"fact", "decision"}
+
+
+def test_distinct_facts_are_not_suppressed():
+    mem = PlanMemory()
+    a = mem.remember("fact", "Step 0 done: created alpha.txt with the header row", "created alpha.txt")
+    b = mem.remember("fact", "Step 1 done: created beta.txt with the footer row", "created beta.txt")
+    assert a is not None and b is not None  # distinct work outcomes both kept
+
+
+def test_texts_near_duplicate_helper():
+    from relay.memory import texts_near_duplicate
+
+    assert texts_near_duplicate(_LACKS_LOOP[0], _LACKS_LOOP[1])
+    assert texts_near_duplicate(_LACKS_LOOP[0], _LACKS_LOOP[2])
+    assert texts_near_duplicate("same text here exactly", "same text here exactly")
+    # A genuine superset (adds a clause of new content) is NOT a duplicate.
+    assert not texts_near_duplicate(
+        "main lacks the input loop entirely",
+        "main lacks the input loop entirely and also mishandles the quit command and the help command",
+    )
+    # Unrelated facts are not duplicates.
+    assert not texts_near_duplicate(
+        "the config loader reads from config.toml at startup",
+        "the renderer draws the month grid with seven columns",
+    )

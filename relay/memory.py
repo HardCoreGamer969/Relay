@@ -56,6 +56,28 @@ VERBATIM_SHARE = 0.75
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
+# --- near-duplicate suppression knobs (v0.0.21) ----------------------------
+# Across a stuck step's reviews the brain restates the same finding many times
+# ("main() lacks the input loop" / "...lacks the input loop implementation" /
+# "...does not contain the required input loop"). Stored verbatim, these
+# rewordings dominate the keyword-ranked slice fed back into the next review and
+# reinforce the loop. So a new entry that near-restates a recent same-kind entry
+# is suppressed. Conservative by construction: same-kind only, a bounded recent
+# window, and a novelty guard that keeps a genuinely-new superset entry.
+_DEDUP_WINDOW = 12          # recent same-kind entries to scan
+_DEDUP_MIN_TOKENS = 5       # below this many content tokens, only an exact match dedups
+_DEDUP_CONTAINMENT = 0.7    # shared-token share of the SMALLER entry to call it a restatement
+_DEDUP_MAX_EXTRA = 0.4      # ...AND the larger entry adds <=40% brand-new tokens (else it is new info)
+
+# Function words that don't carry a fact's identity; dropped before comparison so
+# rewordings ("lacks X" vs "does not contain the required X") still match on
+# content tokens. Negations ("not"/"no") are deliberately KEPT (they flip meaning).
+_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "for", "with",
+    "that", "this", "as", "at", "by", "from", "into", "is", "are", "be", "was",
+    "were", "does", "do", "did", "has", "have", "had", "it", "its", "their",
+})
+
 _SUMMARY_SYSTEM = (
     "You are compacting a coding agent's plan memory to fit a small context "
     "window. Compress the given older memory entries into the densest possible "
@@ -87,7 +109,15 @@ class MemoryEntry:
 class PlanMemory:
     """Append-mostly store of :class:`MemoryEntry` values for one run.
 
-    Entries are never silently dropped. In-memory only (no persistence, no DB).
+    In-memory only (no persistence, no DB). Genuinely-new knowledge is never
+    dropped; the one deliberate exception (v0.0.21) is **near-duplicate
+    suppression** -- a new entry that merely restates a RECENT same-kind entry
+    (the brain rewording the same finding across a stuck step's reviews) is not
+    appended, so a handful of restatements can't dominate the keyword-ranked
+    slice fed back into the next review and reinforce a loop. That is a feature,
+    not silent loss: the knowledge is already present. See
+    :func:`texts_near_duplicate` for the conservative test (same-kind, recent
+    window, novelty guard so a superset that ADDS information is kept).
     """
 
     entries: list[MemoryEntry] = field(default_factory=list)
@@ -111,8 +141,14 @@ class PlanMemory:
         *,
         provenance: str = "",
         tags: list[str] | None = None,
-    ) -> MemoryEntry:
-        """Convenience: build a :class:`MemoryEntry` and :meth:`add` it."""
+    ) -> MemoryEntry | None:
+        """Build a :class:`MemoryEntry` and :meth:`add` it -- UNLESS it merely
+        restates a recent same-kind entry, in which case it is suppressed and
+        ``None`` is returned (the knowledge is already stored; see the class note
+        on near-duplicate suppression). Genuinely-new content is always appended.
+        """
+        if self._is_near_duplicate(kind, detail):
+            return None
         return self.add(
             MemoryEntry(
                 id="",
@@ -124,6 +160,25 @@ class PlanMemory:
                 tags=list(tags or []),
             )
         )
+
+    def _is_near_duplicate(self, kind: str, detail: str) -> bool:
+        """Whether ``detail`` restates a RECENT same-kind entry (bounded scan).
+
+        Only same-kind entries, only the last :data:`_DEDUP_WINDOW` of them, via
+        the shared :func:`texts_near_duplicate` test -- so the check is cheap and
+        cannot suppress an entry just because something unrelated long ago looked
+        similar.
+        """
+        examined = 0
+        for entry in reversed(self.entries):
+            if entry.kind != kind:
+                continue
+            examined += 1
+            if examined > _DEDUP_WINDOW:
+                break
+            if texts_near_duplicate(entry.detail, detail):
+                return True
+        return False
 
     # -- snapshot shape (cheap point-in-time copy; the v0.2 hook) -----------
 
@@ -287,6 +342,45 @@ def small_window_warning(memory: PlanMemory, window: int) -> str | None:
 
 def _terms(query: str) -> set[str]:
     return set(_WORD_RE.findall((query or "").lower()))
+
+
+def _normalize(text: str) -> str:
+    """Whitespace/case-normalized form, for exact-duplicate comparison."""
+    return " ".join((text or "").lower().split())
+
+
+def _content_tokens(text: str) -> set[str]:
+    """Content (non-stopword) word tokens of ``text``, for similarity."""
+    return {t for t in _WORD_RE.findall((text or "").lower()) if t not in _STOPWORDS}
+
+
+def texts_near_duplicate(a: str, b: str) -> bool:
+    """True iff ``a`` and ``b`` are restatements of the same thing (deterministic).
+
+    Either exact after whitespace/case normalization, OR -- for entries with
+    enough content -- a high shared-token share (the overlap as a fraction of the
+    SMALLER entry) together with only a small amount of brand-new content on the
+    larger side. That second clause is the **novelty guard**: a genuine superset
+    that ADDS information (the larger entry is mostly new tokens) is NOT a
+    duplicate, so real new knowledge is never dropped. Symmetric, and shared by
+    memory's suppression and the orchestrator's repetition breaker so the two can
+    never diverge.
+    """
+    na, nb = _normalize(a), _normalize(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    ta, tb = _content_tokens(a), _content_tokens(b)
+    if len(ta) < _DEDUP_MIN_TOKENS or len(tb) < _DEDUP_MIN_TOKENS:
+        return False
+    overlap = len(ta & tb)
+    if not overlap:
+        return False
+    smaller, larger = sorted((len(ta), len(tb)))
+    containment = overlap / smaller
+    extra_ratio = (larger - overlap) / larger
+    return containment >= _DEDUP_CONTAINMENT and extra_ratio <= _DEDUP_MAX_EXTRA
 
 
 def _score(entry: MemoryEntry, terms: set[str], max_ord: int) -> float:

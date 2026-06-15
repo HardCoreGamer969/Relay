@@ -13,6 +13,7 @@ spine threaded everywhere the brain makes an assume-vs-ask decision.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 from dotenv import find_dotenv, load_dotenv
@@ -88,6 +89,25 @@ _ASSUMPTION_DIRECTIVES = {
 def assumption_directive(level: str) -> str:
     """The dial directive for ``level`` (defaults to ``auto`` for unknown values)."""
     return _ASSUMPTION_DIRECTIVES.get(level, _ASSUMPTION_DIRECTIVES["auto"])
+
+
+def assumption_summary(level: str) -> str:
+    """A short, plain-language description of what the dial does at ``level``.
+
+    DERIVED from the real directive (:data:`_ASSUMPTION_DIRECTIVES` via
+    :func:`assumption_directive`) -- the single source of truth -- so it can never
+    drift from the dial's actual behavior. Each directive reads
+    ``ASSUMPTION DIAL = <level> (<label>): <clause>; ...``; this returns
+    ``"<label> -- <first clause>"`` (e.g. ``"balanced -- assume technical/decidable
+    details"``), grounded in the same text the brain is actually given.
+    """
+    directive = assumption_directive(level)
+    head, _, rest = directive.partition("): ")
+    label = head[head.rfind("(") + 1:] if "(" in head else ""
+    # The first clause: up to the first sentence/clause boundary in the directive.
+    match = re.search(r"\. |; | -- ", rest)
+    first = (rest[:match.start()] if match else rest).strip().rstrip(".")
+    return f"{label} -- {first}" if label else first
 
 # These defaults are MEANT TO BE OVERRIDDEN via RELAY_BRAIN_MODEL /
 # RELAY_HANDS_MODEL; they exist only so the CLI is runnable out of the box once

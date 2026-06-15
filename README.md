@@ -43,30 +43,48 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.17 (TUI slash commands: a dialog-driven control plane)
+## Status — v0.0.18 (`/provider`, a reusable segmented toggle, richer `/assume`)
 
-Type **`/`** in the TUI prompt and a filterable command popover appears; pick one
-and it opens a **dialog** (or runs a clean action). Every command is
-dialog-driven with **zero inline arguments** — and a key is **never** typed into
-the chat input. The commands:
+Two additions on the v0.0.17 slash infrastructure, plus one new reusable primitive:
+
+- **`SegmentedControl`** — a general horizontal choose-one toggle (the analog of
+  `SelectDialog` for a small fixed set): **left/right** cycle with wrap-around,
+  **Enter** commits, **Esc** cancels. Built as a proper component (its own tests),
+  reusable by any future step — `/provider`'s role step is just its first consumer.
+- **`/provider`** — set which provider supplies a role, then its model. A role
+  toggle (**`brain` ◄ ► `hands` ◄ ► `both`**) → the provider `SelectDialog` (the
+  same list `/key`/setup use) → straight into the **shared model-pick step** for
+  the just-chosen provider (a live `/models` list for DeepSeek, a validated slug
+  for OpenRouter). **Per-role isolation**: the chosen role is the only one touched.
+  **`both` runs the model pick twice** — brain, then hands — each self-contained,
+  so you can pair (say) a pro brain and a flash hands on the same provider. Provider
+  + model both persist to `config.json` via the shared `persist_role`.
+- **`/assume`** now shows a short, plain-language **description per level**, derived
+  from the real dial semantics in `config.py` (`assumption_summary`, sourced from
+  the actual directive text so it can't drift) — e.g. "1 — super loose: assume
+  almost everything", "5 — exact letter: assume almost nothing". The current level
+  is still marked.
+
+It's **reuse, not rebuild**: `/provider`'s provider dialog, model-pick step,
+`validate_model`, `list_models`, and `persist_role` are the SAME pieces `/model`
+and the setup screen use (`/model` was refactored to share the model-pick step).
+No inline arguments anywhere; the engine/InputRouter/precedence are untouched.
+
+Under that, the v0.0.17 **slash control plane** still stands — type **`/`** in the
+prompt for a filterable command popover; every command opens a dialog or runs a
+clean action, none parse inline args, and a key is never typed into the chat input:
 
 - `/help` — list every command (the discoverability anchor).
 - `/model` — pick a role, then its model: a **live `/models` list** for DeepSeek,
   a **validated slug field** for OpenRouter; persisted + live-reloaded.
+- `/provider` — set a role's provider, then chain into its model pick (above).
 - `/key` — a **masked** key-entry dialog (`password=True`), saved `0o600`.
 - `/config` — the resolved config (provider/model/thinking + source; key
   present/absent — **never the key**).
 - `/doctor` — the provider/model preflight in a dialog.
 - `/runs` — recent runs, read-only.
-- `/assume` — pick the assumption level (1–5 / auto) for the session.
+- `/assume` — pick the assumption level (1–5 / auto), each with a description.
 - `/clear` — clear the panes (disabled mid-run; never clobbers a live run).
-
-It's **reuse, not rebuild**: slash commands are a thin front door that launches
-the existing v0.0.16 flows (masked entry, live listing, `validate_model`,
-`persist_role`, `secrets.set_key`, the doctor/runs logic). The popover is gated to
-the idle input state, so the engine/InputRouter is undisturbed; a plain goal
-(no leading `/`) submits exactly as before. First-run guidance is now slash-native
-("type `/key` to get started, `/help` for all commands").
 
 Under that, **beta-enablement** (v0.0.16): a user who has never touched a
 `.env` can add a provider, enter a key, and pick models *in the app*. Config now

@@ -104,6 +104,32 @@ def test_assume_sets_session_level(tmp_path):
     asyncio.run(main())
 
 
+def test_assume_options_carry_grounded_descriptions(tmp_path):
+    """Every level option has a non-empty description sourced from config's real
+    dial semantics (assumption_summary), and the current level is marked."""
+    from relay.config import ASSUMPTION_LEVELS, assumption_summary
+
+    async def main():
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._set_assume("2")          # make "2" the current level
+            app._cmd_assume()
+            await pilot.pause()
+            dialog = app.screen
+            by_value = {o["value"]: o for o in dialog._options}
+            for lvl in ASSUMPTION_LEVELS:
+                opt = by_value[lvl]
+                # Description is the config-derived summary (single source of truth).
+                assert opt["description"] == assumption_summary(lvl)
+                assert opt["description"]  # non-empty
+            # The current level is still marked.
+            assert "current" in by_value["2"]["title"]
+            assert "current" not in by_value["3"]["title"]
+
+    asyncio.run(main())
+
+
 # --- /clear (panes only; never clobbers an in-flight run) -------------------
 
 

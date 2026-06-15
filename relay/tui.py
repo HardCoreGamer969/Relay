@@ -61,6 +61,7 @@ from relay.config import (
     ASSUMPTION_LEVELS,
     ROLES,
     ModelConfig,
+    assumption_summary,
     describe_resolution,
     default_config,
     load_models,
@@ -1755,13 +1756,21 @@ class RelayTuiApp(App):
             return []
 
     def _cmd_assume(self) -> None:
-        """Pick the assumption level for this session (a select, not an inline number)."""
-        options = [
-            {"title": lvl, "value": lvl, "category": "assumption",
-             "description": "current" if lvl == self._assumption_level else "",
-             "on_select": (lambda v: self._set_assume(v))}
-            for lvl in ASSUMPTION_LEVELS
-        ]
+        """Pick the assumption level for this session (a select, not an inline number).
+
+        Each level carries a short description DERIVED from the real dial semantics
+        (:func:`relay.config.assumption_summary`), so the text can't drift from what
+        the brain is actually instructed to do. The current level is marked.
+        """
+        options = []
+        for lvl in ASSUMPTION_LEVELS:
+            current = lvl == self._assumption_level
+            options.append({
+                "title": f"{lvl}  (current)" if current else lvl,
+                "value": lvl, "category": "assumption",
+                "description": assumption_summary(lvl),
+                "on_select": (lambda v: self._set_assume(v)),
+            })
         self.push_screen(SelectDialog(title="Assumption level (1 = assume freely .. 5 = ask)", options=options))
 
     def _set_assume(self, level: str) -> None:

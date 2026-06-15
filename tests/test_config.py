@@ -6,8 +6,29 @@ from relay.config import (
     ASSUMPTION_LEVELS,
     DEFAULT_ASSUMPTION_LEVEL,
     assumption_directive,
+    assumption_summary,
     resolve_assumption_level,
 )
+
+
+def test_assumption_summary_is_grounded_in_the_directive():
+    """Each summary is DERIVED from the real directive, not a hardcoded guess: it's
+    non-empty for every level, short (a phrase), and its words appear in the
+    directive it summarizes (so it can't drift from the dial's actual behavior)."""
+    for level in ASSUMPTION_LEVELS:
+        summary = assumption_summary(level)
+        directive = assumption_directive(level).lower()
+        assert summary, f"{level} has no summary"
+        assert len(summary) < 120, f"{level} summary is a paragraph, not a phrase"
+        # Every word of the derived summary comes from the directive text.
+        for word in summary.lower().replace("--", " ").split():
+            assert word in directive, f"{level}: {word!r} is not in the real directive"
+
+
+def test_assumption_summary_distinguishes_loose_from_strict():
+    # Grounded in the real low-vs-high posture (assume freely .. assume almost nothing).
+    assert "assume almost everything" in assumption_summary("1")
+    assert "assume almost nothing" in assumption_summary("5")
 
 
 def test_default_is_auto(monkeypatch):

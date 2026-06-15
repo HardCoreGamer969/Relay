@@ -127,6 +127,19 @@
   forked. The popover is gated to the IDLE input state so the engine/InputRouter
   is undisturbed; ``/clear`` is disabled mid-run. First-run guidance is now
   slash-native (``/key`` to start, ``/help`` for all commands).
+- v0.0.18 adds a reusable **``SegmentedControl``** primitive (a horizontal
+  choose-one toggle: left/right with wrap, Enter commits, Esc cancels -- the
+  analog of ``SelectDialog`` for a small fixed set), and a **``/provider``** slash
+  command built on it: a role toggle (``brain``/``hands``/``both``) -> the provider
+  ``SelectDialog`` -> the SHARED model-pick step for the just-chosen provider
+  (``_pick_model_step``, also now used by ``/model``), persisted via ``persist_role``.
+  Per-role isolation holds (the chosen role is the only one touched); ``both`` runs
+  the model step twice (brain then hands), each persisted independently; provider +
+  model both persist to ``config.json``. ``/assume`` now shows a short per-level
+  description DERIVED from the real dial semantics
+  (:func:`~relay.config.assumption_summary`, sourced from
+  ``_ASSUMPTION_DIRECTIVES`` so it can't drift), with the current level marked. No
+  inline args; no forked logic.
 """
 
 from __future__ import annotations
@@ -156,6 +169,7 @@ from relay.config import (
     DEFAULT_ASSUMPTION_LEVEL,
     ModelConfig,
     assumption_directive,
+    assumption_summary,
     default_config,
     describe_resolution,
     load_env,
@@ -230,7 +244,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.17"
+__version__ = "0.0.18"
 
 __all__ = [
     # v0.01 -- model layer
@@ -294,6 +308,7 @@ __all__ = [
     "ScopeAssessment",
     "resolve_assumption_level",
     "assumption_directive",
+    "assumption_summary",
     "ASSUMPTION_LEVELS",
     "DEFAULT_ASSUMPTION_LEVEL",
     # v0.08 (B of B) -- the continuous transcript + readability compaction

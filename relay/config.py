@@ -17,7 +17,8 @@ from dataclasses import dataclass
 
 from dotenv import find_dotenv, load_dotenv
 
-from relay.providers import DEFAULT_PROVIDER
+import relay.store as store
+from relay.providers import DEFAULT_PROVIDER, known_providers
 
 # The two roles Relay knows about.
 ROLES = ("brain", "hands")
@@ -136,9 +137,111 @@ class ModelConfig:
         return mapping[role]
 
 
+_TRUE = ("1", "true", "yes", "on")
+_FALSE = ("0", "false", "no", "off")
+
+
 def _env_bool(name: str) -> bool:
     """Read a boolean env flag (``1`` / ``true`` / ``yes`` / ``on`` → True)."""
-    return str(os.environ.get(name, "")).strip().lower() in ("1", "true", "yes", "on")
+    return str(os.environ.get(name, "")).strip().lower() in _TRUE
+
+
+def _env_name(role: str, field: str) -> str:
+    """The env var for a role field, e.g. (``brain``, ``model``) -> ``RELAY_BRAIN_MODEL``."""
+    return f"RELAY_{role.upper()}_{field.upper()}"
+
+
+def _config_role_field(config: dict, role: str, field: str):
+    """The value of ``config["roles"][role][field]`` or ``None`` (defensive)."""
+    roles = config.get("roles") if isinstance(config, dict) else None
+    role_cfg = roles.get(role) if isinstance(roles, dict) else None
+    if isinstance(role_cfg, dict):
+        value = role_cfg.get(field)
+        if value is not None:
+            return value
+    return None
+
+
+def _default_for(role: str, field: str):
+    if field == "provider":
+        return DEFAULT_PROVIDER
+    if field == "thinking":
+        return False
+    return DEFAULT_BRAIN_MODEL if role == "brain" else DEFAULT_HANDS_MODEL
+
+
+def resolve_role_field(role: str, field: str, config: dict | None = None):
+    """Resolve one role field with provenance: **env > config.json > default**.
+
+    Returns ``(value, source)`` where ``source`` is ``"env"`` / ``"config"`` /
+    ``"default"``. ``field`` is ``"provider"`` / ``"model"`` / ``"thinking"``.
+    A user's ``RELAY_*`` env var always wins, so the historical workflow is intact;
+    config.json is the next rung; the built-in default is last.
+    """
+    config = config if config is not None else store.load_config()
+    raw_env = os.environ.get(_env_name(role, field))
+
+    if field == "thinking":
+        if raw_env is not None and raw_env.strip() != "":
+            return (raw_env.strip().lower() in _TRUE), "env"
+        cfg = _config_role_field(config, role, field)
+        if cfg is not None:
+            return bool(cfg), "config"
+        return False, "default"
+
+    # provider / model: a non-empty env var wins.
+    if raw_env:
+        return raw_env, "env"
+    cfg = _config_role_field(config, role, field)
+    if cfg is not None:
+        return str(cfg), "config"
+    return _default_for(role, field), "default"
+
+
+def default_config() -> dict:
+    """A fresh, fully-populated v1 config skeleton (for seeding ``config.json``).
+
+    Mirrors the documented shape, including the reserved picker sockets
+    (``preferences.cost_bias`` / ``recommendations_source``) -- round-tripped but
+    inert (no logic reads them yet).
+    """
+    return {
+        "version": store.CONFIG_VERSION,
+        "providers": {pid: {"enabled": True} for pid in known_providers()},
+        "roles": {
+            "brain": {
+                "provider": DEFAULT_PROVIDER, "model": DEFAULT_BRAIN_MODEL, "thinking": False,
+            },
+            "hands": {
+                "provider": DEFAULT_PROVIDER, "model": DEFAULT_HANDS_MODEL, "thinking": False,
+            },
+        },
+        "preferences": {"cost_bias": "balanced"},   # reserved picker socket (inert)
+        "recommendations_source": "bundled",        # reserved picker socket (inert)
+    }
+
+
+def describe_resolution() -> dict:
+    """Resolved config for ``relay config show`` (and tests).
+
+    Returns per-role ``{field: (value, source)}`` and per-provider key presence.
+    **Never** includes a key value -- only whether one is available (env or
+    auth.json). Importing the key check lazily keeps all secret access in
+    :mod:`relay.secrets`.
+    """
+    from relay.providers import resolve_provider
+    from relay.secrets import resolve_key
+
+    config = store.load_config()
+    roles = {
+        role: {field: resolve_role_field(role, field, config) for field in ("provider", "model", "thinking")}
+        for role in ROLES
+    }
+    providers = {}
+    for pid in known_providers():
+        profile = resolve_provider(pid)
+        providers[pid] = {"key_present": resolve_key(pid, profile.key_env) is not None}
+    return {"roles": roles, "providers": providers}
 
 
 def load_env() -> str:
@@ -164,21 +267,28 @@ def load_env() -> str:
 
 
 def load_models() -> ModelConfig:
-    """Build a :class:`ModelConfig` from the environment.
+    """Build a :class:`ModelConfig`, resolving each role **env > config.json > default**.
 
-    Loads a project ``.env`` from the current working directory (:func:`load_env`,
-    cwd-based so it works under any install location) and resolves, per role: the
-    model from ``RELAY_BRAIN_MODEL`` / ``RELAY_HANDS_MODEL``, the provider from
-    ``RELAY_BRAIN_PROVIDER`` / ``RELAY_HANDS_PROVIDER`` (default ``openrouter``),
-    and the thinking toggle from ``RELAY_BRAIN_THINKING`` / ``RELAY_HANDS_THINKING``
-    (default off). Provider/thinking defaults keep the OpenRouter behavior intact.
+    Loads a project ``.env`` from the current working directory (:func:`load_env`),
+    then resolves per role (:func:`resolve_role_field`): the model
+    (``RELAY_BRAIN_MODEL`` / ``RELAY_HANDS_MODEL``), provider (``RELAY_BRAIN_PROVIDER``
+    / ``RELAY_HANDS_PROVIDER``, default ``openrouter``), and thinking toggle
+    (``RELAY_BRAIN_THINKING`` / ``RELAY_HANDS_THINKING``, default off). A user's env
+    var still wins over the global ``config.json``, which wins over the built-in
+    default -- so the historical env/.env workflow is unchanged, and an absent
+    config.json falls through exactly as before.
     """
     load_env()
+    config = store.load_config()
+
+    def value(role: str, field: str):
+        return resolve_role_field(role, field, config)[0]
+
     return ModelConfig(
-        brain=os.environ.get("RELAY_BRAIN_MODEL", DEFAULT_BRAIN_MODEL),
-        hands=os.environ.get("RELAY_HANDS_MODEL", DEFAULT_HANDS_MODEL),
-        brain_provider=os.environ.get("RELAY_BRAIN_PROVIDER", DEFAULT_PROVIDER),
-        hands_provider=os.environ.get("RELAY_HANDS_PROVIDER", DEFAULT_PROVIDER),
-        brain_thinking=_env_bool("RELAY_BRAIN_THINKING"),
-        hands_thinking=_env_bool("RELAY_HANDS_THINKING"),
+        brain=value("brain", "model"),
+        hands=value("hands", "model"),
+        brain_provider=value("brain", "provider"),
+        hands_provider=value("hands", "provider"),
+        brain_thinking=value("brain", "thinking"),
+        hands_thinking=value("hands", "thinking"),
     )

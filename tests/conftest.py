@@ -32,6 +32,12 @@ def _isolate_catalog(monkeypatch, tmp_path):
     monkeypatch.setenv("RELAY_CACHE_DIR", str(tmp_path / "relay-cache"))
     monkeypatch.delenv("RELAY_MODELS_URL", raising=False)
     monkeypatch.delenv("RELAY_DISABLE_MODELS_FETCH", raising=False)
+    # Isolate the global user-config + secrets store too: every test gets a fresh
+    # tmp config dir (never the developer's real ~/.config/relay), and the auth
+    # env-override starts cleared. Keeps config/secrets tests hermetic and stops
+    # load_models() from ever reading the real machine's config.json.
+    monkeypatch.setenv("RELAY_CONFIG_DIR", str(tmp_path / "relay-config"))
+    monkeypatch.delenv("RELAY_AUTH_CONTENT", raising=False)
     yield
     catalog.reset_catalog_cache()
 

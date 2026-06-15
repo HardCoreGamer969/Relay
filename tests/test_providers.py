@@ -20,9 +20,12 @@ from relay.models import call_model
 from relay.providers import (
     DEFAULT_PROVIDER,
     DEEPSEEK,
+    DISCOVERY_LIST,
+    DISCOVERY_MANUAL,
     OPENROUTER,
     ProviderProfile,
     known_providers,
+    list_models,
     resolve_provider,
 )
 from relay.telemetry import Ledger
@@ -166,3 +169,43 @@ def test_deepseek_role_does_not_request_openrouter_usage():
     sent = client.chat.completions.calls[0]
     # The OpenRouter-specific usage.include must NOT be sent to DeepSeek.
     assert "usage" not in (sent.get("extra_body") or {})
+
+
+# --- discovery mode + list_models (no network: client injected) -------------
+
+
+class _ModelsListClient:
+    """A fake client whose .models.list() returns a fixture /models response."""
+
+    def __init__(self, ids):
+        data = [SimpleNamespace(id=i) for i in ids]
+        self.models = SimpleNamespace(list=lambda: SimpleNamespace(data=data))
+
+
+def test_provider_profiles_declare_discovery():
+    assert OPENROUTER.discovery == DISCOVERY_MANUAL  # aggregator: type a slug
+    assert DEEPSEEK.discovery == DISCOVERY_LIST       # direct: list live
+
+
+def test_list_models_manual_provider_returns_empty():
+    # OpenRouter is manual -> no enumeration; caller prompts for a slug instead.
+    assert list_models("openrouter", client=_ModelsListClient(["x"])) == []
+
+
+def test_list_models_list_provider_parses_ids():
+    client = _ModelsListClient(["deepseek-v4-flash", "deepseek-v4-pro"])
+    assert list_models("deepseek", client=client) == ["deepseek-v4-flash", "deepseek-v4-pro"]
+
+
+def test_list_models_omits_deprecated_ids_absent_from_endpoint():
+    # The live endpoint self-corrects: legacy ids retire and simply don't appear.
+    client = _ModelsListClient(["deepseek-v4-flash", "deepseek-v4-pro"])
+    ids = list_models("deepseek", client=client)
+    assert "deepseek-chat" not in ids and "deepseek-reasoner" not in ids
+
+
+def test_list_models_handles_dict_style_entries():
+    # Tolerate a dict-shaped /models payload as well as SDK objects.
+    raw = SimpleNamespace(data=[{"id": "deepseek-v4-flash"}, {"id": "deepseek-v4-pro"}])
+    client = SimpleNamespace(models=SimpleNamespace(list=lambda: raw))
+    assert list_models("deepseek", client=client) == ["deepseek-v4-flash", "deepseek-v4-pro"]

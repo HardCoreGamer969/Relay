@@ -21,6 +21,15 @@ from dataclasses import dataclass
 DEFAULT_PROVIDER = "openrouter"
 
 
+# How a provider's models are chosen:
+# - "manual": the user supplies a slug; we do NOT enumerate (aggregators like
+#   OpenRouter expose thousands of slugs -- the right UX is type-a-slug, validated).
+# - "list": enumerate live via the provider's ``/models`` endpoint (direct
+#   providers like DeepSeek). Listing live self-corrects against deprecations.
+DISCOVERY_MANUAL = "manual"
+DISCOVERY_LIST = "list"
+
+
 @dataclass(frozen=True)
 class ProviderProfile:
     """A provider as a thin profile over the shared OpenAI-compatible client."""
@@ -28,12 +37,19 @@ class ProviderProfile:
     id: str
     base_url: str
     key_env: str
+    discovery: str = DISCOVERY_MANUAL
 
 
 # The built-in registry. NOTE DeepSeek's base URL includes ``/v1`` (its docs), and
 # DeepSeek is OpenAI-compatible so it needs no special client -- just this entry.
-OPENROUTER = ProviderProfile("openrouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY")
-DEEPSEEK = ProviderProfile("deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY")
+# OpenRouter is a manual aggregator (type-a-slug); DeepSeek is a direct provider
+# that lists its models live.
+OPENROUTER = ProviderProfile(
+    "openrouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", DISCOVERY_MANUAL
+)
+DEEPSEEK = ProviderProfile(
+    "deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", DISCOVERY_LIST
+)
 
 _REGISTRY: dict[str, ProviderProfile] = {p.id: p for p in (OPENROUTER, DEEPSEEK)}
 
@@ -57,3 +73,38 @@ def resolve_provider(provider: str | ProviderProfile | None) -> ProviderProfile:
 def known_providers() -> tuple[str, ...]:
     """The registered provider ids (e.g. for help text / the future picker)."""
     return tuple(sorted(_REGISTRY))
+
+
+def list_models(provider: str | ProviderProfile, *, client=None) -> list[str]:
+    """Return the model ids a provider offers, by its ``discovery`` mode.
+
+    - ``manual`` providers (OpenRouter): return ``[]`` -- the caller should prompt
+      for a slug instead (check ``profile.discovery``). No enumeration.
+    - ``list`` providers (DeepSeek): enumerate live via the OpenAI-compatible
+      ``/models`` endpoint (``GET {base_url}/models``, bearer key). Listing live
+      self-corrects against deprecations -- a retired id simply won't appear.
+
+    ``client`` may be injected (tests pass a fake with ``.models.list()``); when
+    ``None`` a real client is built for the provider. Only model ids are returned
+    -- cross-reference the catalog for pricing/context at display time.
+    """
+    profile = resolve_provider(provider)
+    if profile.discovery != DISCOVERY_LIST:
+        return []
+    if client is None:
+        # Lazy import avoids a providers <-> client import cycle.
+        from relay.client import build_client
+
+        client = build_client(profile.id)
+    raw = client.models.list()
+    data = getattr(raw, "data", None)
+    if data is None:
+        data = raw if isinstance(raw, (list, tuple)) else []
+    ids: list[str] = []
+    for entry in data:
+        mid = getattr(entry, "id", None)
+        if mid is None and isinstance(entry, dict):
+            mid = entry.get("id")
+        if mid:
+            ids.append(str(mid))
+    return ids

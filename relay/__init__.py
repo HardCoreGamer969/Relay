@@ -127,17 +127,30 @@ from relay.config import (
     DEFAULT_ASSUMPTION_LEVEL,
     ModelConfig,
     assumption_directive,
+    default_config,
+    describe_resolution,
     load_env,
     load_models,
     resolve_assumption_level,
+    resolve_role_field,
 )
 from relay.context import DEFAULT_CONTEXT_WINDOW, resolve_context_window
 from relay.providers import (
     DEFAULT_PROVIDER,
+    DISCOVERY_LIST,
+    DISCOVERY_MANUAL,
     ProviderProfile,
     known_providers,
+    list_models,
     resolve_provider,
 )
+from relay.secrets import (
+    get_key,
+    remove_key,
+    resolve_key,
+    set_key,
+)
+from relay.store import config_dir, config_path, load_config, save_config
 from relay.conversation import ConversationResult, ScopeAssessment, plan_conversationally
 from relay.loop import StepResult, TaskResult, run_task
 from relay.memory import (
@@ -282,5 +295,20 @@ __all__ = [
     "resolve_provider",
     "known_providers",
     "DEFAULT_PROVIDER",
+    # v0.0.16 -- provider config + secrets (beta-enablement)
+    "config_dir",
+    "config_path",
+    "load_config",
+    "save_config",
+    "default_config",
+    "describe_resolution",
+    "resolve_role_field",
+    "get_key",
+    "set_key",
+    "remove_key",
+    "resolve_key",
+    "list_models",
+    "DISCOVERY_MANUAL",
+    "DISCOVERY_LIST",
     "__version__",
 ]

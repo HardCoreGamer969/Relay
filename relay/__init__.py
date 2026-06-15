@@ -114,6 +114,19 @@
   app; an empty first-run is guided into setup (offered-but-prominent), while a
   user with working env vars/keys goes straight to chat. The picker's ``cost_bias``
   / ``recommendations_source`` sockets are reserved but inert.
+- v0.0.17 adds a **dialog-driven slash-command** control plane to the TUI: typing
+  ``/`` in the prompt opens a filterable popover (:data:`relay.tui.COMMANDS`); every
+  command opens a DIALOG or runs a clean no-arg action -- NONE parse inline
+  arguments, and no command (especially ``/key``) ever reads a value out of the
+  prompt text. One generic ``SelectDialog`` is the primitive every list command
+  (``/help`` ``/model`` ``/config`` ``/doctor`` ``/runs`` ``/assume``) opens; a
+  ``TextEntryDialog`` (masked for ``/key``, plain for a manual slug) is the entry
+  primitive. Slash commands are a thin front door that LAUNCHES the existing
+  v0.0.16 flows (masked key entry, live model listing, ``validate_model``,
+  ``persist_role``, ``secrets.set_key``, the doctor/runs logic) -- reused, never
+  forked. The popover is gated to the IDLE input state so the engine/InputRouter
+  is undisturbed; ``/clear`` is disabled mid-run. First-run guidance is now
+  slash-native (``/key`` to start, ``/help`` for all commands).
 """
 
 from __future__ import annotations
@@ -217,7 +230,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.16"
+__version__ = "0.0.17"
 
 __all__ = [
     # v0.01 -- model layer

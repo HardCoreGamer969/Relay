@@ -137,3 +137,28 @@ def test_clear_is_disabled_and_inert_mid_run(tmp_path):
             assert app._conversation_lines == ["you (goal): build x"]
 
     asyncio.run(main())
+
+
+# --- first-run is slash-native ----------------------------------------------
+
+
+def test_first_run_hint_is_slash_native(tmp_path, monkeypatch):
+    """An empty first-run guides the user to /key (slash-native), offered-but-
+    prominent. A configured/env user never reaches this."""
+    from textual.widgets import Static
+
+    monkeypatch.setenv("RELAY_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.chdir(tmp_path)  # no project .env to supply a key
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    async def main():
+        app = RelayTuiApp(root=str(tmp_path), models=CFG, client=None)  # genuinely empty
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            assert app._first_run is True
+            hint = str(app.query_one("#hint", Static).render())
+            assert "/key" in hint and "/help" in hint
+
+    asyncio.run(main())

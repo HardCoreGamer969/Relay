@@ -43,9 +43,32 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.16 (provider config + secrets: configure Relay in the app)
+## Status — v0.0.17 (TUI slash commands: a dialog-driven control plane)
 
-The latest milestone is **beta-enablement**: a user who has never touched a
+Type **`/`** in the TUI prompt and a filterable command popover appears; pick one
+and it opens a **dialog** (or runs a clean action). Every command is
+dialog-driven with **zero inline arguments** — and a key is **never** typed into
+the chat input. The commands:
+
+- `/help` — list every command (the discoverability anchor).
+- `/model` — pick a role, then its model: a **live `/models` list** for DeepSeek,
+  a **validated slug field** for OpenRouter; persisted + live-reloaded.
+- `/key` — a **masked** key-entry dialog (`password=True`), saved `0o600`.
+- `/config` — the resolved config (provider/model/thinking + source; key
+  present/absent — **never the key**).
+- `/doctor` — the provider/model preflight in a dialog.
+- `/runs` — recent runs, read-only.
+- `/assume` — pick the assumption level (1–5 / auto) for the session.
+- `/clear` — clear the panes (disabled mid-run; never clobbers a live run).
+
+It's **reuse, not rebuild**: slash commands are a thin front door that launches
+the existing v0.0.16 flows (masked entry, live listing, `validate_model`,
+`persist_role`, `secrets.set_key`, the doctor/runs logic). The popover is gated to
+the idle input state, so the engine/InputRouter is undisturbed; a plain goal
+(no leading `/`) submits exactly as before. First-run guidance is now slash-native
+("type `/key` to get started, `/help` for all commands").
+
+Under that, **beta-enablement** (v0.0.16): a user who has never touched a
 `.env` can add a provider, enter a key, and pick models *in the app*. Config now
 persists to two deliberately separate files in your OS user-config dir
 (`%LOCALAPPDATA%\relay` / `~/.config/relay`, via `platformdirs`):

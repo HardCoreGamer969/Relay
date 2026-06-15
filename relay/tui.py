@@ -998,15 +998,18 @@ class RelayTuiApp(App):
         return True
 
     def _enter_first_run_setup(self) -> None:
-        """Empty-state: make the next step obvious, then open setup (escapable)."""
+        """Empty-state: teach the slash surface (the primary control plane), then
+        open setup as a fallback. Offered-but-prominent + escapable; a user with
+        working env vars/keys never reaches here."""
         self._first_run = True
         try:
             self.query_one("#hint", Static).update(
-                "Add a provider key to get started -- ctrl+s, or set RELAY_* env vars"
+                "Type  /key  to add a provider key and get started  ·  "
+                "/help  for all commands  ·  or set RELAY_* env vars"
             )
         except Exception:  # noqa: BLE001 -- hint not present
             pass
-        self.action_open_setup()
+        self.action_open_setup()  # fallback: also open the full setup screen
 
     # -- startup + handoff animations (the look layer) -------------------------
 

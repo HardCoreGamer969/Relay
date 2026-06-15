@@ -496,7 +496,7 @@ wheels = [
 
 [[package]]
 name = "relay-cli"
-version = "0.0.16"
+version = "0.0.17"
 source = { editable = "." }
 dependencies = [
     { name = "openai" },

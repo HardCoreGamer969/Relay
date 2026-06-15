@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 from dataclasses import dataclass
 from typing import Callable
 
@@ -239,6 +240,62 @@ def model_identity(models: ModelConfig) -> str:
     front and center -- so it reads as the machine's name, cleanly styled.
     """
     return f"brain ~{models.brain}  ·  hands ~{models.hands}"
+
+
+# -- friendly provider errors (the catch-all so raw API JSON never reaches a user) --
+
+# Pretty provider labels for user-facing error text (fall back to the raw id).
+_PROVIDER_LABELS = {"openrouter": "OpenRouter", "deepseek": "DeepSeek"}
+
+# Markers that betray a raw provider/API error blob (JSON / status line) we must
+# never surface verbatim.
+_RAW_ERROR_MARKERS = ("{'error'", '{"error"', "'raw'", '"raw"', "error code:", "traceback")
+
+
+def _provider_label(provider: str | None) -> str:
+    return _PROVIDER_LABELS.get(provider, provider) if provider else "The provider"
+
+
+def _is_raw_provider_error(text: str) -> bool:
+    """Whether ``text`` looks like a raw provider/API error blob (don't show it raw)."""
+    low = text.lower()
+    return any(marker in low for marker in _RAW_ERROR_MARKERS)
+
+
+def _http_status(text: str) -> str | None:
+    """Pull an HTTP-ish 4xx/5xx status code out of a provider error string."""
+    match = re.search(r"\b([45]\d\d)\b", text)
+    return match.group(1) if match else None
+
+
+def friendly_provider_error(error, *, provider: str | None = None, model: str | None = None) -> str:
+    """Render a raw provider/API error as a friendly, ASCII-safe one-liner.
+
+    THE catch-all net: at every point a provider error would reach the UI (the
+    run-error path and the slash live calls -- validation, listing, doctor), this
+    states what failed, which provider/model, and a short hint to re-pick -- and
+    NEVER includes the raw ``{'error': {... 'raw': ...}}`` payload (which may be
+    logged at debug elsewhere, but not shown). Text that does NOT look like a raw
+    provider error is returned unchanged, so a clean validation note ("'x' is not in
+    deepseek's live model list") and a plain non-provider error read normally.
+    """
+    text = str(error or "").strip()
+    if not _is_raw_provider_error(text):
+        return text
+    label = _provider_label(provider)
+    code = _http_status(text)
+    code_note = f" (HTTP {code})" if code else ""
+    if model:
+        lead = (
+            f"{label} rejected the request -- '{model}' may not be a valid {label} model"
+            if code == "400"
+            else f"{label} returned an error{code_note} for '{model}'"
+        )
+        return f"{lead}. Use /model or /provider to pick a valid one."
+    return (
+        f"{label} returned an error{code_note}. The model or provider may be invalid -- "
+        "check with /doctor, or re-pick via /model or /provider."
+    )
 
 
 def pick_greeting() -> str:
@@ -486,6 +543,7 @@ class SetupScreen(ModalScreen):
         """
         ok, note = persist_role(role, provider, model, thinking, validate_fn=self._validate_fn)
         if not ok:
+            note = friendly_provider_error(note, provider=provider, model=model)
             self._set_status(f"[red]{role} rejected:[/red] {note}")  # inline error, not saved
             return False
         self._set_status(f"[green]saved {role}: {provider} / {model}.[/green]")
@@ -1430,7 +1488,8 @@ class RelayTuiApp(App):
     def _handle_finished(self, outcome: RunOutcome) -> None:
         self._sync_transcript()  # the result turn is in the transcript by now
         if outcome.status == STATUS_ERROR:
-            self._write_conversation(f"brain (error): the run failed -- {outcome.error}")
+            detail = friendly_provider_error(outcome.error)  # never leak raw API JSON
+            self._write_conversation(f"brain (error): the run failed -- {detail}")
         elif outcome.result is None:
             # No execution happened (declined, or cancelled mid-conversation),
             # so no result turn exists; close the thread visibly anyway.
@@ -1705,6 +1764,8 @@ class RelayTuiApp(App):
         )
         if ok:
             self._on_setup_saved()  # indicator/status reflect config.json now
+        else:
+            note = friendly_provider_error(note, provider=provider, model=model)
         return ok, note
 
     def _cmd_key(self) -> None:
@@ -1782,8 +1843,9 @@ class RelayTuiApp(App):
             rows, _ = cli._run_doctor(checks, clients)
             return rows
         except Exception as exc:  # noqa: BLE001 -- never crash the TUI on a preflight
+            note = friendly_provider_error(str(exc).splitlines()[0][:120])
             return [{"role": "?", "provider": "?", "model": "?",
-                     "status": "FAILED", "note": str(exc).splitlines()[0][:120]}]
+                     "status": "FAILED", "note": note}]
 
     def _cmd_runs(self) -> None:
         """List recent runs (reusing the runlog reader) read-only in a dialog."""

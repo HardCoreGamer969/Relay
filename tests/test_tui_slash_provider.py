@@ -192,6 +192,84 @@ def test_provider_reuses_validate_and_persist(tmp_path, monkeypatch):
     asyncio.run(main())
 
 
+# --- cross-provider validation (Bug 3 guard, v0.0.19) -----------------------
+
+
+def test_provider_validates_against_the_newly_picked_provider(tmp_path):
+    """Switching a role's provider must validate the model against the NEWLY-picked
+    provider, never the role's pre-existing one. A slug validated against the wrong
+    endpoint is exactly what 400s in live use -- so spy validate_model and assert it
+    only ever saw the new provider. (openrouter -> deepseek; list provider.)"""
+    validated = []
+
+    def spy_validate(provider, model):
+        validated.append((provider, model))
+        return True, "ok"
+
+    async def main():
+        _seed_config()  # hands starts on openrouter
+        app = _app(tmp_path, validate_fn=spy_validate)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _choose_scope(pilot, app, "hands")
+            await _choose_provider(pilot, app, "deepseek")  # NEW != current (openrouter)
+            assert isinstance(app.screen, SelectDialog)
+            app.screen.choose("deepseek-v4-pro")
+            await pilot.pause()
+
+            assert ("deepseek", "deepseek-v4-pro") in validated
+            assert all(p == "deepseek" for p, _ in validated)  # never the old provider
+            assert store.load_config()["roles"]["hands"] == {
+                "provider": "deepseek", "model": "deepseek-v4-pro", "thinking": False,
+            }
+
+    asyncio.run(main())
+
+
+def test_provider_switch_to_manual_validates_against_new_provider(tmp_path):
+    """The other direction: a role CURRENTLY on deepseek, switched to openrouter
+    (manual), validates the typed slug against openrouter -- not the stale deepseek."""
+    from textual.widgets import Input
+
+    validated = []
+
+    def spy_validate(provider, model):
+        validated.append((provider, model))
+        return True, "ok"
+
+    async def main():
+        store.save_config({
+            "version": 1,
+            "roles": {
+                "brain": {"provider": "openrouter", "model": "brain-orig", "thinking": False},
+                "hands": {"provider": "deepseek", "model": "deepseek-v4-flash", "thinking": False},
+            },
+        })
+        app = RelayTuiApp(
+            root=str(tmp_path),
+            models=ModelConfig(brain="brain-orig", hands="deepseek-v4-flash", hands_provider="deepseek"),
+            client=SimpleNamespace(),
+            list_models_fn=lambda provider, **k: ["deepseek-v4-flash"],
+            validate_fn=spy_validate,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _choose_scope(pilot, app, "hands")
+            await _choose_provider(pilot, app, "openrouter")  # NEW != current (deepseek)
+            entry = app.screen  # manual -> TextEntryDialog
+            entry.query_one("#entry-input", Input).value = "openai/gpt-4o"
+            assert entry.submit() is True
+            await pilot.pause()
+
+            assert ("openrouter", "openai/gpt-4o") in validated
+            assert all(p == "openrouter" for p, _ in validated)  # never the stale deepseek
+            assert store.load_config()["roles"]["hands"] == {
+                "provider": "openrouter", "model": "openai/gpt-4o", "thinking": False,
+            }
+
+    asyncio.run(main())
+
+
 # --- no inline args ---------------------------------------------------------
 
 

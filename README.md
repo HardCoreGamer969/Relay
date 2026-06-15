@@ -43,9 +43,41 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.18 (`/provider`, a reusable segmented toggle, richer `/assume`)
+## Status — v0.0.19 (surface fixes: reachable slash, friendly errors, honest saves)
 
-Two additions on the v0.0.17 slash infrastructure, plus one new reusable primitive:
+A pass over rough edges found in live use — the kind the headless suite missed
+because they live at the boundary of real env vars, live validation, display
+refresh, and interactive state. Two were genuine bugs; three turned out already
+sound and are now pinned by regression tests so they can't quietly break later.
+
+- **`/` is reachable whenever the engine isn't generating.** The popover used to
+  open **only** when idle, so once a goal was in flight you often couldn't reach
+  slash commands. A single predicate (`_slash_allowed`) now opens it in idle **and**
+  every awaiting-you state (react / decide / approve), suppressing it **only** during
+  active planning/execution. The gate governs the popover alone — routing, the
+  engine, the bridge, and the `InputRouter` are untouched.
+- **No raw provider JSON ever reaches you.** A provider 400 used to surface as a raw
+  `Error code: 400 - {'error': {... 'raw': ...}}` blob. Every point an error can reach
+  the UI — the run-error line, the slash validation note, the setup rejection, the
+  `/doctor` preflight — now renders a friendly one-liner (what failed, which
+  provider/model, a hint to re-pick) via `friendly_provider_error`; the raw payload is
+  dropped. Clean notes pass through unchanged.
+- **A shadowed save says so.** Saving a model via `/model` or `/provider` writes
+  `config.json`, but `env > config` means a `RELAY_*_MODEL` env var (or a project
+  `.env`) silently wins — so the screen looked unchanged. The live display already
+  reloaded correctly; now `config.env_override_for` lets the app add an honest note
+  naming the overriding variable instead of looking stale. Precedence is **unchanged**
+  — this only reports the shadow.
+
+Pinned by new tests (no behavior change — already correct on v0.0.18): key
+**presence** mirrors `resolve_key`, so a key counts as present when it resolves from
+the env var **or** `auth.json` (an env-key user is never wrongly sent to first-run
+setup); and `/provider` validates + persists against the **newly-picked** provider in
+both directions, never the role's stale one.
+
+Under that, **v0.0.18** (`/provider`, a reusable segmented toggle, richer `/assume`)
+still stands — two additions on the v0.0.17 slash infrastructure, plus one new
+reusable primitive:
 
 - **`SegmentedControl`** — a general horizontal choose-one toggle (the analog of
   `SelectDialog` for a small fixed set): **left/right** cycle with wrap-around,

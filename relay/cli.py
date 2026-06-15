@@ -33,6 +33,7 @@ from relay.providers import (
     known_providers,
     list_models,
     resolve_provider,
+    validate_model,
 )
 from relay.secrets import remove_key, set_key
 from relay.store import CONFIG_VERSION, load_config, save_config
@@ -598,29 +599,12 @@ app.add_typer(config_app, name="config")
 
 
 def _validate_role_model(provider: str, model: str) -> tuple[bool, str]:
-    """Validate a (provider, model) before saving it. Never raises.
+    """Validate a (provider, model) before saving it (shared with the TUI).
 
-    For a ``manual`` provider (OpenRouter): a live preflight probe (the same kind
-    ``doctor`` uses) so a typo'd slug is rejected at entry, not at first run. For a
-    ``list`` provider (DeepSeek): the id must appear in the live ``/models`` list.
+    Manual providers (OpenRouter) get a live preflight probe; list providers
+    (DeepSeek) must appear in the live ``/models`` list. Never raises.
     """
-    try:
-        profile = resolve_provider(provider)
-    except ValueError as exc:
-        return False, str(exc)
-    try:
-        client = build_client(provider)
-    except Exception as exc:  # noqa: BLE001 -- missing key etc.: a clear note, not a traceback
-        return False, str(exc).splitlines()[0]
-    if profile.discovery == DISCOVERY_LIST:
-        try:
-            ids = list_models(provider, client=client)
-        except Exception as exc:  # noqa: BLE001
-            return False, f"could not list {provider} models: {str(exc).splitlines()[0]}"
-        if ids and model not in ids:
-            return False, f"{model!r} is not in {provider}'s live model list"
-        return True, "in live model list"
-    return _probe_model(client, model, provider)
+    return validate_model(provider, model)
 
 
 @config_app.command("show")

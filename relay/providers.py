@@ -108,3 +108,41 @@ def list_models(provider: str | ProviderProfile, *, client=None) -> list[str]:
         if mid:
             ids.append(str(mid))
     return ids
+
+
+def validate_model(provider: str | ProviderProfile, model: str, *, client=None) -> tuple[bool, str]:
+    """Validate a ``(provider, model)`` LIVE before it is saved. Never raises.
+
+    Returns ``(ok, note)``. For a ``list`` provider (DeepSeek): the id must appear
+    in the live ``/models`` list. For a ``manual`` provider (OpenRouter): a minimal
+    ``max_tokens=1`` probe -- so a typo'd slug is rejected at entry, not at the
+    first (paid) run. ``client`` may be injected (tests); else one is built.
+    """
+    try:
+        profile = resolve_provider(provider)
+    except ValueError as exc:
+        return False, str(exc)
+    if client is None:
+        from relay.client import build_client
+
+        try:
+            client = build_client(profile.id)
+        except Exception as exc:  # noqa: BLE001 -- missing key etc.: a clear note
+            return False, str(exc).splitlines()[0]
+    if profile.discovery == DISCOVERY_LIST:
+        try:
+            ids = list_models(profile.id, client=client)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"could not list {profile.id} models: {str(exc).splitlines()[0]}"
+        if ids and model not in ids:
+            return False, f"{model!r} is not in {profile.id}'s live model list"
+        return True, "in live model list"
+    # manual provider: a live preflight probe.
+    try:
+        client.chat.completions.create(
+            model=model, messages=[{"role": "user", "content": "ping"}], max_tokens=1
+        )
+        return True, "resolved"
+    except Exception as exc:  # noqa: BLE001 -- classify any failure as the note
+        text = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+        return False, text[:120]

@@ -143,6 +143,7 @@ from relay.providers import (
     known_providers,
     list_models,
     resolve_provider,
+    validate_model,
 )
 from relay.secrets import (
     get_key,
@@ -308,6 +309,7 @@ __all__ = [
     "remove_key",
     "resolve_key",
     "list_models",
+    "validate_model",
     "DISCOVERY_MANUAL",
     "DISCOVERY_LIST",
     "__version__",

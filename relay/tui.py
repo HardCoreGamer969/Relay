@@ -64,7 +64,7 @@ from relay.providers import (
     resolve_provider,
     validate_model as provider_validate_model,
 )
-from relay.secrets import set_key as secrets_set_key
+from relay.secrets import resolve_key, set_key as secrets_set_key
 from relay.store import CONFIG_VERSION, load_config, save_config
 from relay.transcript import Turn
 
@@ -593,6 +593,7 @@ class RelayTuiApp(App):
         self._greeting = pick_greeting()
         self._placeholder = pick_placeholder()  # the idle prompt phrase for this launch
         self._indicator_text = model_identity(self._models)
+        self._first_run = False  # set when the empty-state setup is offered on launch
         # The render-path buffers: exactly the strings handed to the widgets,
         # kept so headless tests can assert on the render path directly.
         self._conversation_lines: list[str] = []
@@ -626,6 +627,39 @@ class RelayTuiApp(App):
         self.query_one("#prompt", Input).focus()
         self.set_interval(_SYNC_INTERVAL_S, self._sync_transcript)
         self._play_startup()
+        # Graceful first-run: if there's no usable config (no working role+key from
+        # env OR config/auth), guide the user into setup rather than letting them
+        # type a doomed goal. Offered-but-prominent -- escapable, and a user with
+        # working env vars/keys (the developer's state) never sees it.
+        if not self._has_usable_config():
+            self.call_after_refresh(self._enter_first_run_setup)
+
+    def _has_usable_config(self) -> bool:
+        """Whether a run could actually start: both roles resolve to a provider with
+        an available key (env var OR stored auth.json). An injected client (tests)
+        counts as a working backend."""
+        if self._client is not None:
+            return True
+        for role in ROLES:
+            provider = self._models.provider_for_role(role)
+            try:
+                profile = resolve_provider(provider)
+            except ValueError:
+                return False
+            if resolve_key(profile.id, profile.key_env) is None:
+                return False
+        return True
+
+    def _enter_first_run_setup(self) -> None:
+        """Empty-state: make the next step obvious, then open setup (escapable)."""
+        self._first_run = True
+        try:
+            self.query_one("#hint", Static).update(
+                "Add a provider key to get started -- ctrl+s, or set RELAY_* env vars"
+            )
+        except Exception:  # noqa: BLE001 -- hint not present
+            pass
+        self.action_open_setup()
 
     # -- startup + handoff animations (the look layer) -------------------------
 

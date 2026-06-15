@@ -98,6 +98,22 @@
   events the engine already emits (``describe_event_for_activity``) -- adding zero
   model calls / token spend, codified by a guard test. Pure presentation: nothing
   here narrates or summarizes via a generation.
+- v0.0.16 adds **provider configuration + secrets** (beta-enablement): a persistent
+  global store in two deliberately separate files under the OS user-config dir --
+  ``config.json`` (inspectable selections + reserved picker sockets;
+  :mod:`relay.store`) and ``auth.json`` (credentials, ``0o600``, isolated in
+  :mod:`relay.secrets`; a key never touches config/logs/output). Precedence
+  preserves the env/.env workflow as highest: models resolve env > config.json >
+  default (:func:`~relay.config.resolve_role_field`), keys resolve env-key >
+  auth.json (:func:`~relay.secrets.resolve_key`). Provider profiles gain a
+  ``discovery`` mode -- OpenRouter is ``manual`` (type-a-slug, validated live),
+  DeepSeek is ``list`` (enumerates live via ``/models`` so deprecations
+  self-correct). A ``relay config`` CLI group (show / set-role / set-key [no echo]
+  / remove-key / list-models) and an in-TUI setup screen (ctrl+s: masked key entry,
+  per-role model pick, thinking toggle) let a beta user configure everything in the
+  app; an empty first-run is guided into setup (offered-but-prominent), while a
+  user with working env vars/keys goes straight to chat. The picker's ``cost_bias``
+  / ``recommendations_source`` sockets are reserved but inert.
 """
 
 from __future__ import annotations
@@ -201,7 +217,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.15"
+__version__ = "0.0.16"
 
 __all__ = [
     # v0.01 -- model layer

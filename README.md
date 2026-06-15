@@ -43,23 +43,42 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.15 (TUI polish: placeholder, proposal split, brain↔hands feed)
+## Status — v0.0.16 (provider config + secrets: configure Relay in the app)
 
-The latest pass is **render-layer TUI polish** (no engine/bridge change, no new
-tokens): (1) the input placeholder rotates through a small set and is
-**state-aware** — idle vs awaiting a reaction / decision / approval; (2) the
-**proposal split** — the conversation pane shows only the human-readable headline
-plus the surfaced assumptions, while the full numbered executor plan moves to the
-activity pane (dual fidelity, both pre-commit and in scroll-back); and (3) the
-activity pane now surfaces the **brain↔hands exchange** as an attributed,
-scrollable feed, built **entirely from events the engine already emits** — adding
-zero model calls / token spend (codified by a guard test; no narration via a
-generation). The conversation pane is the clean human story; the activity pane is
-the technical detail.
+The latest milestone is **beta-enablement**: a user who has never touched a
+`.env` can add a provider, enter a key, and pick models *in the app*. Config now
+persists to two deliberately separate files in your OS user-config dir
+(`%LOCALAPPDATA%\relay` / `~/.config/relay`, via `platformdirs`):
 
-Under that, Relay is genuinely **multi-provider** (v0.0.13). Three backend pieces
-land together (the in-TUI key entry / model picker sits on top of these and is a
-coming milestone):
+- **`config.json`** — inspectable, non-secret selections (provider/model/thinking
+  per role) plus reserved picker sockets (`cost_bias`, `recommendations_source` —
+  round-tripped but inert; the recommendation engine is the next milestone).
+- **`auth.json`** — credentials, written `0o600`, keyed by provider as a record
+  (`{"type":"api","key":...}`, room for OAuth later). All secret handling is
+  isolated in `relay/secrets.py`; a key is **never** written to `config.json`,
+  logged, printed, or put in a run record.
+
+**Precedence preserves the env/.env workflow as highest** — models resolve
+`env > config.json > default`, keys resolve `env-key > auth.json` — so a developer
+with `RELAY_*` / `OPENROUTER_API_KEY` set is unaffected; absent/corrupt files fall
+through harmlessly. Provider profiles gain a **`discovery`** mode: OpenRouter is
+`manual` (type any slug, validated live), DeepSeek is `list` (enumerates live via
+`/models`, so deprecations self-correct).
+
+Manage it from the CLI — `relay config show` (resolved values + source per role +
+key present/absent, **never the key**), `set-role` (validates the slug live before
+saving), `set-key` (entered **without echo**, stored `0o600`), `remove-key`,
+`list-models` — or in the TUI **setup screen** (`ctrl+s`): masked key entry,
+per-role model pick (a live list for DeepSeek, a validated slug for OpenRouter), a
+thinking toggle. An empty **first run** is guided into setup (offered-but-prominent;
+a configured/env user goes straight to chat).
+
+Under that, the **TUI polish** pass (v0.0.15) still stands: a rotating state-aware
+placeholder, the proposal split (conversation = headline + assumptions; activity =
+the numbered plan), and the attributed brain↔hands activity feed (zero new tokens).
+
+And under that, Relay is genuinely **multi-provider** (v0.0.13). Three backend
+pieces:
 
 1. **A model catalog** (`relay/catalog.py`). Model metadata + pricing are pulled
    from an external catalog (default [`models.dev`](https://models.dev), endpoint
@@ -486,8 +505,15 @@ relay run --goal "create a file hello.txt containing the text: hi from relay"
 relay run -g "add a hello route to a tiny flask app" --root .
 
 # The interactive TUI: a two-pane chat over the same engine (type a goal to start)
-relay tui
-relay tui --root . --assume 3
+relay tui                # first run with no key/config is guided into setup
+relay tui --root . --assume 3   # in-app: ctrl+s opens the setup screen
+
+# Configure providers/models/keys in the app (persisted globally; env still wins)
+relay config show                                   # resolved config + key present/absent (never the key)
+relay config set-role hands -p deepseek -m deepseek-v4-flash   # validated live before saving
+relay config set-key deepseek                       # prompts WITHOUT echo; stored 0o600
+relay config list-models deepseek                   # live /models (manual slug for openrouter)
+relay config remove-key deepseek
 
 # Preview: pause for approval after the brain produces the plan, before executing
 relay run -g "refactor utils.py" --confirm-plan

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import relay.secrets as secrets
 import relay.store as store
@@ -21,9 +22,11 @@ CFG = ModelConfig(brain="vendor/brain", hands="vendor/hands")
 
 
 def _app(tmp_path, **kw):
-    # client=None so this isn't auto-treated as "configured"; seams avoid network.
+    # An injected client marks the app as "configured" so first-run setup doesn't
+    # auto-open over these explicit-setup tests; the seams keep listing/validation
+    # off the network. (client is unused unless a run starts, which it never does.)
     return RelayTuiApp(
-        root=str(tmp_path), models=CFG, client=None,
+        root=str(tmp_path), models=CFG, client=SimpleNamespace(),
         list_models_fn=lambda provider, **k: ["deepseek-v4-flash", "deepseek-v4-pro"],
         validate_fn=lambda provider, model: (True, "ok"),
         **kw,
@@ -190,5 +193,61 @@ def test_save_updates_live_app_models(monkeypatch, tmp_path):
             # on_saved re-resolved load_models -> the live app reflects config.json.
             assert app._models.provider_for_role("hands") == "deepseek"
             assert app._models.for_role("hands") == "deepseek-v4-pro"
+
+    asyncio.run(main())
+
+
+# --- first-run: empty state is guided into setup; configured goes to chat ----
+
+
+def test_first_run_empty_state_opens_setup(monkeypatch, tmp_path):
+    """No env model/keys AND no config/auth -> guided into setup (offered, escapable)."""
+    monkeypatch.setenv("RELAY_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.chdir(tmp_path)  # no project .env to supply a key
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    async def main():
+        # client=None (no injected backend) + no key anywhere -> not usable.
+        app = RelayTuiApp(root=str(tmp_path), models=CFG, client=None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            assert app._first_run is True
+            assert isinstance(app.screen, SetupScreen)  # routed into setup
+            app.screen.action_close()
+            await pilot.pause()
+
+    asyncio.run(main())
+
+
+def test_configured_state_goes_straight_to_chat(monkeypatch, tmp_path):
+    """A working key (env) -> straight to chat, setup NOT auto-opened."""
+    monkeypatch.setenv("RELAY_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-present")  # both roles are openrouter
+
+    async def main():
+        app = RelayTuiApp(root=str(tmp_path), models=CFG, client=None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            assert app._first_run is False
+            assert not isinstance(app.screen, SetupScreen)  # straight to chat
+
+    asyncio.run(main())
+
+
+def test_injected_client_is_treated_as_configured(monkeypatch, tmp_path):
+    monkeypatch.setenv("RELAY_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    async def main():
+        app = _app(tmp_path)  # injected client
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            assert app._has_usable_config() is True
+            assert not isinstance(app.screen, SetupScreen)
 
     asyncio.run(main())

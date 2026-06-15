@@ -1131,6 +1131,15 @@ class RelayTuiApp(App):
         # The last "your save was shadowed by an env var" note (mirrored for tests;
         # "" when the most recent save landed as the resolved value).
         self._save_notice = ""
+        # Two-tier cost (v0.0.20), both mirrored for tests; Relay SHOWS spend and lets
+        # the user stop -- it never caps:
+        #  - _goal_cost: the CURRENT goal's live cost; reset on a new goal but kept
+        #    showing the last goal's total while idle (never blinks to $0 on finish).
+        #  - _session_cost: cumulative over FINISHED goals this session; folded at
+        #    finish, cleared only on quit or a manual /cost reset.
+        self._goal_cost = 0.0
+        self._session_cost = 0.0
+        self._cost_visible = True  # status-line counter shown by default (/cost toggles)
         self._first_run = False  # set when the empty-state setup is offered on launch
         # The render-path buffers: exactly the strings handed to the widgets,
         # kept so headless tests can assert on the render path directly.
@@ -1389,6 +1398,7 @@ class RelayTuiApp(App):
         self.query_one("#working").display = True
 
     def _start_run(self, goal: str) -> None:
+        self._goal_cost = 0.0  # a new goal: zero the per-goal counter (session untouched)
         self._seen_turn_ids.clear()  # fresh transcript: turn ids restart at t0
         if self._conversation_lines:
             self._write_conversation("")  # a blank line between runs
@@ -1461,6 +1471,7 @@ class RelayTuiApp(App):
                     self._write_activity(f"    {observation[:200]}", dim=True)
             self._render_plan_split(event)
         self._sync_transcript()
+        self._refresh_cost()  # live per-goal cost off the run's ledger (no model call)
         self._update_status()
 
     def _render_plan_split(self, event: Event) -> None:
@@ -1498,6 +1509,13 @@ class RelayTuiApp(App):
         cost_note = "" if cost is None else f" (cost ${cost:.4f})"
         self._write_activity(f"[finished] {outcome.status}{cost_note}")
         self._router.finish_run()
+        # Two-tier cost: fold the goal's final cost into the session cumulative. We flip
+        # to IDLE first (finish_run above), so _session_total() -- which adds the live
+        # goal only while in-flight -- never double-counts the fold. The per-goal
+        # counter keeps showing this goal's total until the next goal starts.
+        if cost is not None:
+            self._goal_cost = cost
+            self._session_cost += cost
         self._update_status()
 
     # -- conversation pane: rendered from the Transcript ------------------------
@@ -1552,15 +1570,58 @@ class RelayTuiApp(App):
     def _update_status(self) -> None:
         state = self._router.state
         hint = _STATE_HINTS.get(state, "")
-        self._status_text = (
+        base = (
             f"[{state.value}] {hint}  |  "
             f"brain={self._models.brain}  hands={self._models.hands}"
         )
-        self.query_one("#status", Static).update(self._status_text)
+        cost = self._cost_segment()
+        # The plain buffer is what headless tests assert on; the widget gets a styled
+        # render so the cost segment can stand out (and pulse on a change in v0.0.20).
+        self._status_text = f"{base}  |  {cost}" if cost else base
+        text = Text(base)
+        if cost:
+            text.append("  |  ", style="dim")
+            text.append(cost, style="green")
+        self.query_one("#status", Static).update(text)
         # The input box's placeholder tracks what a submit now means (Fix 1).
         self.query_one("#prompt", Input).placeholder = placeholder_for_state(
             state, self._placeholder
         )
+
+    # -- live cost: a two-tier counter (per-goal + session); reads ALREADY-tracked
+    # cost off the run's ledger, so the whole path makes ZERO model calls. Relay
+    # SHOWS spend and lets the user stop -- it never imposes a cap.
+
+    def _run_in_flight(self) -> bool:
+        """Whether a run is live (any non-idle router state) -- drives the 'esc to
+        stop' affordance and whether the session rollup includes the live goal."""
+        return self._router.state is not InputState.IDLE
+
+    def _cost_segment(self) -> str:
+        """The status-line cost text (``""`` when hidden via the toggle). Shows the
+        current goal's cost; while a run is in flight it also shows the stop cue."""
+        if not self._cost_visible:
+            return ""
+        cost = f"${self._goal_cost:.4f}"
+        return f"{cost} · esc to stop" if self._run_in_flight() else cost
+
+    def _session_total(self) -> float:
+        """Session spend: folded finished goals plus the live current goal while a run
+        is in flight (so it reflects the in-flight goal without double-counting once
+        that goal is folded into ``_session_cost`` at finish)."""
+        live = self._goal_cost if self._run_in_flight() else 0.0
+        return self._session_cost + live
+
+    def _refresh_cost(self) -> None:
+        """Read the live per-goal cost off the active run's ledger. Cost is ALREADY
+        tracked (telemetry), so this makes NO model call; a no-op when unchanged."""
+        runner = self._runner
+        if runner is None:
+            return
+        cost = runner.ledger.total_cost()
+        if cost is None or cost == self._goal_cost:
+            return
+        self._goal_cost = cost
 
     # -- the setup / picker flow ------------------------------------------------
 

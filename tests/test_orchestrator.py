@@ -666,3 +666,65 @@ def test_no_cancel_check_changes_nothing(tmp_path):
         committed_plan=_committed("create a.txt"),
     )
     assert result.status == STATUS_COMPLETED
+
+
+# --- v0.0.20: fast cancel BETWEEN executor calls (not only step boundaries) ---
+
+
+def test_cancel_halts_between_executor_calls_within_a_step(tmp_path):
+    """A cancel set mid-step halts at the next executor-CALL boundary: the step does
+    NOT run its full call budget, no further call is issued after the cancel point,
+    the run ends cancelled, and (crucially) no replan/brain call is spent."""
+    state = {"hands": 0}
+
+    class _NeverDoneClient:
+        """Hands that never emit <done> -- so without a mid-step cancel the step would
+        burn its entire executor budget. Counts every model call."""
+
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        def _create(self, *, model, **kwargs):
+            state["hands"] += 1
+            return _resp('<read path="x"/>')  # a valid action, never <done>
+
+        @property
+        def calls(self):
+            return [{"model": "vendor/hands"}] * state["hands"]
+
+    client = _NeverDoneClient()
+    result = run_planned(
+        "one big step", tmp_path, models=CFG, client=client, supervise=False,
+        committed_plan=_committed("a long multi-call step"),
+        max_executor_steps=12,
+        cancel_check=lambda: state["hands"] >= 3,  # cancel after 3 calls have returned
+    )
+
+    assert result.status == STATUS_CANCELLED
+    assert state["hands"] == 3                       # halted at the call boundary, not 12
+    assert result.plan.steps[0].status == "pending"  # step not marked done/failed
+    # No replan/brain call was spent after the cancel (supervise off; only hands ran).
+
+
+def test_fast_cancel_does_not_fire_when_step_completes_first(tmp_path):
+    """If the step finishes before the cancel threshold, the per-call check is inert
+    -- the step completes normally (the knob never changes a non-cancelled run)."""
+    state = {"hands": 0}
+
+    class _DoneClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        def _create(self, *, model, **kwargs):
+            state["hands"] += 1
+            return _resp('<edit path="a.txt">A</edit>\n<done>made a.txt</done>')
+
+    client = _DoneClient()
+    result = run_planned(
+        "g", tmp_path, models=CFG, client=client, supervise=False,
+        committed_plan=_committed("create a.txt"),
+        cancel_check=lambda: state["hands"] >= 99,  # never trips
+    )
+    assert result.status == STATUS_COMPLETED
+    assert state["hands"] == 1
+    assert (tmp_path / "a.txt").exists()

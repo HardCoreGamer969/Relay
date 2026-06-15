@@ -1148,6 +1148,7 @@ class RelayTuiApp(App):
         self._cost_visible = True  # status-line counter shown by default (/cost toggles)
         self._cost_pulse = False   # transient highlight while the counter is climbing
         self._cost_pulse_timer = None
+        self._stopping = False     # esc pressed; awaiting the next safe stop boundary
         self._first_run = False  # set when the empty-state setup is offered on launch
         # The render-path buffers: exactly the strings handed to the widgets,
         # kept so headless tests can assert on the render path directly.
@@ -1408,6 +1409,7 @@ class RelayTuiApp(App):
     def _start_run(self, goal: str) -> None:
         self._goal_cost = 0.0  # a new goal: zero the per-goal counter (session untouched)
         self._cost_pulse = False
+        self._stopping = False
         self._seen_turn_ids.clear()  # fresh transcript: turn ids restart at t0
         if self._conversation_lines:
             self._write_conversation("")  # a blank line between runs
@@ -1517,6 +1519,7 @@ class RelayTuiApp(App):
         cost = self._runner.ledger.total_cost() if self._runner is not None else None
         cost_note = "" if cost is None else f" (cost ${cost:.4f})"
         self._write_activity(f"[finished] {outcome.status}{cost_note}")
+        self._stopping = False  # the stop landed (or the run ended on its own)
         self._router.finish_run()
         # Two-tier cost: fold the goal's final cost into the session cumulative. We flip
         # to IDLE first (finish_run above), so _session_total() -- which adds the live
@@ -1612,7 +1615,9 @@ class RelayTuiApp(App):
         if not self._cost_visible:
             return ""
         cost = f"${self._goal_cost:.4f}"
-        return f"{cost} · esc to stop" if self._run_in_flight() else cost
+        if not self._run_in_flight():
+            return cost
+        return f"{cost} · stopping..." if self._stopping else f"{cost} · esc to stop"
 
     def _session_total(self) -> float:
         """Session spend: folded finished goals plus the live current goal while a run
@@ -2042,7 +2047,14 @@ class RelayTuiApp(App):
         runner = self._runner
         if runner is not None and runner.is_running:
             runner.cancel()
-            self._write_activity("[cancel] stop requested (takes effect at the next step boundary)")
+            # Instant, visible acknowledgment -- never a silent cancel. The cancel flag
+            # is set now; the engine halts at the next executor-CALL boundary (after the
+            # in-flight call returns), so a long multi-call step stops within ~one call's
+            # latency instead of running to the end of the step. The in-flight request is
+            # never torn down (the money-leak guard); the worker still joins cleanly.
+            self._stopping = True
+            self._write_activity("[cancel] stopping... (halts after the current call returns)")
+            self._update_status()
 
     async def action_quit(self) -> None:
         """Quit WITHOUT orphaning the worker: cancel, join (bounded), then exit."""

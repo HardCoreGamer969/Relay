@@ -247,3 +247,28 @@ def test_cost_command_shows_totals_toggles_and_resets(tmp_path):
             assert app._goal_cost == 0.01  # per-goal untouched by the reset
 
     asyncio.run(main())
+
+
+# --- fast esc-to-stop: instant ack (UI side) ---------------------------------
+
+
+def test_esc_instant_ack_and_clean_join(tmp_path):
+    """esc acknowledges instantly (never silent) and the worker still joins cleanly --
+    the money-leak guard is intact (we only set the cancel flag + show the ack)."""
+    async def main():
+        app = _app(tmp_path, client=_NoCostParking())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _submit(pilot, app, "go")  # starts a run; the worker parks on the ask
+            assert await _until(pilot, lambda: app._runner is not None and app._runner.is_running)
+
+            # esc: assert the ack BEFORE any await, so the marshaled finish can't run yet.
+            app.action_cancel_run()
+            assert app._stopping is True
+            assert any("stopping" in line.lower() for line in app._activity_lines)
+            assert "stopping" in app._cost_segment().lower()
+
+            # the worker still terminates cleanly (clean join; money-leak guard intact).
+            assert await _until(pilot, lambda: not app._runner.is_running)
+
+    asyncio.run(main())

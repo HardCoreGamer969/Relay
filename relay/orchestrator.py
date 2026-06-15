@@ -150,6 +150,7 @@ class _StepOutcome:
     transcript: list[str] = field(default_factory=list)  # what the executor did
     unresolved: bool = False   # a product-decision escalation could not be resolved
     unresolved_question: str = ""
+    cancelled: bool = False    # the user cancelled between executor calls (clean stop)
 
 
 @dataclass
@@ -216,12 +217,20 @@ def _run_executor_step(
     emit: Callable[[str, str, dict], None] | None = None,
     resolve_question: Callable[[str], _QuestionResolution] | None = None,
     extra_instruction: str | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> _StepOutcome:
     """Run the hands in a fresh, narrow context until done/blocked/budget/question.
 
     On a ``<question>`` the executor pauses: ``resolve_question`` is consulted
     (the brain answers or escalates); a returned answer is fed back as an
     observation and the step continues; an unresolved escalation ends the step.
+
+    ``cancel_check`` is the fast-stop seam (v0.0.20): consulted at each executor-CALL
+    boundary (before issuing the next call), so a cancel set mid-step halts after the
+    current in-flight call returns -- typically within one call's latency -- instead
+    of waiting for the whole step. The in-flight call is NEVER torn down (its tokens
+    are already committed); we simply stop before the next one (the soonest SAFE stop,
+    preserving the money-leak guard).
     """
     messages: list[dict[str, str]] = [
         {"role": "system", "content": EXECUTOR_SYSTEM_PROMPT},
@@ -232,6 +241,14 @@ def _run_executor_step(
     calls = 0
 
     for _ in range(max(max_steps, 0)):
+        # Fast cancel: poll BEFORE issuing the next call. A cancel that arrived during
+        # the previous in-flight call is caught here, so we stop without tearing down
+        # a request mid-flight and without spending another call.
+        if cancel_check is not None and cancel_check():
+            return _StepOutcome(
+                False, cancelled=True, failure_reason="cancelled by user",
+                calls=calls, transcript=transcript,
+            )
         reply = call_model(hands_role, messages, models=models, ledger=ledger, client=client).text
         calls += 1
         messages.append({"role": "assistant", "content": reply})
@@ -396,11 +413,14 @@ def run_planned(
     thread, so the question reads as a continuation. After the run a readable,
     post-execution compaction pass produces ``result.transcript_compacted``.
 
-    ``cancel_check`` is the coarse cancel seam (a TUI/UI hands it a "did the
-    user ask to stop?" probe): consulted at STEP BOUNDARIES only -- before each
-    step starts, never mid-model-call. When it returns True the run ends with
-    the clean terminal status ``cancelled`` (result turn + compaction still
-    happen, like every other terminal path).
+    ``cancel_check`` is the cancel seam (a TUI/UI hands it a "did the user ask to
+    stop?" probe): consulted at step boundaries AND at each executor-CALL boundary
+    within a step (v0.0.20) -- before issuing the next model call, never mid-call. So
+    a cancel set during a long multi-call step halts after the current in-flight call
+    returns (typically within one call's latency), not at the end of the whole step;
+    the in-flight request is never torn down (the money-leak guard). When it returns
+    True the run ends with the clean terminal status ``cancelled`` (result turn +
+    compaction still happen, like every other terminal path).
 
     Note: a single step's executor ceiling is ``max_executor_steps *
     (1 + max_followups_per_step)`` (each supervised follow-up re-runs the
@@ -531,11 +551,17 @@ def run_planned(
         outcome = _run_executor_step(
             step, plan, goal, tools, hands_role=hands_role, models=models, ledger=ledger,
             client=client, max_steps=step_budget, emit=emit, resolve_question=resolver,
+            cancel_check=cancel_check,
         )
         executor_calls += outcome.calls
         followups_used = 0
 
         while True:
+            # Fast cancel short-circuits BEFORE the failed/replan path, so a user stop
+            # mid-step does not spend a brain replan call (it's a clean cancel, not a
+            # failure). The outer loop then ends the run with the cancelled status.
+            if outcome.cancelled:
+                return _Disposition("cancelled", records=records)
             if outcome.unresolved:
                 return _Disposition("unresolved", unresolved_question=outcome.unresolved_question, records=records)
             if not outcome.success:
@@ -572,7 +598,7 @@ def run_planned(
             outcome = _run_executor_step(
                 step, plan, goal, tools, hands_role=hands_role, models=models, ledger=ledger,
                 client=client, max_steps=step_budget, emit=emit, resolve_question=resolver,
-                extra_instruction=review.followup,
+                extra_instruction=review.followup, cancel_check=cancel_check,
             )
             executor_calls += outcome.calls
 
@@ -610,6 +636,14 @@ def run_planned(
         # Persist the brain's review records (provenance: this step's review).
         for kind, detail, summary in disposition.records:
             remember(kind, detail, summary, provenance=f"step{step.index} review")
+
+        if disposition.kind == "cancelled":
+            # Fast cancel landed between executor calls within the step: end the run on
+            # the existing clean terminal status (result turn + compaction still happen
+            # via finalize), without marking the step or spending a replan.
+            result.status = STATUS_CANCELLED
+            emit("status", "run cancelled by user mid-step", {"status": STATUS_CANCELLED})
+            break
 
         if disposition.kind == "unresolved":
             result.status = STATUS_UNRESOLVED_ESCALATION

@@ -1027,6 +1027,8 @@ COMMANDS: list[Command] = [
             run=lambda app: app._cmd_runs()),
     Command("assume", "Assume", "Set the assumption level for this session", "ops",
             run=lambda app: app._cmd_assume()),
+    Command("cost", "Cost", "Session + per-goal spend; toggle / reset the counter", "ops",
+            run=lambda app: app._cmd_cost()),
     Command("clear", "Clear", "Clear the conversation + activity panes", "ops",
             run=lambda app: app._cmd_clear(), enabled=lambda app: not _run_active(app)),
 ]
@@ -1987,6 +1989,38 @@ class RelayTuiApp(App):
 
     def _set_assume(self, level: str) -> None:
         self._assumption_level = level
+        self._update_status()
+
+    def _cmd_cost(self) -> None:
+        """Show session + per-goal spend, and offer toggle / reset. Dialog-driven (no
+        inline args); cost is already tracked so opening this makes NO model call.
+        Relay SHOWS spend and lets YOU decide when to stop -- it never caps."""
+        session = self._session_total()
+        options = [
+            {"title": f"Session total: ${session:.4f}", "value": "__session__", "category": "spend",
+             "description": "Cumulative across all goals since launch or last reset"},
+            {"title": f"This goal: ${self._goal_cost:.4f}", "value": "__goal__", "category": "spend",
+             "description": "The current goal's cost (or the last goal's, while idle)"},
+            {"title": f"Live counter: {'on' if self._cost_visible else 'off'}", "value": "__toggle__",
+             "category": "actions", "description": "Show/hide the status-line per-goal counter",
+             "on_select": (lambda v: self._toggle_cost_counter())},
+            {"title": "Reset session total", "value": "__reset__", "category": "actions",
+             "description": "Zero the session figure (a deliberate break; leaves the goal "
+                            "counter and any run untouched)",
+             "on_select": (lambda v: self._reset_session_cost())},
+        ]
+        self.push_screen(SelectDialog(
+            title="Cost (Relay shows spend; you decide when to stop)", options=options))
+
+    def _toggle_cost_counter(self) -> None:
+        """Show/hide the status-line per-goal counter (the /cost toggle)."""
+        self._cost_visible = not self._cost_visible
+        self._update_status()
+
+    def _reset_session_cost(self) -> None:
+        """Zero the session cumulative -- a deliberate manual break. Does NOT touch the
+        per-goal counter or any in-flight run."""
+        self._session_cost = 0.0
         self._update_status()
 
     def _cmd_clear(self) -> None:

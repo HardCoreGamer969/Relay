@@ -19,7 +19,7 @@ from textual.widgets import Input
 
 from relay.bridge import RunOutcome
 from relay.config import ModelConfig
-from relay.tui import RelayTuiApp
+from relay.tui import COMMANDS, RelayTuiApp, SelectDialog
 
 CFG = ModelConfig(brain="vendor/brain", hands="vendor/hands")
 
@@ -208,5 +208,42 @@ def test_cost_path_makes_zero_model_calls(tmp_path):
             app._update_status()  # styled render
             app._end_cost_pulse() # revert
             assert calls["n"] == 0  # zero model calls across the whole cost/anim path
+
+    asyncio.run(main())
+
+
+# --- the /cost command -------------------------------------------------------
+
+
+def test_cost_command_is_registered():
+    assert "cost" in {c.name for c in COMMANDS}
+
+
+def test_cost_command_shows_totals_toggles_and_resets(tmp_path):
+    async def main():
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._goal_cost = 0.01
+            app._session_cost = 0.05
+            app._cmd_cost()
+            await pilot.pause()
+            dialog = app.screen
+            assert isinstance(dialog, SelectDialog)
+            titles = " ".join(o.get("title", "") for o in dialog._options)
+            assert "$0.0500" in titles   # session total (idle -> just _session_cost)
+            assert "$0.0100" in titles   # the per-goal figure
+
+            # "Toggle live counter" hides the status-line counter.
+            toggle = next(o for o in dialog._options if o["value"] == "__toggle__")
+            toggle["on_select"]("__toggle__")
+            assert app._cost_visible is False
+            assert app._cost_segment() == ""
+
+            # "Reset session total" zeroes the session WITHOUT touching the goal counter.
+            reset = next(o for o in dialog._options if o["value"] == "__reset__")
+            reset["on_select"]("__reset__")
+            assert app._session_cost == 0.0
+            assert app._goal_cost == 0.01  # per-goal untouched by the reset
 
     asyncio.run(main())

@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import asyncio
 import random
+from dataclasses import dataclass
+from typing import Callable
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -55,7 +57,14 @@ from relay.bridge import (
     RunOutcome,
     UiRequest,
 )
-from relay.config import ROLES, ModelConfig, describe_resolution, default_config, load_models
+from relay.config import (
+    ASSUMPTION_LEVELS,
+    ROLES,
+    ModelConfig,
+    describe_resolution,
+    default_config,
+    load_models,
+)
 from relay.orchestrator import Event
 from relay.providers import (
     DISCOVERY_LIST,
@@ -329,6 +338,32 @@ def setup_summary() -> str:
     return "\n".join(lines)
 
 
+def persist_role(
+    role: str, provider: str, model: str, thinking: bool, *, validate_fn=None
+) -> tuple[bool, str]:
+    """Validate a (provider, model) live, then persist the role to config.json.
+
+    The ONE place a role selection is written -- shared by the SetupScreen and the
+    ``/model`` slash command so they can never fork (same validation, same write).
+    ``validate_fn`` defaults to the shared :func:`relay.providers.validate_model`.
+    Returns ``(saved?, note)``; does not persist on validation failure.
+    """
+    validate_fn = validate_fn or provider_validate_model
+    model = (model or "").strip()
+    if not model:
+        return False, "enter a model id"
+    ok, note = validate_fn(provider, model)
+    if not ok:
+        return False, note
+    config = load_config() or default_config()
+    config.setdefault("version", CONFIG_VERSION)
+    config.setdefault("roles", {})[role] = {
+        "provider": provider, "model": model, "thinking": bool(thinking),
+    }
+    save_config(config)
+    return True, note
+
+
 class SetupScreen(ModalScreen):
     """In-TUI provider setup: enter a key (masked), pick per-role models, toggle
     thinking -- for a beta user with no terminal/.env knowledge.
@@ -437,21 +472,15 @@ class SetupScreen(ModalScreen):
         return True
 
     def save_role(self, role: str, provider: str, model: str, thinking: bool) -> bool:
-        """Validate (live) and persist a role's provider/model/thinking. Returns saved?."""
-        model = (model or "").strip()
-        if not model:
-            self._set_status(f"[red]{role}: enter a model id.[/red]")
-            return False
-        ok, note = self._validate_fn(provider, model)
+        """Validate (live) and persist a role's provider/model/thinking. Returns saved?.
+
+        Delegates to the shared :func:`persist_role` (same path the ``/model`` slash
+        command uses) so validation + persistence never fork.
+        """
+        ok, note = persist_role(role, provider, model, thinking, validate_fn=self._validate_fn)
         if not ok:
             self._set_status(f"[red]{role} rejected:[/red] {note}")  # inline error, not saved
             return False
-        config = load_config() or default_config()
-        config.setdefault("version", CONFIG_VERSION)
-        config.setdefault("roles", {})[role] = {
-            "provider": provider, "model": model, "thinking": bool(thinking),
-        }
-        save_config(config)
         self._set_status(f"[green]saved {role}: {provider} / {model}.[/green]")
         self._refresh_summary()
         self._notify_saved()
@@ -513,6 +542,303 @@ class SetupScreen(ModalScreen):
         self.dismiss()
 
 
+# ============================================================================
+# Slash commands: a dialog-driven control plane (v0.0.17)
+# ============================================================================
+#
+# Typing "/" in the prompt opens a filterable popover of commands; each command's
+# run() opens a DIALOG or performs a clean no-arg action. NO command parses inline
+# arguments, and NO command (especially /key) ever reads a value out of the prompt
+# text. Slash commands are a thin front door that LAUNCHES the existing v0.0.16
+# flows (masked key entry, live model listing, validation, persistence, doctor,
+# runs) -- they reuse those functions, never fork them.
+
+
+@dataclass(frozen=True)
+class Command:
+    """One slash command as a data record.
+
+    ``name`` is the slash trigger (``"model"`` -> typed ``/model``); ``title`` /
+    ``description`` are human text; ``category`` groups it in lists; ``run(app)``
+    opens a dialog or performs the action (it takes only the app -- never a value
+    parsed from the input); ``enabled(app)`` optionally hides the command in the
+    current state (e.g. mid-run). Adding a command is adding a record to
+    :data:`COMMANDS`.
+    """
+
+    name: str
+    title: str
+    description: str
+    category: str
+    run: Callable  # run(app) -> None
+    enabled: Callable | None = None  # enabled(app) -> bool
+
+
+def _run_active(app) -> bool:
+    """Whether a run is in flight (used by ``enabled`` predicates)."""
+    runner = getattr(app, "_runner", None)
+    return runner is not None and getattr(runner, "is_running", False)
+
+
+def visible_commands(app) -> list[Command]:
+    """Commands available in the app's current state (``enabled`` honored)."""
+    return [c for c in COMMANDS if c.enabled is None or c.enabled(app)]
+
+
+def filter_commands(app, query: str) -> list[Command]:
+    """Visible commands whose name/title matches ``query`` (substring; empty = all)."""
+    q = (query or "").strip().lower()
+    out = []
+    for command in visible_commands(app):
+        if not q or q in command.name.lower() or q in command.title.lower():
+            out.append(command)
+    return out
+
+
+class PromptInput(Input):
+    """The main prompt input. When the slash popover is open it routes up/down/esc
+    to the popover (Enter is handled via ``Input.Submitted`` in the app)."""
+
+    def on_key(self, event) -> None:
+        app = self.app
+        if not getattr(app, "_popover_open", False):
+            return
+        if event.key == "down":
+            app._popover_move(1); event.prevent_default(); event.stop()
+        elif event.key == "up":
+            app._popover_move(-1); event.prevent_default(); event.stop()
+        elif event.key == "escape":
+            app._popover_close(); event.prevent_default(); event.stop()
+
+
+class FilterInput(Input):
+    """A dialog's filter field: up/down move the dialog highlight (the screen owns
+    selection); typing filters via the screen's ``apply_filter``."""
+
+    def on_key(self, event) -> None:
+        screen = self.screen
+        if event.key == "down" and hasattr(screen, "move"):
+            screen.move(1); event.prevent_default(); event.stop()
+        elif event.key == "up" and hasattr(screen, "move"):
+            screen.move(-1); event.prevent_default(); event.stop()
+
+
+_DIALOG_CSS = """
+SelectDialog, TextEntryDialog { align: center middle; }
+#dialog-box {
+    width: 80%; max-width: 100; height: auto; max-height: 90%;
+    padding: 1 2; border: double $primary; background: $surface;
+}
+#dialog-title { text-style: bold; content-align: center middle; }
+#dialog-list { margin: 1 0; }
+#dialog-hint, #entry-hint { color: $text-muted; text-style: dim; margin-top: 1; }
+#dialog-filter, #entry-input { margin-bottom: 1; }
+#entry-status { margin-top: 1; }
+"""
+
+
+class SelectDialog(ModalScreen):
+    """One generic filterable selection dialog -- the primitive every list command
+    (``/help``, ``/model``, ``/config``, ``/doctor``, ``/runs``, ``/assume``) opens.
+
+    ``options`` is a list of dicts: ``{title, value, description?, category?,
+    on_select?}``. Options are grouped by ``category`` when present; typing filters,
+    arrows move, Enter calls the highlighted option's ``on_select(value)``.
+    """
+
+    BINDINGS = [("escape", "close", "Close")]
+    CSS = _DIALOG_CSS
+
+    def __init__(self, *, title: str, options: list[dict]) -> None:
+        super().__init__()
+        self._title = title
+        self._options = list(options)
+        self._visible: list[dict] = list(self._options)
+        self._highlight = 0
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="dialog-box"):
+            yield Static(self._title, id="dialog-title")
+            yield FilterInput(placeholder="type to filter...", id="dialog-filter")
+            yield Static(id="dialog-list")
+            yield Static("up/down move  ·  enter choose  ·  esc close", id="dialog-hint")
+
+    def on_mount(self) -> None:
+        self.apply_filter("")
+        self.query_one("#dialog-filter", Input).focus()
+
+    # -- testable core --------------------------------------------------------
+
+    def apply_filter(self, text: str) -> None:
+        q = (text or "").strip().lower()
+
+        def match(option: dict) -> bool:
+            hay = " ".join(
+                str(option.get(k, "")) for k in ("title", "value", "description", "category")
+            ).lower()
+            return not q or q in hay
+
+        self._visible = [o for o in self._options if match(o)]
+        self._highlight = 0
+        self._refresh_list()
+
+    def visible_values(self) -> list:
+        return [o.get("value") for o in self._visible]
+
+    def move(self, delta: int) -> None:
+        if not self._visible:
+            return
+        self._highlight = max(0, min(len(self._visible) - 1, self._highlight + delta))
+        self._refresh_list()
+
+    def select_highlighted(self) -> None:
+        if self._visible:
+            self.choose(self._visible[self._highlight].get("value"))
+
+    def choose(self, value) -> None:
+        """Dismiss and invoke the chosen option's ``on_select`` (if any)."""
+        chosen = next((o for o in self._visible if o.get("value") == value), None)
+        if chosen is None:
+            return
+        self.dismiss()
+        callback = chosen.get("on_select")
+        if callback is not None:
+            callback(value)
+
+    # -- rendering ------------------------------------------------------------
+
+    def _refresh_list(self) -> None:
+        # NOTE: do NOT name this ``_render`` -- that shadows Textual's
+        # ``Widget._render`` (which must return a Visual) and renders the screen None.
+        try:
+            widget = self.query_one("#dialog-list", Static)
+        except Exception:  # noqa: BLE001 -- not mounted (headless logic-only use)
+            return
+        widget.update(self._list_renderable())
+
+    def _list_renderable(self) -> Text:
+        text = Text()
+        if not self._visible:
+            text.append("(no matches)", style="dim")
+            return text
+        last_category = object()
+        for i, option in enumerate(self._visible):
+            category = option.get("category")
+            if category and category != last_category:
+                text.append(f"{category}\n", style="bold")
+                last_category = category
+            marker = "> " if i == self._highlight else "  "
+            style = "reverse" if i == self._highlight else ""
+            line = f"{marker}{option.get('title', option.get('value', ''))}"
+            text.append(line, style=style)
+            desc = option.get("description")
+            if desc:
+                text.append(f"  -  {desc}", style="dim")
+            text.append("\n")
+        return text
+
+    # -- widget wiring --------------------------------------------------------
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "dialog-filter":
+            event.stop()
+            self.apply_filter(event.value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "dialog-filter":
+            event.stop()
+            self.select_highlighted()
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+
+class TextEntryDialog(ModalScreen):
+    """A single-field entry dialog -- masked (``password=True``) for a key, plain
+    for a manual model slug. ``on_submit(value) -> (ok, note)``; the dialog stays
+    open (showing the note) on failure, dismisses on success. The value is read
+    ONLY from this dialog's own field -- never from the chat prompt."""
+
+    BINDINGS = [("escape", "close", "Close")]
+    CSS = _DIALOG_CSS
+
+    def __init__(
+        self, *, title: str, label: str, on_submit, password: bool = False,
+        placeholder: str = "",
+    ) -> None:
+        super().__init__()
+        self._title = title
+        self._label = label
+        self._on_submit = on_submit
+        self._password = password
+        self._placeholder = placeholder
+        self.status_text = ""
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="dialog-box"):
+            yield Static(self._title, id="dialog-title")
+            yield Label(self._label)
+            yield Input(password=self._password, placeholder=self._placeholder, id="entry-input")
+            yield Button("Save", id="entry-save", variant="primary")
+            yield Static("", id="entry-status")
+            yield Static("enter to save  ·  esc to cancel", id="entry-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#entry-input", Input).focus()
+
+    def submit(self) -> bool:
+        """Read THIS dialog's field and hand it to ``on_submit``. Returns saved?."""
+        value = self.query_one("#entry-input", Input).value
+        ok, note = self._on_submit(value)
+        if ok:
+            self.dismiss()
+            return True
+        self._set_status(f"[red]{note}[/red]")
+        return False
+
+    def _set_status(self, message: str) -> None:
+        self.status_text = message
+        try:
+            self.query_one("#entry-status", Static).update(message)
+        except Exception:  # noqa: BLE001 -- not mounted
+            pass
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "entry-save":
+            event.stop()
+            self.submit()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "entry-input":
+            event.stop()
+            self.submit()
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+
+# The registry -- one list; adding a command is adding a record. run(app) opens a
+# dialog or does a clean action. Categories group the list in /help and the popover.
+COMMANDS: list[Command] = [
+    Command("help", "Help", "List all commands", "general",
+            run=lambda app: app._cmd_help()),
+    Command("model", "Model", "Pick the model for a role", "config",
+            run=lambda app: app._cmd_model()),
+    Command("key", "Key", "Add a provider API key (masked)", "config",
+            run=lambda app: app._cmd_key()),
+    Command("config", "Config", "Show the resolved config", "config",
+            run=lambda app: app._cmd_config()),
+    Command("doctor", "Doctor", "Preflight each role's provider/model", "ops",
+            run=lambda app: app._cmd_doctor()),
+    Command("runs", "Runs", "List recent runs", "ops",
+            run=lambda app: app._cmd_runs()),
+    Command("assume", "Assume", "Set the assumption level for this session", "ops",
+            run=lambda app: app._cmd_assume()),
+    Command("clear", "Clear", "Clear the conversation + activity panes", "ops",
+            run=lambda app: app._cmd_clear(), enabled=lambda app: not _run_active(app)),
+]
+
+
 class RelayTuiApp(App):
     """A welcome screen that hands off to a two-pane chat over the engine."""
 
@@ -549,6 +875,17 @@ class RelayTuiApp(App):
         color: $text-muted;
     }
     #status { height: 1; padding: 0 1; background: $surface; }
+
+    /* -- the slash-command popover (shown only while typing a /command) -- */
+    #command-popover {
+        display: none;
+        height: auto;
+        max-height: 12;
+        margin: 0 1;
+        padding: 0 1;
+        border: round $primary;
+        background: $surface;
+    }
     """
 
     BINDINGS = [
@@ -569,6 +906,8 @@ class RelayTuiApp(App):
         anim_mode: str = "short",
         list_models_fn=None,
         validate_fn=None,
+        doctor_fn=None,
+        runs_fn=None,
     ) -> None:
         super().__init__()
         self._root = root
@@ -577,6 +916,13 @@ class RelayTuiApp(App):
         # Setup-flow seams (injected by tests; default to the real provider funcs).
         self._list_models_fn = list_models_fn
         self._validate_fn = validate_fn
+        # Slash-command seams (injected by tests; default to the real CLI logic).
+        self._doctor_fn = doctor_fn
+        self._runs_fn = runs_fn
+        # The slash-command popover state (mirrored for headless tests).
+        self._popover_open = False
+        self._popover_commands: list[Command] = []
+        self._popover_index = 0
         self._assumption_level = assumption_level
         self._auto_approve = auto_approve
         self._run_kwargs = run_kwargs
@@ -618,7 +964,8 @@ class RelayTuiApp(App):
             activity.border_title = "Activity"
             yield activity
             yield Static(id="status")
-        yield Input(id="prompt", placeholder=self._placeholder)
+        yield Static(id="command-popover")
+        yield PromptInput(id="prompt", placeholder=self._placeholder)
 
     def on_mount(self) -> None:
         # The model indicator is visible from launch, BEFORE the first message
@@ -726,7 +1073,27 @@ class RelayTuiApp(App):
 
     # -- the input box (one box, routed by engine state) -----------------------
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Drive the slash popover from the prompt's text (dialog filters are
+        handled on their own screens, so guard by id)."""
+        if event.input.id != "prompt":
+            return
+        value = event.value
+        # Slash commands are available only when the box is accepting a goal
+        # (idle) -- mid-run the input is routed to the engine, so no popover.
+        if value.startswith("/") and self._router.state is InputState.IDLE:
+            self._popover_update(value)
+        else:
+            self._popover_close()
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "prompt":
+            return  # a dialog's own field; its screen handles submit
+        # Enter while the popover is open runs the highlighted command, never a goal.
+        if self._popover_open:
+            event.input.value = ""
+            self._popover_run_selected()
+            return
         text = event.value
         event.input.value = ""
         outcome = self._router.submit(text)
@@ -743,6 +1110,59 @@ class RelayTuiApp(App):
         elif text.strip():
             self._write_activity("(input ignored: the engine is busy)")
         self._update_status()
+
+    # -- the slash-command popover ---------------------------------------------
+
+    def _popover_update(self, value: str) -> None:
+        """Open/refresh the popover for prompt text ``value`` (starts with ``/``)."""
+        self._popover_commands = filter_commands(self, value[1:])
+        self._popover_index = 0
+        self._popover_open = True
+        popover = self.query_one("#command-popover", Static)
+        popover.display = True
+        popover.update(self._popover_text())
+
+    def _popover_move(self, delta: int) -> None:
+        if not self._popover_commands:
+            return
+        self._popover_index = max(
+            0, min(len(self._popover_commands) - 1, self._popover_index + delta)
+        )
+        self.query_one("#command-popover", Static).update(self._popover_text())
+
+    def _popover_close(self) -> None:
+        if not self._popover_open:
+            return
+        self._popover_open = False
+        self._popover_commands = []
+        self._popover_index = 0
+        try:
+            self.query_one("#command-popover", Static).display = False
+        except Exception:  # noqa: BLE001 -- not mounted
+            pass
+
+    def _popover_run_selected(self) -> None:
+        """Run the highlighted command (Enter). Closes the popover; the command's
+        run() opens its dialog. Never submits a goal."""
+        commands = self._popover_commands
+        index = self._popover_index
+        self._popover_close()
+        if commands and 0 <= index < len(commands):
+            commands[index].run(self)
+
+    def _popover_text(self) -> Text:
+        text = Text()
+        if not self._popover_commands:
+            text.append("(no matching commands)", style="dim")
+            return text
+        for i, command in enumerate(self._popover_commands):
+            marker = "> " if i == self._popover_index else "  "
+            style = "reverse" if i == self._popover_index else ""
+            text.append(f"{marker}/{command.name}", style=style)
+            text.append(f"  -  {command.description}", style="dim")
+            if i != len(self._popover_commands) - 1:
+                text.append("\n")
+        return text
 
     def _begin_first_run(self, goal: str) -> None:
         """First goal of the session: hand off welcome -> working, then run.
@@ -959,6 +1379,208 @@ class RelayTuiApp(App):
         except Exception:  # noqa: BLE001 -- indicator not present (e.g. mid-working)
             pass
         self._update_status()
+
+    # -- the slash commands (each opens a dialog or does a clean action) --------
+
+    def _cmd_help(self) -> None:
+        """List every command; selecting one runs it (the discoverability anchor)."""
+        options = [
+            {
+                "title": f"/{c.name}  -  {c.title}",
+                "value": c.name,
+                "description": c.description,
+                "category": c.category,
+                "on_select": (lambda v, cmd=c: cmd.run(self)),
+            }
+            for c in visible_commands(self)
+        ]
+        self.push_screen(SelectDialog(title="Commands", options=options))
+
+    def _cmd_model(self) -> None:
+        """Pick a role, then its model (reuses v0.0.16 listing + validation)."""
+        options = [
+            {"title": "brain (planner)", "value": "brain",
+             "on_select": (lambda v: self._pick_model_for("brain"))},
+            {"title": "hands (executor)", "value": "hands",
+             "on_select": (lambda v: self._pick_model_for("hands"))},
+        ]
+        self.push_screen(SelectDialog(title="Set the model for which role?", options=options))
+
+    def _pick_model_for(self, role: str) -> None:
+        provider = self._models.provider_for_role(role)
+        try:
+            profile = resolve_provider(provider)
+        except ValueError:
+            profile = None
+        if profile is not None and profile.discovery == DISCOVERY_LIST:
+            list_fn = self._list_models_fn or provider_list_models
+            try:
+                ids = list(list_fn(provider))
+            except Exception:  # noqa: BLE001 -- no key/network -> empty, handled below
+                ids = []
+            options = [
+                {"title": mid, "value": mid, "category": provider,
+                 "on_select": (lambda v, r=role, p=provider: self._save_role_model(r, p, v))}
+                for mid in ids
+            ] or [{"title": "(no models listed -- add a key with /key)", "value": "__none__"}]
+            self.push_screen(SelectDialog(title=f"Pick a {role} model ({provider})", options=options))
+        else:
+            # manual aggregator: a slug field validated live before saving.
+            self.push_screen(TextEntryDialog(
+                title=f"{role} model ({provider})",
+                label="Type a model slug (validated live before saving):",
+                password=False, placeholder="e.g. openai/gpt-4o",
+                on_submit=(lambda slug, r=role, p=provider: self._save_role_model(r, p, slug)),
+            ))
+
+    def _save_role_model(self, role: str, provider: str, model: str, thinking=None) -> tuple[bool, str]:
+        """Persist a role's model via the SHARED persist_role path, then live-reload.
+
+        Returns ``(ok, note)`` so a TextEntryDialog can show the rejection inline.
+        """
+        if thinking is None:
+            thinking = self._models.thinking_for_role(role)
+        ok, note = persist_role(
+            role, provider, model, thinking, validate_fn=self._validate_fn or provider_validate_model
+        )
+        if ok:
+            self._on_setup_saved()  # indicator/status reflect config.json now
+        return ok, note
+
+    def _cmd_key(self) -> None:
+        """Pick a provider, then enter its key in a MASKED dialog (never inline)."""
+        options = [
+            {"title": pid, "value": pid, "on_select": (lambda v: self._enter_key_for(v))}
+            for pid in known_providers()
+        ]
+        self.push_screen(SelectDialog(title="Add a key for which provider?", options=options))
+
+    def _enter_key_for(self, provider: str) -> None:
+        self.push_screen(TextEntryDialog(
+            title=f"API key for {provider}",
+            label="Paste the key (hidden; never shown, logged, or in config.json):",
+            password=True, placeholder="sk-...",
+            on_submit=(lambda key, p=provider: self._save_key(p, key)),
+        ))
+
+    def _save_key(self, provider: str, key: str) -> tuple[bool, str]:
+        """Store a key (from the masked dialog ONLY) to auth.json 0o600, then reload."""
+        key = (key or "").strip()
+        if not key:
+            return False, "no key entered"
+        secrets_set_key(provider, key)  # the same v0.0.16 secrets path; value never echoed
+        self._on_setup_saved()
+        return True, f"stored a key for {provider}"
+
+    def _cmd_config(self) -> None:
+        """Show the resolved config (provider/model/thinking + source; key present/
+        absent) -- NEVER the key. Any row jumps into the full setup screen."""
+        res = describe_resolution()
+        options: list[dict] = []
+        for role in ROLES:
+            f = res["roles"][role]
+            options.append({
+                "title": f"{role}: {f['provider'][0]} / {f['model'][0]}",
+                "value": f"role:{role}", "category": "roles",
+                "description": f"thinking {'on' if f['thinking'][0] else 'off'}  "
+                               f"(src {f['provider'][1]}/{f['model'][1]})",
+                "on_select": (lambda v: self.action_open_setup()),
+            })
+        for pid in known_providers():
+            present = res["providers"][pid]["key_present"]
+            options.append({
+                "title": f"key[{pid}]: {'present' if present else 'absent'}",
+                "value": f"key:{pid}", "category": "keys",
+                "on_select": (lambda v: self.action_open_setup()),
+            })
+        options.append({
+            "title": "Open full setup (ctrl+s)...", "value": "__setup__", "category": "actions",
+            "on_select": (lambda v: self.action_open_setup()),
+        })
+        self.push_screen(SelectDialog(title="Config (resolved: env > config > default)", options=options))
+
+    def _cmd_doctor(self) -> None:
+        """Run the provider/model preflight (reusing the CLI logic) in a dialog."""
+        rows = self._run_doctor_report()
+        options = [
+            {"title": f"{r.get('role')}  {r.get('provider')}/{r.get('model')}: {r.get('status', '?')}",
+             "value": r.get("model", "?"), "category": "preflight",
+             "description": r.get("note", "")}
+            for r in rows
+        ] or [{"title": "(no checks run)", "value": "__none__"}]
+        self.push_screen(SelectDialog(title="Doctor: provider/model preflight", options=options))
+
+    def _run_doctor_report(self) -> list[dict]:
+        """Preflight rows, via the injected seam or the shared CLI doctor logic."""
+        if self._doctor_fn is not None:
+            return self._doctor_fn()
+        try:
+            from relay import cli
+
+            checks = cli._doctor_checks(self._models, None)
+            clients = cli._build_provider_clients(checks)
+            rows, _ = cli._run_doctor(checks, clients)
+            return rows
+        except Exception as exc:  # noqa: BLE001 -- never crash the TUI on a preflight
+            return [{"role": "?", "provider": "?", "model": "?",
+                     "status": "FAILED", "note": str(exc).splitlines()[0][:120]}]
+
+    def _cmd_runs(self) -> None:
+        """List recent runs (reusing the runlog reader) read-only in a dialog."""
+        records = self._read_runs()
+        recent = list(reversed(records))[:20]
+        options = []
+        for rec in recent:
+            roles = rec.roles if isinstance(rec.roles, dict) else {}
+            models_text = ", ".join(f"{k}:{v}" for k, v in roles.items()) or "-"
+            totals = rec.totals if isinstance(rec.totals, dict) else {}
+            cost = totals.get("cost_usd")
+            cost_text = "-" if cost is None else f"${cost:.4f}"
+            options.append({
+                "title": f"{str(rec.run_id)[:8]}  {rec.status}",
+                "value": rec.run_id, "category": "runs",
+                "description": f"{models_text}  cost {cost_text}",
+            })
+        if not options:
+            options = [{"title": "(no runs recorded yet)", "value": "__none__"}]
+        self.push_screen(SelectDialog(title="Recent runs", options=options))
+
+    def _read_runs(self) -> list:
+        if self._runs_fn is not None:
+            return self._runs_fn()
+        try:
+            from relay.runlog import default_log_path, load_records
+
+            return load_records(default_log_path(self._root))
+        except Exception:  # noqa: BLE001 -- a missing/odd log is just "no runs"
+            return []
+
+    def _cmd_assume(self) -> None:
+        """Pick the assumption level for this session (a select, not an inline number)."""
+        options = [
+            {"title": lvl, "value": lvl, "category": "assumption",
+             "description": "current" if lvl == self._assumption_level else "",
+             "on_select": (lambda v: self._set_assume(v))}
+            for lvl in ASSUMPTION_LEVELS
+        ]
+        self.push_screen(SelectDialog(title="Assumption level (1 = assume freely .. 5 = ask)", options=options))
+
+    def _set_assume(self, level: str) -> None:
+        self._assumption_level = level
+        self._update_status()
+
+    def _cmd_clear(self) -> None:
+        """Clear the visible panes for a fresh session. Guarded: never while a run
+        is in flight (also gated by the command's ``enabled`` predicate)."""
+        if _run_active(self):
+            return
+        self._conversation_lines = []
+        self._activity_lines = []
+        try:
+            self.query_one("#conversation", RichLog).clear()
+            self.query_one("#activity", RichLog).clear()
+        except Exception:  # noqa: BLE001 -- panes not mounted (welcome view)
+            pass
 
     # -- cancel + clean shutdown (the money-leak guard) --------------------------
 

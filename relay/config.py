@@ -218,6 +218,24 @@ def resolve_role_field(role: str, field: str, config: dict | None = None):
     return _default_for(role, field), "default"
 
 
+def env_override_for(role: str, field: str = "model", config: dict | None = None) -> str | None:
+    """The ``RELAY_*`` env var NAME silently shadowing a role's saved selection, or None.
+
+    Returns the variable name (e.g. ``RELAY_BRAIN_MODEL``) when ``field`` resolves
+    from the **environment** AND ``config.json`` holds a value for it -- i.e. a
+    saved selection the env var is overriding. This only *reports* the shadow so a
+    surface (the TUI) can give honest feedback after a save; it never alters the
+    env > config > default resolution (which is intentional and unchanged).
+    """
+    config = config if config is not None else store.load_config()
+    _, source = resolve_role_field(role, field, config)
+    if source != "env":
+        return None
+    if _config_role_field(config, role, field) is None:
+        return None
+    return _env_name(role, field)
+
+
 def default_config() -> dict:
     """A fresh, fully-populated v1 config skeleton (for seeding ``config.json``).
 

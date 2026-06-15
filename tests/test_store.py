@@ -20,6 +20,7 @@ from relay.config import (
     DEFAULT_HANDS_MODEL,
     default_config,
     describe_resolution,
+    env_override_for,
     load_models,
     resolve_role_field,
 )
@@ -118,6 +119,29 @@ def test_env_still_wins_in_load_models(monkeypatch, tmp_path):
     store.save_config(cfg)
     monkeypatch.setenv("RELAY_BRAIN_MODEL", "env-model")  # env overrides config
     assert load_models().for_role("brain") == "env-model"
+
+
+# --- env_override_for: REPORT a shadowed save (Bug 1, v0.0.19) --------------
+
+
+def test_env_override_for_names_the_shadowing_var(monkeypatch):
+    """A saved config value being overridden by an env var: report the var name."""
+    monkeypatch.setenv("RELAY_BRAIN_MODEL", "env-wins")
+    cfg = {"roles": {"brain": {"provider": "openrouter", "model": "config-model"}}}
+    assert env_override_for("brain", "model", cfg) == "RELAY_BRAIN_MODEL"
+
+
+def test_env_override_for_none_when_no_config_value(monkeypatch):
+    """Env var set but NO config selection -> not a shadow (env is the only source)."""
+    monkeypatch.setenv("RELAY_BRAIN_MODEL", "env-wins")
+    assert env_override_for("brain", "model", {}) is None
+
+
+def test_env_override_for_none_when_config_is_the_source(monkeypatch):
+    """Config is the resolved source (no env) -> nothing is shadowing it."""
+    monkeypatch.delenv("RELAY_HANDS_MODEL", raising=False)
+    cfg = {"roles": {"hands": {"provider": "deepseek", "model": "deepseek-v4-flash"}}}
+    assert env_override_for("hands", "model", cfg) is None
 
 
 # --- auth.json: 0o600, get/set/remove, precedence, override -----------------

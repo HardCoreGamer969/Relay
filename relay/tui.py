@@ -64,6 +64,7 @@ from relay.config import (
     assumption_summary,
     describe_resolution,
     default_config,
+    env_override_for,
     load_models,
 )
 from relay.orchestrator import Event
@@ -1064,6 +1065,9 @@ class RelayTuiApp(App):
         self._greeting = pick_greeting()
         self._placeholder = pick_placeholder()  # the idle prompt phrase for this launch
         self._indicator_text = model_identity(self._models)
+        # The last "your save was shadowed by an env var" note (mirrored for tests;
+        # "" when the most recent save landed as the resolved value).
+        self._save_notice = ""
         self._first_run = False  # set when the empty-state setup is offered on launch
         # The render-path buffers: exactly the strings handed to the widgets,
         # kept so headless tests can assert on the render path directly.
@@ -1498,15 +1502,53 @@ class RelayTuiApp(App):
         """A setup save landed: re-resolve config so the LIVE app reflects it.
 
         The welcome model indicator + status line now show config.json selections,
-        not just env. (A run already in flight keeps its own resolved models.)
+        not just env. (A run already in flight keeps its own resolved models.) If an
+        env var is shadowing the just-saved selection (env > config), the save has no
+        visible effect -- so we surface an honest note rather than letting the screen
+        look stale (see :meth:`_env_shadow_notice`).
         """
         self._models = load_models()
         self._indicator_text = model_identity(self._models)
+        self._save_notice = self._env_shadow_notice()
         try:
             self.query_one("#indicator", Static).update(self._indicator_text)
         except Exception:  # noqa: BLE001 -- indicator not present (e.g. mid-working)
             pass
+        self._render_save_notice()
         self._update_status()
+
+    def _env_shadow_notice(self) -> str:
+        """A one-line note when a saved model is being OVERRIDDEN by an env var.
+
+        The save wrote config.json, but ``env > config`` means a ``RELAY_*_MODEL``
+        env var (or a project ``.env``) wins -- so the change has no visible effect.
+        Returns "" in the common case (nothing shadowed). ASCII-safe; this only
+        REPORTS the shadow -- resolution precedence is unchanged.
+        """
+        overrides = [
+            f"{env} is overriding your saved {role} model"
+            for role in ROLES
+            if (env := env_override_for(role, "model"))
+        ]
+        if not overrides:
+            return ""
+        return (
+            "Saved to config.json -- but " + "; ".join(overrides)
+            + " (unset it to use the saved value)."
+        )
+
+    def _render_save_notice(self) -> None:
+        """Surface the shadow note where the user is looking -- the welcome hint line
+        and (in the working view) the activity feed. A no-op when nothing is shadowed."""
+        notice = self._save_notice
+        if not notice:
+            return
+        try:
+            self.query_one("#hint", Static).update(notice)
+        except Exception:  # noqa: BLE001 -- hint not mounted (working view)
+            pass
+        if self._view == "working":
+            self._write_activity(notice)
 
     # -- the slash commands (each opens a dialog or does a clean action) --------
 

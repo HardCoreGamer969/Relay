@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 from textual.widgets import Input
 
+from relay.bridge import InputState
 from relay.config import ModelConfig
 from relay.tui import (
     COMMANDS,
@@ -147,6 +148,67 @@ def test_clearing_slash_dismisses_popover(tmp_path):
             app.query_one("#prompt", Input).value = ""  # deleted the slash
             await pilot.pause()
             assert app._popover_open is False
+
+    asyncio.run(main())
+
+
+# --- the slash GATE: reachable unless the engine is actively generating ------
+# (Bug 4, v0.0.19) The popover used to open ONLY in IDLE, so once a goal was
+# entered the user often couldn't reach slash commands. It must open whenever the
+# engine is NOT actively generating -- idle AND the awaiting-user states -- and be
+# suppressed ONLY during active planning/execution.
+
+
+def test_slash_reachable_in_idle_and_awaiting_states(tmp_path):
+    async def main():
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            prompt = app.query_one("#prompt", Input)
+            for state in (InputState.IDLE, InputState.AWAITING_REACTION,
+                          InputState.AWAITING_DECISION, InputState.AWAITING_APPROVAL):
+                app._router.state = state
+                prompt.value = ""            # reset the popover between checks
+                await pilot.pause()
+                prompt.value = "/"
+                await pilot.pause()
+                assert app._popover_open is True, f"slash should open in {state.value}"
+
+    asyncio.run(main())
+
+
+def test_slash_suppressed_during_active_generation(tmp_path):
+    async def main():
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            prompt = app.query_one("#prompt", Input)
+            for state in (InputState.PLANNING, InputState.EXECUTING):
+                app._router.state = state
+                prompt.value = ""
+                await pilot.pause()
+                prompt.value = "/"
+                await pilot.pause()
+                assert app._popover_open is False, f"slash must be suppressed in {state.value}"
+
+    asyncio.run(main())
+
+
+def test_non_slash_goal_never_opens_popover_in_any_state(tmp_path):
+    """A normal goal (no leading /) is routed normally and never opens the popover --
+    in every router state. The gate governs ONLY the popover, not routing."""
+    async def main():
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            prompt = app.query_one("#prompt", Input)
+            for state in InputState:
+                app._router.state = state
+                prompt.value = ""
+                await pilot.pause()
+                prompt.value = "build a thing"
+                await pilot.pause()
+                assert app._popover_open is False, f"a goal must not open the popover in {state.value}"
 
     asyncio.run(main())
 

@@ -117,6 +117,11 @@ INPUT_PLACEHOLDERS = (
     "What's the goal?",
 )
 
+# The states where the engine is ACTIVELY generating (the model is genuinely
+# running). The slash popover is suppressed only here -- every other state (idle and
+# the awaiting-user states) accepts a slash command (see ``_slash_allowed``).
+_GENERATING_STATES = (InputState.PLANNING, InputState.EXECUTING)
+
 # State-aware placeholders: the one box's PURPOSE changes with what the engine is
 # waiting for, so the prompt should say what a submit now means. Short.
 _STATE_PLACEHOLDERS = {
@@ -1211,12 +1216,25 @@ class RelayTuiApp(App):
         if event.input.id != "prompt":
             return
         value = event.value
-        # Slash commands are available only when the box is accepting a goal
-        # (idle) -- mid-run the input is routed to the engine, so no popover.
-        if value.startswith("/") and self._router.state is InputState.IDLE:
+        # The popover opens whenever the engine is NOT actively generating: idle AND
+        # the awaiting-user states (react / decide / approve) all accept a slash
+        # command; only active planning/execution suppresses it (see _slash_allowed).
+        if value.startswith("/") and self._slash_allowed():
             self._popover_update(value)
         else:
             self._popover_close()
+
+    def _slash_allowed(self) -> bool:
+        """Whether the `/` popover may open in the current router state.
+
+        True unless the engine is ACTIVELY generating: idle (start a goal) and the
+        states where the engine is WAITING ON THE USER (awaiting reaction / decision /
+        approval) all permit slash commands; only active planning/execution suppresses
+        the popover. This governs the popover ONLY -- routing, the engine, the bridge,
+        and the InputRouter are unchanged, and a normal goal is unaffected in every
+        state. (Input queueing is a separate future milestone, not this gate.)
+        """
+        return self._router.state not in _GENERATING_STATES
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "prompt":

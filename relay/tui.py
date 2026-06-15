@@ -168,6 +168,10 @@ _ANIM_FPS = 24
 _STARTUP_SHORT_S = 0.45      # boot decode that resolves into the wordmark
 _TRANSITION_SHORT_S = 0.4    # welcome -> working datamosh (short ALWAYS)
 
+# How long the live cost counter stays highlighted after it climbs (a single
+# transient style flip on change -- no animation loop, no thread, zero model calls).
+_COST_PULSE_S = 0.5
+
 
 def _normalize_block(target: str) -> list[str]:
     """Split into equal-width rows so the glitch matrix is a clean rectangle."""
@@ -1140,6 +1144,8 @@ class RelayTuiApp(App):
         self._goal_cost = 0.0
         self._session_cost = 0.0
         self._cost_visible = True  # status-line counter shown by default (/cost toggles)
+        self._cost_pulse = False   # transient highlight while the counter is climbing
+        self._cost_pulse_timer = None
         self._first_run = False  # set when the empty-state setup is offered on launch
         # The render-path buffers: exactly the strings handed to the widgets,
         # kept so headless tests can assert on the render path directly.
@@ -1399,6 +1405,7 @@ class RelayTuiApp(App):
 
     def _start_run(self, goal: str) -> None:
         self._goal_cost = 0.0  # a new goal: zero the per-goal counter (session untouched)
+        self._cost_pulse = False
         self._seen_turn_ids.clear()  # fresh transcript: turn ids restart at t0
         if self._conversation_lines:
             self._write_conversation("")  # a blank line between runs
@@ -1581,7 +1588,7 @@ class RelayTuiApp(App):
         text = Text(base)
         if cost:
             text.append("  |  ", style="dim")
-            text.append(cost, style="green")
+            text.append(cost, style="bold bright_green" if self._cost_pulse else "green")
         self.query_one("#status", Static).update(text)
         # The input box's placeholder tracks what a submit now means (Fix 1).
         self.query_one("#prompt", Input).placeholder = placeholder_for_state(
@@ -1622,6 +1629,28 @@ class RelayTuiApp(App):
         if cost is None or cost == self._goal_cost:
             return
         self._goal_cost = cost
+        self._flash_cost()  # transient highlight; the caller re-renders the status
+
+    def _flash_cost(self) -> None:
+        """Briefly highlight the counter when it climbs -- a single transient style
+        flip reverted by a short timer (NOT an animation loop or thread). Pure
+        presentation on the already-tracked figure: zero model calls."""
+        self._cost_pulse = True
+        timer = self._cost_pulse_timer
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:  # noqa: BLE001 -- already stopped/torn down
+                pass
+        try:
+            self._cost_pulse_timer = self.set_timer(_COST_PULSE_S, self._end_cost_pulse)
+        except Exception:  # noqa: BLE001 -- not mounted (logic-only use in tests)
+            self._cost_pulse_timer = None
+
+    def _end_cost_pulse(self) -> None:
+        self._cost_pulse = False
+        self._cost_pulse_timer = None
+        self._update_status()
 
     # -- the setup / picker flow ------------------------------------------------
 

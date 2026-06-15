@@ -37,6 +37,7 @@ def _fake_runner(cost):
     return SimpleNamespace(
         ledger=SimpleNamespace(total_cost=lambda: cost),
         transcript=SimpleNamespace(turns=[]),
+        is_running=False,
     )
 
 
@@ -162,5 +163,50 @@ def test_status_counter_renders_affordance_and_toggle(tmp_path):
             app._cost_visible = True
             app._update_status()
             assert "$0.0234" in app._status_text
+
+    asyncio.run(main())
+
+
+# --- animation: a pulse on change, and ZERO model calls in the cost path -----
+
+
+def test_cost_change_pulses_then_reverts(tmp_path):
+    async def main():
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._router.begin_run()
+            app._runner = _fake_runner(0.0042)
+            app._refresh_cost()          # the value climbed -> pulse on
+            assert app._cost_pulse is True
+            app._end_cost_pulse()        # the revert (normally a short timer)
+            assert app._cost_pulse is False
+
+    asyncio.run(main())
+
+
+def test_cost_path_makes_zero_model_calls(tmp_path):
+    """The cost-display + pulse path reads an already-tracked figure -- it must never
+    call a model (reuse the zero-token discipline: a counting client stays at 0)."""
+    calls = {"n": 0}
+
+    class _CountingClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._c))
+
+        def _c(self, **kw):
+            calls["n"] += 1
+            return _resp_nocost("<done>x</done>")
+
+    async def main():
+        app = _app(tmp_path, client=_CountingClient())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._router.begin_run()
+            app._runner = _fake_runner(0.0099)
+            app._refresh_cost()   # read cost + pulse
+            app._update_status()  # styled render
+            app._end_cost_pulse() # revert
+            assert calls["n"] == 0  # zero model calls across the whole cost/anim path
 
     asyncio.run(main())

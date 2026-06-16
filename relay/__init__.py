@@ -250,7 +250,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.21"
+__version__ = "0.0.22"
 
 __all__ = [
     # v0.01 -- model layer

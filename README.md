@@ -46,7 +46,42 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.21 (fail fast on a stuck loop: memory dedup, repetition breaker, friendly stop, step ceiling)
+## Status — v0.0.22 (`/log`: a shareable, redacted debug export)
+
+When a beta tester hits a problem, "describe what went wrong" loses most of the picture.
+**`/log`** captures it instead: one timestamped, human-readable Markdown file with the
+whole run — config, outcome, the conversation, the activity feed, the plan, and memory —
+that they can attach to a GitHub issue. Its non-negotiable property is that it is **safe to
+paste in public**: no API key (or other credential) can appear in it, **by construction**.
+
+- **A redactor built and tested first (the safety core).** `redact_secrets(text,
+  known_secrets=…)` is a pure, **idempotent**, crash-safe function that masks credential
+  shapes — `sk-…` keys (OpenRouter/DeepSeek), `Bearer` tokens, and values following
+  `api_key=` / `Authorization:` markers — and, the strongest guarantee, replaces any
+  **exact live key value** handed to it **verbatim wherever it appears**, even off-pattern
+  and mid-sentence. It's `None`-safe, leaves ordinary text untouched (bare git SHAs and
+  hashes survive), and runs over **every field** of the bundle — belt-and-suspenders.
+- **A bundle assembled from existing state — zero model calls.** The builder reads what the
+  app already holds (no generation, no network, no upload) into clear `##` sections:
+  environment (Relay/Python/OS), resolved **non-secret** config (models/providers/assumption/
+  step ceiling + key **presence only**, never a value), the run outcome (status, cost,
+  done/failed/total, which limit fired), the conversation transcript, the activity log, and
+  the final plan + memory. The whole thing is then run through the redactor before writing.
+- **Two scopes, picked from a dialog.** **Current project** exports the most recent run;
+  **Full session** exports the session-spanning buffers plus the current project's structured
+  outcome (Relay keeps no per-project history — the header says so). The choice writes
+  `relay-debug-<YYYYMMDD-HHMMSS>.md` to the working directory and names the **full path**:
+  *"…safe to attach to a GitHub issue (no keys included)."* A write failure reads friendly,
+  not as a traceback. **Relay never sends the bundle anywhere** — the file is local and you
+  choose whether to share it.
+
+The export path makes **no model call** and changes no engine/bridge behavior — it's
+read-only surfacing of existing state plus one new command. Proven by network-free headless
+tests, including a bundle that seeds a fake key into **every** field and comes out with the
+key absent from all of them.
+
+Under that, **v0.0.21** (fail fast on a stuck loop: memory dedup, repetition breaker,
+friendly stop, step ceiling) still stands.
 
 A repeated-dead-end loop showed up in live use: on a step the brain wouldn't accept,
 it kept re-deriving the same memory and the plan kept re-issuing the same step until
@@ -171,6 +206,9 @@ clean action, none parse inline args, and a key is never typed into the chat inp
 - `/doctor` — the provider/model preflight in a dialog.
 - `/runs` — recent runs, read-only.
 - `/assume` — pick the assumption level (1–5 / auto), each with a description.
+- `/cost` — session + per-goal spend; toggle / reset the live counter.
+- `/log` — export a **redacted** debug `.md` (current project / full session) to
+  share when reporting an issue; key **presence only**, never a value.
 - `/clear` — clear the panes (disabled mid-run; never clobbers a live run).
 
 Under that, **beta-enablement** (v0.0.16): a user who has never touched a

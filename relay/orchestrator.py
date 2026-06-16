@@ -131,6 +131,9 @@ class PlannedTaskResult:
     events: list[Event] = field(default_factory=list)
     memory: PlanMemory | None = None
     revisions: int = 0
+    # The effective global step ceiling for this run (None = unbounded), so a
+    # surface can tell the user how to raise it when STATUS_MAX_STEPS is hit.
+    max_total_steps: int | None = None
     # The continuous conversation thread (planning turns, mid-run escalations,
     # decisions, the result turn). ``transcript`` is the full live thread (source
     # of truth); ``transcript_compacted`` is its post-execution readable form.
@@ -320,13 +323,53 @@ def _run_executor_step(
     )
 
 
-def _result_summary(status: str, plan: Plan) -> str:
-    """A plain, human-readable one-liner for the conversation's closing result turn.
+# v0.0.21: the stuck-loop and step-ceiling terminals are the ones a beta user can
+# actually act on, so they get plain-language, ACTIONABLE text (no "escalation_limit"
+# jargon) -- drafted once here and reused by every surface (the transcript result
+# turn -> TUI conversation + CLI --show-transcript, and the CLI status print) so the
+# wording can never drift. The internal status STRINGS are unchanged (logs/tests
+# still see escalation_limit / repeated_step / max_steps); only the DISPLAYED text
+# becomes friendly. ASCII-safe ("--") for non-UI surfaces.
+_STUCK_NEXT_STEPS = (
+    "To get further you can: switch to a more capable brain model (/model or "
+    "/provider), restate the goal as smaller, clearer steps, or review the partial "
+    "work that did land."
+)
+
+
+def friendly_terminal_message(status: str, *, max_total_steps: int | None = None) -> str | None:
+    """Plain, actionable text for a user-facing terminal -- or ``None`` when the
+    status has no special friendly form (the caller keeps its own wording).
+
+    Covers the terminals a user can do something about: the stuck-loop pair
+    (``escalation_limit`` / ``repeated_step``) and the global step ceiling
+    (``max_steps``). Says, in plain terms, what happened and what to try next.
+    """
+    if status in (STATUS_ESCALATION_LIMIT, STATUS_REPEATED_STEP):
+        return (
+            "Relay got stuck on one step -- it kept trying the same approach without "
+            f"it being accepted, so it stopped instead of looping. {_STUCK_NEXT_STEPS}"
+        )
+    if status == STATUS_MAX_STEPS:
+        ceiling = f" ({max_total_steps} steps)" if max_total_steps else ""
+        return (
+            f"Relay reached its overall step ceiling{ceiling} and stopped as a safety "
+            "limit. If the project is genuinely large, raise it with --max-total-steps, "
+            "the RELAY_MAX_TOTAL_STEPS env var, or the config, then re-run -- or restate "
+            "the goal as smaller steps and review the partial work."
+        )
+    return None
+
+
+def _result_summary(status: str, plan: Plan, *, max_total_steps: int | None = None) -> str:
+    """A plain, human-readable line for the conversation's closing result turn.
 
     Composed from the run outcome (NOT a model call) so it adds no brain cost and
     cannot drift from what actually happened. Reconciles the wording with the real
     done/failed counts: a ``completed`` run that recovered from a failed step (via
     replan) must NOT claim it "built everything" -- that would contradict the count.
+    The stuck-loop and step-ceiling terminals use the shared, actionable
+    :func:`friendly_terminal_message` so the user never sees raw jargon.
     """
     done = sum(1 for s in plan.steps if s.status == "done")
     failed = sum(1 for s in plan.steps if s.status == "failed")
@@ -336,11 +379,8 @@ def _result_summary(status: str, plan: Plan) -> str:
             reworked = f"{failed} step(s) were reworked along the way"
             return f"Done -- reached the goal ({done} of {total} steps completed; {reworked})."
         return f"Done -- built everything we agreed on. ({done}/{total} steps completed.)"
-    phrasing = {
-        STATUS_MAX_STEPS: "Stopped early: the step budget ran out.",
+    phrasing = friendly_terminal_message(status, max_total_steps=max_total_steps) or {
         STATUS_CANCELLED: "Stopped: you cancelled the run.",
-        STATUS_ESCALATION_LIMIT: "Stopped: too many steps failed to recover.",
-        STATUS_REPEATED_STEP: "Stopped: I kept retrying the same step without it being accepted.",
         STATUS_ABORTED_BY_BRAIN: "Stopped: I judged the goal unreachable as specified.",
         STATUS_UNRESOLVED_ESCALATION: "Paused: I needed a decision from you that I could not get.",
         STATUS_PLANNING_FAILED: "Could not produce a usable plan.",
@@ -437,6 +477,7 @@ def run_planned(
     memory = memory if memory is not None else PlanMemory()
     transcript = transcript if transcript is not None else Transcript()
     result = PlannedTaskResult(goal=goal, ledger=ledger, memory=memory, transcript=transcript)
+    result.max_total_steps = max_total_steps  # so a surface can tell the user how to raise it
 
     cfg = models if models is not None else load_models()
     window, _source = resolve_context_window(cfg.brain, client=client, override=context_window)
@@ -461,7 +502,10 @@ def run_planned(
         result turn (no model call), then the readable post-execution compaction.
         Called once per run, so every outcome leaves a result turn + a compacted
         record -- not just the run-to-completion path."""
-        transcript.record("brain", "result", _result_summary(result.status, plan_for_summary or Plan(steps=[])))
+        transcript.record(
+            "brain", "result",
+            _result_summary(result.status, plan_for_summary or Plan(steps=[]), max_total_steps=max_total_steps),
+        )
         result.transcript_compacted = compact_transcript(
             transcript, budget_tokens=mem_budget, client=client, models=models, ledger=ledger
         )
@@ -652,7 +696,8 @@ def run_planned(
             remaining = max_total_steps - executor_calls
             if remaining <= 0:
                 result.status = STATUS_MAX_STEPS
-                emit("status", "overall executor-step budget exhausted", {"status": STATUS_MAX_STEPS})
+                emit("status", "stopped: reached the overall step ceiling (a safety limit)",
+                     {"status": STATUS_MAX_STEPS, "max_total_steps": max_total_steps})
                 break
             step_budget = min(max_executor_steps, remaining)
 
@@ -722,7 +767,8 @@ def run_planned(
 
         if escalations >= max_escalations:
             result.status = STATUS_ESCALATION_LIMIT
-            emit("status", f"escalation limit ({max_escalations}) reached", {"status": STATUS_ESCALATION_LIMIT})
+            emit("status", "stopped: stuck on a step after repeated recovery attempts",
+                 {"status": STATUS_ESCALATION_LIMIT, "escalations": escalations})
             break
 
         escalations += 1

@@ -372,6 +372,50 @@ def test_progressing_replan_is_not_short_circuited(tmp_path):
     assert len(_hands_calls(client)) == 2     # the genuinely-different step ran
 
 
+# --- v0.0.21: friendly, plain-language failure message ----------------------
+
+
+def test_friendly_terminal_message_covers_stuck_and_ceiling():
+    from relay.loop import STATUS_COMPLETED as _DONE, STATUS_MAX_STEPS
+    from relay.orchestrator import friendly_terminal_message
+
+    stuck = friendly_terminal_message(STATUS_ESCALATION_LIMIT)
+    assert "stuck" in stuck.lower()
+    assert "escalation_limit" not in stuck  # no jargon
+    assert ("/model" in stuck or "smaller" in stuck)  # an actionable hint
+    # repeated_step shares the same friendly stuck-loop form.
+    assert friendly_terminal_message(STATUS_REPEATED_STEP) == stuck
+
+    ceiling = friendly_terminal_message(STATUS_MAX_STEPS, max_total_steps=50)
+    assert "50" in ceiling and "RELAY_MAX_TOTAL_STEPS" in ceiling
+    assert "--max-total-steps" in ceiling
+
+    # Statuses with no special friendly form return None (caller keeps its wording).
+    assert friendly_terminal_message(_DONE) is None
+    assert friendly_terminal_message(STATUS_ABORTED_BY_BRAIN) is None
+
+
+def test_stuck_loop_result_turn_is_plain_language(tmp_path):
+    # A repeated-dead-end run: the closing result turn (shown in the TUI
+    # conversation and CLI --show-transcript) must read plainly, not "repeated_step".
+    client = RoutedClient(
+        brain=[
+            "<plan><step>Implement the input loop in main() to handle user navigation commands</step></plan>",
+            "<plan><step>Implement the input loop in main() to handle the navigation commands properly</step></plan>",
+        ],
+        hands=["<blocked>cannot determine the loop structure</blocked>"],
+    )
+    result = run_planned("terminal calendar", tmp_path, models=CFG, client=client)
+
+    assert result.status == STATUS_REPEATED_STEP  # internal status string unchanged
+    result_turns = [t for t in result.transcript.turns if t.phase == "result"]
+    assert result_turns
+    text = result_turns[-1].text.lower()
+    assert "stuck" in text
+    assert "repeated_step" not in text and "escalation_limit" not in text  # no jargon shown
+    assert ("/model" in text or "smaller" in text)  # a concrete next action
+
+
 # --- narrow executor context still holds -----------------------------------
 
 

@@ -51,9 +51,11 @@ from relay.orchestrator import (
     STATUS_DECLINED,
     STATUS_ESCALATION_LIMIT,
     STATUS_PLANNING_FAILED,
+    STATUS_REPEATED_STEP,
     STATUS_UNRESOLVED_ESCALATION,
     Event,
     PlannedTaskResult,
+    friendly_terminal_message,
     run_planned,
 )
 from relay.runlog import append_record, build_record, default_log_path, load_records
@@ -866,12 +868,12 @@ def _print_planned_status(result) -> None:
         )
     elif status == STATUS_ABORTED_BY_BRAIN:
         console.print("\n[bold red]ABORTED BY BRAIN[/bold red] goal deemed unreachable")
-    elif status == STATUS_ESCALATION_LIMIT:
-        console.print(
-            f"\n[bold red]ESCALATION LIMIT[/bold red] gave up after {result.escalations} replan(s)"
-        )
+    elif status in (STATUS_ESCALATION_LIMIT, STATUS_REPEATED_STEP):
+        # Plain-language, actionable -- not raw "escalation_limit" jargon.
+        console.print(f"\n[bold red]STUCK[/bold red] {friendly_terminal_message(status)}")
     elif status == STATUS_MAX_STEPS:
-        console.print("\n[yellow]MAX STEPS[/yellow] overall executor budget exhausted")
+        msg = friendly_terminal_message(status, max_total_steps=getattr(result, "max_total_steps", None))
+        console.print(f"\n[yellow]STEP CEILING[/yellow] {msg}")
     elif status == STATUS_DECLINED:
         console.print("\n[yellow]DECLINED[/yellow] plan not approved; nothing executed")
     else:

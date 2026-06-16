@@ -33,20 +33,53 @@ escalation** — it does not review every successful step. A step *fails* when t
 executor emits `<blocked>`, exhausts its per-step budget, or can't follow the
 protocol; the harness then asks the brain to **replan** the remaining tail
 (keeping completed steps) or `<abort>`. Every loop is bounded
-(`max_executor_steps=12` per step, `max_escalations=3` replans, an optional
-overall budget) so a weak model can't burn money in a spiral.
+(`max_executor_steps=12` per step, `max_escalations=3` replans, and a global
+step ceiling `max_total_steps` — **on by default at 50**, raisable/disable-able)
+so a weak model can't burn money in a spiral. If a replan re-issues a step that
+already dead-ended the same way, Relay recognizes the loop and **stops fast**
+rather than grinding the budget.
 
 A planned run ends in one clear terminal status: `completed`, `planning_failed`,
-`aborted_by_brain`, `escalation_limit`, or `max_steps`. Telemetry is recorded
+`aborted_by_brain`, `escalation_limit`, `repeated_step`, or `max_steps`. Telemetry is recorded
 per role, so the end-of-run table shows **brain vs hands** cost/tokens/time
 separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.20 (live cost counter, `/cost`, fast esc-to-stop)
+## Status — v0.0.21 (fail fast on a stuck loop: memory dedup, repetition breaker, friendly stop, step ceiling)
 
+A repeated-dead-end loop showed up in live use: on a step the brain wouldn't accept,
+it kept re-deriving the same memory and the plan kept re-issuing the same step until
+the escalation budget ran out — tens to ~170 model calls on one step that never
+advanced. This release makes the agent **fail fast and cleanly** on that loop and stop
+reinforcing it. (The deeper *why it rejects at all* — the reviewer judging a truncated
+action transcript — is a separate, deferred fix; the reviewer's context is untouched here.)
+
+- **Memory near-duplicate suppression.** Plan memory no longer stores a fact/decision
+  that merely **restates** a recent same-kind entry, so the brain's rewordings ("main()
+  lacks the input loop" ×3, a repeated verbatim decision) can't accrete and dominate the
+  keyword-ranked slice fed back into the next review. Conservative — same-kind, a bounded
+  recent window, content-token overlap with a **novelty guard** so a genuine superset that
+  *adds* information is always kept.
+- **Repetition breaker.** When a replan re-issues a step **near-identical to one that
+  already dead-ended**, that *is* the loop — Relay stops on a new `repeated_step` terminal
+  **before** re-running it, instead of grinding the full escalation budget. It fires only
+  on a clear repeat, so a progressing run whose replan picks a genuinely different approach
+  is never short-circuited.
+- **Friendly, plain-language stop.** The stuck-loop and step-ceiling terminals now read in
+  plain terms — *what happened* and *2–3 things to try* (a more capable model via
+  `/model` / `/provider`, smaller/clearer steps, or review the partial work) — instead of
+  `escalation_limit` jargon. One shared source feeds every surface (TUI + CLI); the internal
+  status strings are unchanged for logs/tests.
+- **One comprehensible step ceiling.** The global executor-step cap is on by **default 50**
+  in production (CLI + TUI) — a generous safety net that should never fire in normal use,
+  not a wall. Raise or disable it via `--max-total-steps`, the `RELAY_MAX_TOTAL_STEPS` env
+  var, or `config.json` (`0`/`off` = unbounded; precedence env > config > default), and the
+  ceiling message tells you how.
+
+Under that, **v0.0.20** (live cost counter, `/cost`, fast esc-to-stop) still stands.
 Relay's philosophy on spend is explicit: it does **not** impose a cap or judge what
-you want to build — it shows cost live and lets **you** stop whenever you decide. This
+you want to build — it shows cost live and lets **you** stop whenever you decide. That
 release surfaces two cost figures and makes stopping feel instant.
 
 - **A live per-goal cost counter** in the status line (e.g. `$0.0234`), animated with
@@ -483,7 +516,9 @@ executor itself instead of a human doing it:
   `confirmation`, dead ends → `dead_end`, each with provenance + dual form) and
   evolves the remaining plan (`evolve_plan`) when learning warrants it. All loops
   are bounded (`max_followups_per_step`, `max_plan_revisions`, `max_escalations`,
-  `max_total_steps`).
+  and `max_total_steps` — the global step ceiling, **default 50**, raisable via
+  `--max-total-steps` / `RELAY_MAX_TOTAL_STEPS` / config). A replan that re-issues
+  an already-dead-ended step is caught and the run stops fast (`repeated_step`).
 - **Everything is an event.** `executor_question`, `brain_self_answered`,
   `brain_escalated`, `user_decided`, `step_reviewed`, `plan_revised`,
   `memory_write` stream to the console so the brain↔executor exchange is visible.

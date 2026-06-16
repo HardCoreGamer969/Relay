@@ -178,6 +178,12 @@ from relay.config import (
     resolve_role_field,
 )
 from relay.context import DEFAULT_CONTEXT_WINDOW, resolve_context_window
+from relay.debug import (
+    RunSnapshot,
+    build_debug_bundle,
+    redact_secrets,
+    summarize_run,
+)
 from relay.providers import (
     DEFAULT_PROVIDER,
     DISCOVERY_LIST,
@@ -356,5 +362,10 @@ __all__ = [
     "validate_model",
     "DISCOVERY_MANUAL",
     "DISCOVERY_LIST",
+    # v0.0.22 -- the /log debug export (redactor + bundle builder)
+    "redact_secrets",
+    "build_debug_bundle",
+    "summarize_run",
+    "RunSnapshot",
     "__version__",
 ]

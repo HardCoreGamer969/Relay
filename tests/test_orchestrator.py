@@ -89,7 +89,9 @@ def test_happy_path_completes_with_supervision(tmp_path):
     assert [s.status for s in result.plan.steps] == ["done", "done"]
     assert (tmp_path / "alpha.txt").read_text(encoding="utf-8") == "ALPHA"
     assert (tmp_path / "beta.txt").read_text(encoding="utf-8") == "BETA"
-    # Supervision cost: 1 plan + 2 step-boundary reviews = 3 brain calls (intended).
+    # Supervision cost: 1 plan + 2 step-boundary reviews = 3 brain calls. Review is now
+    # 1..N brain calls (1 here -- the fake verdicts immediately, without investigating);
+    # review calls do NOT count against the executor max_total_steps ceiling.
     assert len(_brain_calls(client)) == 3
     assert _kinds(result).count("step_reviewed") == 2
     # Memory learned both step outcomes (fact, dual-form, with provenance).
@@ -108,6 +110,31 @@ def test_no_supervise_skips_reviews(tmp_path):
     assert result.status == STATUS_COMPLETED
     assert len(_brain_calls(client)) == 1  # plan only -- no review calls
     assert "step_reviewed" not in _kinds(result)
+
+
+def test_agentic_reviewer_reads_the_touched_file_through_run_planned(tmp_path):
+    # End-to-end: the hands edits out.txt; the touched path threads into the reviewer,
+    # which READS the real file (1st review turn) before verdicting accept (2nd turn) --
+    # the documented blind-reviewer loop, fixed through the full loop.
+    client = RoutedClient(
+        brain=[
+            "<plan><step>create out.txt with the answer</step></plan>",
+            '<read path="out.txt"/>',       # review turn 1: investigate the touched file
+            "<verdict>accept</verdict>",     # review turn 2: accept after reading
+        ],
+        hands=['<edit path="out.txt">THE REAL ANSWER</edit>\n<done>created out.txt</done>'],
+    )
+    result = run_planned("g", tmp_path, models=CFG, client=client)
+
+    assert result.status == STATUS_COMPLETED
+    # The reviewer read the real touched file: a brain_action read event for out.txt fired,
+    # and the file's actual contents (not a byte-count) reached the brain.
+    brain_reads = [e for e in result.events if e.kind == "brain_action" and "out.txt" in e.message]
+    assert brain_reads and "THE REAL ANSWER" in brain_reads[0].payload["observation"]
+    # Review here is 2 brain calls (read + verdict); total brain = 1 plan + 2 = 3. The
+    # extra review turn did NOT consume executor budget (only one hands call ran).
+    assert len(_brain_calls(client)) == 3
+    assert len(_hands_calls(client)) == 1
 
 
 # --- executor questions: self-answer vs escalate ---------------------------

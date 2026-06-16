@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from relay.config import ModelConfig
 from relay.planner import MAX_PLAN_STEPS, Plan, PlanStep, make_plan, replan
 from relay.telemetry import Ledger
+from relay.tools import Tools
 
 CFG = ModelConfig(brain="vendor/brain", hands="vendor/hands")
 
@@ -146,52 +147,157 @@ def _one_step_plan():
     return Plan.from_instructions(["do the thing"])
 
 
-def test_review_accept_with_records(monkeypatch):
+def test_review_accept_with_records(monkeypatch, tmp_path):
     monkeypatch.setattr(
         planner_mod, "call_model",
         _FakeBrain('<verdict>accept</verdict><record kind="fact">routes wired :: routes done</record>'),
     )
     plan = _one_step_plan()
     review = review_step("g", plan, plan.steps[0], "did it", ["[edit] wrote x"], PlanMemory(),
-                         models=CFG, client=object())
+                         tools=Tools(tmp_path), models=CFG, client=object())
     assert review.verdict == "accept"
     assert review.records == [("fact", "routes wired", "routes done")]
 
 
-def test_review_follow_up(monkeypatch):
+def test_review_follow_up(monkeypatch, tmp_path):
     monkeypatch.setattr(
         planner_mod, "call_model",
         _FakeBrain("<verdict>follow_up</verdict><followup>add the missing docstring</followup>"),
     )
     plan = _one_step_plan()
-    review = review_step("g", plan, plan.steps[0], "did it", [], PlanMemory(), models=CFG, client=object())
+    review = review_step("g", plan, plan.steps[0], "did it", [], PlanMemory(),
+                         tools=Tools(tmp_path), models=CFG, client=object())
     assert review.verdict == "follow_up"
     assert review.followup == "add the missing docstring"
 
 
-def test_review_revise_plan(monkeypatch):
+def test_review_revise_plan(monkeypatch, tmp_path):
     monkeypatch.setattr(
         planner_mod, "call_model",
         _FakeBrain("<verdict>revise_plan</verdict><reason>discovered a config we must honor</reason>"),
     )
     plan = _one_step_plan()
-    review = review_step("g", plan, plan.steps[0], "did it", [], PlanMemory(), models=CFG, client=object())
+    review = review_step("g", plan, plan.steps[0], "did it", [], PlanMemory(),
+                         tools=Tools(tmp_path), models=CFG, client=object())
     assert review.verdict == "revise_plan"
     assert "config" in review.reason
 
 
-def test_review_empty_followup_downgrades_to_accept(monkeypatch):
+def test_review_empty_followup_downgrades_to_accept(monkeypatch, tmp_path):
     monkeypatch.setattr(planner_mod, "call_model", _FakeBrain("<verdict>follow_up</verdict>"))
     plan = _one_step_plan()
-    review = review_step("g", plan, plan.steps[0], "did it", [], PlanMemory(), models=CFG, client=object())
+    review = review_step("g", plan, plan.steps[0], "did it", [], PlanMemory(),
+                         tools=Tools(tmp_path), models=CFG, client=object())
     assert review.verdict == "accept"  # unactionable follow-up -> accept
 
 
-def test_review_unparseable_defaults_to_accept(monkeypatch):
+def test_review_unparseable_defaults_to_accept(monkeypatch, tmp_path):
     monkeypatch.setattr(planner_mod, "call_model", _FakeBrain("looks fine to me, nice work"))
     plan = _one_step_plan()
-    review = review_step("g", plan, plan.steps[0], "did it", [], PlanMemory(), models=CFG, client=object())
+    review = review_step("g", plan, plan.steps[0], "did it", [], PlanMemory(),
+                         tools=Tools(tmp_path), models=CFG, client=object())
     assert review.verdict == "accept"
+
+
+# --- v0.0.24: the AGENTIC reviewer reads the real work before verdicting --------
+
+
+class _ScriptedBrain:
+    """A brain returning queued replies in order (then repeating the last forever),
+    so a multi-turn read-then-verdict investigation can be driven, network-free."""
+
+    def __init__(self, *replies):
+        self.queue = list(replies)
+        self.last = replies[-1] if replies else "<verdict>accept</verdict>"
+        self.calls = 0
+
+    def __call__(self, role, messages, **kwargs):
+        self.calls += 1
+        if self.queue:
+            self.last = self.queue.pop(0)
+        return SimpleNamespace(text=self.last, record=None)
+
+
+class _ContentAwareBrain:
+    """Models the documented loop's FIX: blind (seeing only a byte-count), the old
+    reviewer rejected; shown the file's REAL contents, this brain accepts. It reads
+    until the correct-content marker appears in its context, then verdicts accept --
+    so it can only reach 'accept by judgment' if the read actually delivered the file."""
+
+    def __init__(self, marker):
+        self.marker = marker
+        self.calls = 0
+
+    def __call__(self, role, messages, **kwargs):
+        self.calls += 1
+        joined = "\n".join(m["content"] for m in messages)
+        if self.marker in joined:
+            return SimpleNamespace(text="<verdict>accept</verdict>", record=None)
+        return SimpleNamespace(text='<read path="impl.py"/>', record=None)
+
+
+def test_reviewer_reads_touched_file_before_verdicting(monkeypatch, tmp_path):
+    (tmp_path / "answer.py").write_text("def answer():\n    return 42\n", encoding="utf-8")
+    brain = _ScriptedBrain('<read path="answer.py"/>', "<verdict>accept</verdict>")
+    monkeypatch.setattr(planner_mod, "call_model", brain)
+    events = []
+    plan = _one_step_plan()
+    review = review_step(
+        "g", plan, plan.steps[0], "wrote answer.py", [], PlanMemory(),
+        tools=Tools(tmp_path), touched_paths=["answer.py"], models=CFG, client=object(),
+        on_event=lambda k, m, p: events.append((k, m, p)),
+    )
+    assert review.verdict == "accept"
+    assert brain.calls == 2  # it READ first, then verdicted -- not a one-shot blind call
+    # The read hit the real touched file and its contents flowed back to the brain.
+    reads = [p for k, m, p in events if k == "brain_action" and "answer.py" in m]
+    assert reads and "return 42" in reads[0]["observation"]
+
+
+def test_agentic_reviewer_accepts_correct_file_a_blind_reviewer_would_reject(monkeypatch, tmp_path):
+    # The documented loop: the hands wrote a CORRECT file; a blind reviewer (seeing only
+    # "wrote impl.py (N bytes)") would reject it. The agentic reviewer reads the real
+    # file, sees it is correct, and ACCEPTS.
+    (tmp_path / "impl.py").write_text("# CORRECT_IMPLEMENTATION\nvalue = 1\n", encoding="utf-8")
+    plan = _one_step_plan()
+    blind_transcript = ['[edit path="impl.py"]\nwrote impl.py (35 bytes, 2 lines)']  # no contents
+
+    brain = _ContentAwareBrain("CORRECT_IMPLEMENTATION")
+    monkeypatch.setattr(planner_mod, "call_model", brain)
+    review = review_step(
+        "g", plan, plan.steps[0], "wrote impl.py", blind_transcript, PlanMemory(),
+        tools=Tools(tmp_path), touched_paths=["impl.py"], models=CFG, client=object(),
+    )
+    assert review.verdict == "accept"   # reading the real file turned a blind reject into accept
+    assert brain.calls == 2             # read, then accept (the read is what enabled the judgment)
+
+    # Contrast: with NO filesystem handle the same brain never sees the contents, so it
+    # cannot reason its way to accept -- it burns its budget and falls back to the safe
+    # default. The READ is what turns a blind default into a genuine judgment.
+    brain_blind = _ContentAwareBrain("CORRECT_IMPLEMENTATION")
+    monkeypatch.setattr(planner_mod, "call_model", brain_blind)
+    review_blind = review_step(
+        "g", plan, plan.steps[0], "wrote impl.py", blind_transcript, PlanMemory(),
+        tools=None, touched_paths=["impl.py"], max_review_steps=3, models=CFG, client=object(),
+    )
+    assert review_blind.verdict == "accept"   # ...but only via the safe default
+    assert brain_blind.calls == 3             # ...after exhausting the budget, never seeing the file
+
+
+def test_reviewer_budget_exhaustion_falls_back_to_accept(monkeypatch, tmp_path):
+    (tmp_path / "f.py").write_text("x = 1\n", encoding="utf-8")
+    # A brain that investigates forever and never verdicts -> bounded by max_review_steps,
+    # then the safe accept default (running out of review budget must not block progress).
+    brain = _ScriptedBrain('<read path="f.py"/>')  # always reads, never a verdict
+    monkeypatch.setattr(planner_mod, "call_model", brain)
+    plan = _one_step_plan()
+    review = review_step(
+        "g", plan, plan.steps[0], "did it", [], PlanMemory(),
+        tools=Tools(tmp_path), touched_paths=["f.py"], max_review_steps=3,
+        models=CFG, client=object(),
+    )
+    assert review.verdict == "accept"
+    assert brain.calls == 3  # exactly the review budget -- no infinite loop
 
 
 def test_answer_self_answer(monkeypatch):

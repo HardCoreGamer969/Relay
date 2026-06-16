@@ -156,6 +156,7 @@ class _StepOutcome:
     failure_reason: str = ""   # concise reason on failure (fed to replan)
     calls: int = 0             # executor model-calls consumed
     transcript: list[str] = field(default_factory=list)  # what the executor did
+    touched_paths: list[str] = field(default_factory=list)  # files actually written this step
     unresolved: bool = False   # a product-decision escalation could not be resolved
     unresolved_question: str = ""
     cancelled: bool = False    # the user cancelled between executor calls (clean stop)
@@ -246,6 +247,7 @@ def _run_executor_step(
         {"role": "user", "content": _executor_step_prompt(goal, step, plan, extra_instruction=extra_instruction)},
     ]
     transcript: list[str] = []
+    touched: list[str] = []  # files actually written this step (seed the reviewer to read them)
     consecutive_parse_failures = 0
     calls = 0
     # Read-tracking for the read-before-edit guard. ``run_planned`` passes a shared
@@ -290,7 +292,10 @@ def _run_executor_step(
                 reason = action.content or "no reason given"
                 return _StepOutcome(False, failure_reason=f"blocked: {reason}", calls=calls, transcript=transcript)
             if action.kind == "done":
-                return _StepOutcome(True, summary=action.content or "step complete", calls=calls, transcript=transcript)
+                return _StepOutcome(
+                    True, summary=action.content or "step complete", calls=calls,
+                    transcript=transcript, touched_paths=touched,
+                )
             if action.kind == "question":
                 question = action.content or ""
                 if resolve_question is None:
@@ -320,6 +325,12 @@ def _run_executor_step(
             rendered = f"[{describe_action(action)}]\n{observation}"
             observations.append(rendered)
             transcript.append(rendered[:_TRANSCRIPT_ENTRY_CAP])
+            # Track files the executor actually WROTE (a successful edit returns
+            # "wrote <path> ..."), so the reviewer can be seeded to read what changed.
+            # A refused ("Refused: ...") or errored ("error: ...") edit is not counted.
+            if action.kind == "edit" and action.path and observation.startswith("wrote "):
+                if action.path not in touched:
+                    touched.append(action.path)
 
         messages.append(
             {"role": "user", "content": "\n\n".join(observations) if observations else "(no output)"}
@@ -429,6 +440,7 @@ def run_planned(
     max_executor_steps: int = 12,
     max_escalations: int = 3,
     max_followups_per_step: int = 2,
+    max_review_steps: int = 4,
     max_plan_revisions: int = 5,
     max_total_steps: int | None = None,
     context_window: int | None = None,
@@ -448,6 +460,7 @@ def run_planned(
     (v0.04). All loops are bounded.
 
     Knobs: ``supervise`` (default on), ``max_followups_per_step``,
+    ``max_review_steps`` (the agentic reviewer's own read-only investigation budget),
     ``max_plan_revisions``, ``max_escalations``, ``max_total_steps`` (overall
     executor-call budget), and ``context_window`` (override the resolved window
     used to size memory reads). ``user_decision(question) -> answer`` is the
@@ -478,8 +491,11 @@ def run_planned(
     Note: a single step's executor ceiling is ``max_executor_steps *
     (1 + max_followups_per_step)`` (each supervised follow-up re-runs the
     executor with its own budget); ``max_total_steps`` is the hard global cap.
-    Review/answer/evolve are brain calls and do NOT count against the executor
-    budget.
+    Review is 1..N brain calls (1 when the model verdicts immediately; up to
+    ``max_review_steps`` when it investigates the touched file(s) read-only first);
+    review calls do NOT count against the executor ``max_total_steps`` ceiling --
+    the reviewer has its own ``max_review_steps`` budget. Answer/evolve are likewise
+    brain calls and excluded from the executor budget.
     """
     ledger = ledger if ledger is not None else Ledger()
     memory = memory if memory is not None else PlanMemory()
@@ -639,8 +655,10 @@ def run_planned(
                 return _Disposition("done", summary=outcome.summary, records=records)
 
             review = review_step(
-                goal, plan, step, outcome.summary, outcome.transcript, memory, models=models,
-                ledger=ledger, client=client, memory_budget_tokens=mem_budget, brain_role=brain_role,
+                goal, plan, step, outcome.summary, outcome.transcript, memory,
+                tools=tools, touched_paths=outcome.touched_paths, max_review_steps=max_review_steps,
+                models=models, ledger=ledger, client=client, memory_budget_tokens=mem_budget,
+                brain_role=brain_role, on_event=emit,
             )
             emit("step_reviewed", f"step {step.index} review: {review.verdict}",
                  {"index": step.index, "verdict": review.verdict, "followup": review.followup, "reason": review.reason})

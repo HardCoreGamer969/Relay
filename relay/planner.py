@@ -17,10 +17,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from relay.config import ModelConfig, assumption_directive
 from relay.context import DEFAULT_CONTEXT_WINDOW
+from relay.investigation import investigate
 from relay.loop import describe_action, execute_action
 from relay.memory import PlanMemory, memory_budget
 from relay.models import call_model
@@ -373,6 +374,15 @@ goal, the plan, what the executor did, and relevant prior memory. Be concise.
 Bias toward accept when the work is adequate; ask for a follow-up only when there
 is a concrete, correctable gap; choose revise_plan only when what was learned
 changes the REMAINING work.
+
+You MAY investigate READ-ONLY before judging, using ONLY these tags:
+  <read path="relative/path"/>
+  <list path="relative/path"/>
+  <grep pattern="regex" path="relative/path"/>
+You cannot edit files or run bash. The executor's summary can be wrong or thin --
+reading the file(s) it actually changed is the surest way to judge, so prefer
+reading what changed over trusting the summary. When you have seen enough (or
+immediately, if no reading is needed), emit your <verdict>.
 """
 
 _REVIEW_GRAMMAR = (
@@ -475,35 +485,74 @@ def review_step(
     observations: list[str] | None,
     memory: PlanMemory | None,
     *,
+    tools: Tools | None = None,
+    touched_paths: Sequence[str] = (),
+    max_review_steps: int = 4,
     models: ModelConfig | None = None,
     ledger: Ledger | None = None,
     client: Any | None = None,
     memory_budget_tokens: int = _DEFAULT_MEMORY_BUDGET,
     brain_role: str = "brain",
+    on_event: EventSink | None = None,
 ) -> StepReview:
-    """One brain call at a step boundary: accept / follow_up / revise_plan."""
+    """Agentically review a finished step: accept / follow_up / revise_plan.
+
+    The reviewer is an agent, not a one-shot blind call: seeded with the file(s) the
+    executor changed (``touched_paths``), it may ``read`` / ``list`` / ``grep`` to see
+    the ACTUAL work before judging -- the ground truth the old one-shot reviewer lacked
+    (it saw only a path label + byte-count). It runs through the shared read-only
+    :func:`relay.investigation.investigate` primitive: bounded by ``max_review_steps``
+    brain turns, read-only (it can never edit/bash), and on budget exhaustion it returns
+    the safe ``accept`` default (running out of investigation budget must not block
+    progress). It is 1 brain call when the model verdicts immediately, up to
+    ``max_review_steps`` when it investigates first; review calls are excluded from the
+    executor ``max_total_steps`` ceiling (they have their own budget).
+
+    Phase (a): the seed is the touched file(s) -- the minimum that fixes the documented
+    blind-reviewer loop. Phase (b) (widening to related files / reusing command output
+    already in the transcript) is later a prompt/seed/budget change, not a re-architecture.
+    """
     mem_ctx = _memory_context(
         memory, step.instruction, memory_budget_tokens, client=client, models=models, ledger=ledger
     )
     transcript = _bounded_text("\n".join(observations or []), 4000)
     memory_block = f"Relevant memory:\n{mem_ctx}\n\n" if mem_ctx else ""
-    user = (
+    touched_block = ""
+    if touched_paths:
+        listing = "\n".join(f"- {p}" for p in touched_paths)
+        touched_block = (
+            "Files the executor changed this step (READ them to verify the real "
+            f"contents before judging):\n{listing}\n\n"
+        )
+    seed = (
         f"Goal: {goal}\n\n"
         f"Plan so far:\n{_render_plan(plan)}\n\n"
         f"Step under review: [{step.index}] {step.instruction}\n"
         f"Executor reported done: {executor_summary}\n\n"
         f"What the executor did this step:\n{transcript or '(no observations)'}\n\n"
+        f"{touched_block}"
         f"{memory_block}"
-        f"{_REVIEW_GRAMMAR}"
+        f"{_REVIEW_GRAMMAR}\n\n"
+        "Investigate read-only if useful, then emit your <verdict>."
     )
-    reply = call_model(
-        brain_role,
-        [{"role": "system", "content": _REVIEW_SYSTEM}, {"role": "user", "content": user}],
+    return investigate(
+        _REVIEW_SYSTEM,
+        seed,
+        terminators=("verdict",),
+        parse_terminal=_parse_review,
+        safe_default=lambda: _parse_review(""),  # absent verdict -> accept (never blocks)
+        budget=max_review_steps,
+        tools=tools,
+        brain_role=brain_role,
         models=models,
         ledger=ledger,
         client=client,
-    ).text
-    return _parse_review(reply)
+        model_call=call_model,  # planner's (test-patchable) call_model reference
+        emit=on_event,
+        final_instruction=(
+            "This is your last turn -- emit <verdict>accept|follow_up|revise_plan</verdict> now."
+        ),
+    )
 
 
 def _parse_review(text: str) -> StepReview:

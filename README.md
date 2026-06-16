@@ -46,7 +46,39 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.22 (`/log`: a shareable, redacted debug export)
+## Status — v0.0.23 (read-before-edit: the hands can't blind-edit a file it hasn't read)
+
+A cheap/weak executor will happily rewrite a file from an assumed picture of its
+contents — and if the brain's instruction is wrong about what the file looks like, that
+mistake gets baked in silently. This release adds the Claude-Code-style **"must read
+first" discipline**, scoped to Relay's hands: the executor may not `<edit>` an **existing**
+file it has not **read** (with a still-current read) earlier in this run.
+
+- **A hard guard where edits execute.** When the hands issues an `<edit>`: a **new file**
+  (path doesn't exist) is allowed unconditionally — creation is never blocked; an **existing
+  file with no current read** is **refused** with a recoverable observation (*"Refused: you
+  must read "…" before editing it … Use `<read path="…"/>` first."*) and the file is left
+  untouched; an existing file **with a current read** is applied. The refusal is a normal
+  executor observation — **not** a parse failure or step abort — so the loop continues and
+  the hands recovers by reading, then editing.
+- **Freshness is content-hash based, never mtime.** A read records the file's sha256; a read
+  stays valid only while the file's contents are unchanged (so unchanged files need no
+  pointless re-read), and **any edit invalidates** the file's recorded read so the next edit
+  needs a fresh one. Content hashing is robust where mtime isn't (e.g. Windows). The
+  read-map is **run-scoped** (a read in an earlier step stays valid across steps).
+- **One sentence to the executor prompt (catch the brain).** *"Before editing an existing
+  file, read it first; if its actual contents don't match what the step assumes, say so
+  rather than forcing the change."* The guard forces the contents into view; this nudge
+  turns that into the hands reliably **speaking up** when the brain is wrong, instead of
+  silently complying.
+
+The guard is the **hands' only** — the brain is read-only (it plans/reviews, never edits)
+and is untouched, as are the bridge, cost/limits, providers, and dependencies. Proven by
+network-free headless tests (helper freshness lifecycle + executor behavior driven through
+`run_planned`). One existing fixture that re-edited a file without reading was updated to
+read-then-edit, matching real behavior.
+
+Under that, **v0.0.22** (`/log`: a shareable, redacted debug export) still stands.
 
 When a beta tester hits a problem, "describe what went wrong" loses most of the picture.
 **`/log`** captures it instead: one timestamped, human-readable Markdown file with the

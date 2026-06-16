@@ -202,6 +202,7 @@ from relay.secrets import (
 )
 from relay.store import config_dir, config_path, load_config, save_config
 from relay.conversation import ConversationResult, ScopeAssessment, plan_conversationally
+from relay.investigation import investigate
 from relay.loop import StepResult, TaskResult, run_task
 from relay.memory import (
     MemoryEntry,
@@ -250,7 +251,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.23"
+__version__ = "0.0.24"
 
 __all__ = [
     # v0.01 -- model layer
@@ -367,5 +368,7 @@ __all__ = [
     "build_debug_bundle",
     "summarize_run",
     "RunSnapshot",
+    # v0.0.24 -- the generalized read-only brain-investigation primitive
+    "investigate",
     "__version__",
 ]

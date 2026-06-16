@@ -46,7 +46,59 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.23 (read-before-edit: the hands can't blind-edit a file it hasn't read)
+## Status — v0.0.24 (the agentic reviewer: a read-only brain-investigation primitive, wired to the reviewer first)
+
+The brain's step reviewer was the worst of a cluster of one-shot "judge-from-a-snippet"
+calls: it **gated every step** yet literally **could not see the file it judged** — it got
+a path label, a byte-count, and the hands' `<done>` claim, nothing more. The documented
+failure: the hands writes a *correct* file, the blind reviewer rejects it, the plan
+re-issues the step, and the loop grinds. This release fixes that by making the reviewer an
+**agent that reads the real work before verdicting** — and does so by first building a
+**generalized, reusable read-only brain-investigation primitive**, then wiring the reviewer
+through it as its first consumer.
+
+- **A generalized read-only brain-investigation loop (`relay.investigation.investigate`).**
+  The brain analog of the executor's mini-loop, but **read-only** and consumer-parameterized.
+  A consumer supplies a system prompt, a seed, terminator tag(s) (e.g. `<verdict>`), a
+  final-output parser, a small budget, and a safe default; the primitive owns the loop, the
+  **read-only action set** (`read`/`list`/`grep` only — an `edit`/`bash` a model emits is
+  **refused and never executed**, so the brain can never write), budget bounding, bounded
+  parse-failure nudging, and the **text-protocol contract** (Relay tags it parses itself —
+  never native tool/function-calling, the moat). Built **heavy on purpose** and
+  **validated on paper against all four** anomaly-cluster consumers (reviewer, `replan`,
+  `evolve_plan`, `answer_or_escalate`) via documented adapter sketches, so "general" is
+  earned, not hoped — but **only the reviewer is wired now**; the other three are
+  proven-to-fit future consumers, unchanged functionally.
+- **The reviewer, wired through it.** Seeded with the file(s) the executor actually changed
+  (`touched_paths`, collected from the step's successful edits), the reviewer's strong first
+  move is "read what changed" — the ground truth it lacked. It is bounded by a new
+  `max_review_steps` budget (default 4 — it verifies, it doesn't build); on exhaustion it
+  returns the existing **safe `accept`** default so running out of investigation budget never
+  blocks progress; it returns the unchanged `StepReview` type (the orchestrator's branching
+  is untouched); and it **never writes**. This is **phase (a)** — the touched file(s), the
+  minimum that fixes the loop; **phase (b)** (widening to related files / reusing command
+  output already in the transcript) is designed-for, a later prompt/seed/budget change, not
+  a re-architecture.
+- **The call-count invariant, restated (not silently changed).** Review is now **1..N brain
+  calls** — 1 when the model verdicts immediately, up to `max_review_steps` when it
+  investigates first — and review calls **remain excluded** from the executor
+  `max_total_steps` ceiling (the reviewer has its own budget). The augmented review prompt
+  keeps the `supervising an EXECUTOR` phrase verbatim, so the existing fakes still route
+  review calls; every existing call-count test survives unchanged.
+
+The brain investigation loop is **read-only and cannot write** (enforced structurally:
+`edit`/`bash` never reach execution); review calls stay **off** the executor ceiling; **only
+the reviewer is wired** (the other three consumers are paper-validated); and the **text
+protocol**, not native tool-calling, is used throughout. Proven by network-free headless
+tests — the primitive in isolation (reads, bounds, safe-default, read-only refusal, bounded
+parse-failures), the reviewer reading the touched file before verdicting, the loop-fix
+scenario (a correct file a blind reviewer would reject is accepted once read), and
+budget-exhaustion → safe accept. The **behavioral** check — a before/after accept-rate
+run-matrix on real projects, to confirm the agentic reviewer doesn't become net-stricter on
+healthy runs — is a **live** task for the maintainer; it is not simulated here.
+
+Under that, **v0.0.23** (read-before-edit: the hands can't blind-edit a file it hasn't read)
+still stands.
 
 A cheap/weak executor will happily rewrite a file from an assumed picture of its
 contents — and if the brain's instruction is wrong about what the file looks like, that

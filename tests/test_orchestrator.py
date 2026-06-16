@@ -464,6 +464,11 @@ def test_overall_budget_exhausted_is_max_steps(tmp_path):
     assert result.status == STATUS_MAX_STEPS
     assert (tmp_path / "a.txt").exists()
     assert not (tmp_path / "b.txt").exists()  # step 1 never ran -- executor budget spent
+    # The ceiling is recorded, and the result turn tells the user how to raise it.
+    assert result.max_total_steps == 1
+    text = [t for t in result.transcript.turns if t.phase == "result"][-1].text
+    assert "ceiling" in text.lower()
+    assert ("RELAY_MAX_TOTAL_STEPS" in text or "--max-total-steps" in text)
 
 
 def test_planning_failed(tmp_path):

@@ -5,9 +5,11 @@ from __future__ import annotations
 from relay.config import (
     ASSUMPTION_LEVELS,
     DEFAULT_ASSUMPTION_LEVEL,
+    DEFAULT_MAX_TOTAL_STEPS,
     assumption_directive,
     assumption_summary,
     resolve_assumption_level,
+    resolve_max_total_steps,
 )
 
 
@@ -82,3 +84,42 @@ def test_directive_low_vs_high_differ_in_posture():
     high = assumption_directive("5").lower()
     assert "assume almost everything" in low
     assert "assume almost nothing" in high
+
+
+# --- v0.0.21: the global step ceiling (env > config > default 50) ------------
+
+
+def test_max_total_steps_defaults_to_50(monkeypatch):
+    monkeypatch.delenv("RELAY_MAX_TOTAL_STEPS", raising=False)
+    assert resolve_max_total_steps(config={}) == 50
+    assert DEFAULT_MAX_TOTAL_STEPS == 50
+
+
+def test_max_total_steps_env_beats_config(monkeypatch):
+    monkeypatch.setenv("RELAY_MAX_TOTAL_STEPS", "200")
+    assert resolve_max_total_steps(config={"max_total_steps": 99}) == 200
+
+
+def test_max_total_steps_config_beats_default(monkeypatch):
+    monkeypatch.delenv("RELAY_MAX_TOTAL_STEPS", raising=False)
+    assert resolve_max_total_steps(config={"max_total_steps": 120}) == 120
+
+
+def test_max_total_steps_override_beats_env(monkeypatch):
+    monkeypatch.setenv("RELAY_MAX_TOTAL_STEPS", "200")
+    assert resolve_max_total_steps(override=30, config={}) == 30
+
+
+def test_max_total_steps_can_be_disabled(monkeypatch):
+    monkeypatch.delenv("RELAY_MAX_TOTAL_STEPS", raising=False)
+    assert resolve_max_total_steps(override=0, config={}) is None       # 0 -> unbounded
+    assert resolve_max_total_steps(override="off", config={}) is None
+    monkeypatch.setenv("RELAY_MAX_TOTAL_STEPS", "none")
+    assert resolve_max_total_steps(config={"max_total_steps": 5}) is None
+
+
+def test_max_total_steps_invalid_falls_through(monkeypatch):
+    monkeypatch.setenv("RELAY_MAX_TOTAL_STEPS", "abc")  # unparseable -> next source
+    assert resolve_max_total_steps(config={"max_total_steps": 77}) == 77
+    monkeypatch.setenv("RELAY_MAX_TOTAL_STEPS", "-5")   # negative -> next source
+    assert resolve_max_total_steps(config={}) == 50

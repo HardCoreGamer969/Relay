@@ -356,6 +356,26 @@ def test_run_no_supervise_flag(tmp_path, monkeypatch):
     assert captured["supervise"] is False
 
 
+def test_run_passes_default_global_ceiling(tmp_path, monkeypatch):
+    # The CLI is a production caller: it passes the resolved ceiling (50 by default).
+    monkeypatch.delenv("RELAY_MAX_TOTAL_STEPS", raising=False)
+    monkeypatch.setenv("RELAY_CONFIG_DIR", str(tmp_path))  # empty config -> default 50
+    captured = _capture_run_planned(monkeypatch)
+    result = runner.invoke(app, ["run", "-g", "x", "--root", str(tmp_path), "--no-log"])
+    assert result.exit_code == 0
+    assert captured["max_total_steps"] == 50
+
+
+def test_run_max_total_steps_flag_overrides(tmp_path, monkeypatch):
+    monkeypatch.delenv("RELAY_MAX_TOTAL_STEPS", raising=False)
+    captured = _capture_run_planned(monkeypatch)
+    result = runner.invoke(
+        app, ["run", "-g", "x", "--root", str(tmp_path), "--no-log", "--max-total-steps", "7"]
+    )
+    assert result.exit_code == 0
+    assert captured["max_total_steps"] == 7
+
+
 def test_run_renders_brain_executor_events(tmp_path, monkeypatch):
     events = [
         ("executor_question", {"question": "which database should I use?"}),

@@ -25,6 +25,7 @@ from relay.config import (
     describe_resolution,
     load_models,
     resolve_assumption_level,
+    resolve_max_total_steps,
 )
 from relay.context import resolve_context_window
 from relay.providers import (
@@ -170,6 +171,12 @@ def run(
     max_steps: int = typer.Option(
         20, "--max-steps", help="Max model turns (solo mode only)."
     ),
+    max_total_steps: int | None = typer.Option(
+        None, "--max-total-steps",
+        help="Global executor-step ceiling for a planned run (a safety net). "
+        "Default 50; pass 0 to disable (unbounded). Overrides RELAY_MAX_TOTAL_STEPS "
+        "and config for this run.",
+    ),
     no_supervise: bool = typer.Option(
         False, "--no-supervise",
         help="Disable brain supervision (no step-boundary review calls).",
@@ -200,6 +207,7 @@ def run(
     ledger = Ledger()
     approver = None if auto_approve else _interactive_approver
     dial = resolve_assumption_level(override=assume or None)
+    ceiling = resolve_max_total_steps(override=max_total_steps)  # 50 by default; flag/env/config can raise
     _warn_if_dirty_git(root)
 
     mode = "solo" if solo else "planned"
@@ -210,6 +218,7 @@ def run(
         result = _run_planned(
             goal, root, cfg, ledger, auto_approve, approver, confirm_plan,
             supervise=not no_supervise, dial=dial, show_transcript=show_transcript,
+            max_total_steps=ceiling,
         )
     wall_time_s = time.perf_counter() - start
 
@@ -255,7 +264,7 @@ def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver):
 
 
 def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, *,
-                 supervise=True, dial="auto", show_transcript=False):
+                 supervise=True, dial="auto", show_transcript=False, max_total_steps=None):
     """Conversational planning -> commit -> the two-role autonomous loop.
 
     Both phases share ONE transcript, so a mid-run escalation appears as the next
@@ -300,6 +309,7 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
             supervise=supervise, user_decision=_interactive_user_decision,
             assumption_level=dial, committed_plan=conversation.plan,
             on_event=_print_event, transcript=transcript,
+            max_total_steps=max_total_steps,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)

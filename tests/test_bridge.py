@@ -486,3 +486,28 @@ def test_runner_is_single_use(tmp_path):
         runner.start("goal two")
     runner.cancel()
     assert runner.join(WAIT_S)
+
+
+# --- v0.0.21: the TUI is a production caller -> defaults the global ceiling ---
+
+
+def _bare_runner(tmp_path, **kwargs):
+    return EngineRunner(
+        tmp_path, models=CFG, client=SimpleNamespace(),
+        on_request=lambda r: None, on_event=lambda e: None, on_finished=lambda o: None,
+        **kwargs,
+    )
+
+
+def test_bridge_defaults_global_step_ceiling(tmp_path, monkeypatch):
+    monkeypatch.delenv("RELAY_MAX_TOTAL_STEPS", raising=False)
+    monkeypatch.setenv("RELAY_CONFIG_DIR", str(tmp_path))  # empty config dir -> default 50
+    runner = _bare_runner(tmp_path)
+    assert runner._run_kwargs["max_total_steps"] == 50  # never unbounded in production
+
+
+def test_bridge_explicit_ceiling_is_respected(tmp_path):
+    # An explicit run_kwargs value (e.g. a test, or a future surface) wins over the
+    # default -- setdefault only fills it when absent.
+    runner = _bare_runner(tmp_path, run_kwargs={"max_total_steps": 3})
+    assert runner._run_kwargs["max_total_steps"] == 3

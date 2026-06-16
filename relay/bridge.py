@@ -41,7 +41,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
-from relay.config import ModelConfig
+from relay.config import ModelConfig, resolve_max_total_steps
 from relay.conversation import DEFAULT_MAX_ROUNDS, ConversationResult, plan_conversationally
 from relay.orchestrator import (
     STATUS_CANCELLED,
@@ -364,6 +364,10 @@ class EngineRunner:
         self.outcome: RunOutcome | None = None
         self._on_finished = on_finished
         self._run_kwargs = dict(run_kwargs or {})  # extra run_planned knobs (tests)
+        # The TUI is a production caller: default the global step ceiling (50, via
+        # env/config) so a stuck run can't grind unbounded. An explicit run_kwargs
+        # value (tests) is respected; setdefault only fills it when absent.
+        self._run_kwargs.setdefault("max_total_steps", resolve_max_total_steps())
         self._thread: threading.Thread | None = None
 
     # -- lifecycle -----------------------------------------------------------

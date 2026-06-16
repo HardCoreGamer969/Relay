@@ -91,6 +91,66 @@ def assumption_directive(level: str) -> str:
     return _ASSUMPTION_DIRECTIVES.get(level, _ASSUMPTION_DIRECTIVES["auto"])
 
 
+# --- the global step ceiling (v0.0.21) --------------------------------------
+
+# The autonomous loop's one comprehensible top-level safety net: the total number
+# of executor model-calls a run may spend. 50 is generous -- comfortably above any
+# healthy run (real successful runs use far fewer) but well below the grind a
+# stuck step could otherwise reach -- so it should never fire in normal use, only
+# backstop a runaway. It is raisable (or disable-able) so a genuinely large
+# project is never walled off.
+DEFAULT_MAX_TOTAL_STEPS = 50
+# Values that mean "no ceiling" (unbounded): the user opting OUT of the safety net.
+_CEILING_DISABLE = frozenset({"0", "off", "none", "no", "false", "disable", "disabled", "unbounded"})
+_UNSET = object()  # "this source had nothing usable" -- fall through to the next
+
+
+def _parse_ceiling(value: object) -> object:
+    """One ceiling source -> a positive ``int``, ``None`` (disabled), or ``_UNSET``.
+
+    ``_UNSET`` means absent or unparseable, so resolution falls through to the
+    next source rather than crashing on a typo.
+    """
+    if value is None or isinstance(value, bool):  # bool is an int subclass -- reject it
+        return _UNSET
+    if isinstance(value, int):
+        return value if value > 0 else (None if value == 0 else _UNSET)
+    text = str(value).strip().lower()
+    if not text:
+        return _UNSET
+    if text in _CEILING_DISABLE:
+        return None
+    try:
+        n = int(text)
+    except ValueError:
+        return _UNSET
+    return n if n > 0 else (None if n == 0 else _UNSET)
+
+
+def resolve_max_total_steps(
+    override: object = None, config: dict | None = None
+) -> int | None:
+    """Resolve the global executor-step ceiling: **override > env > config > default**.
+
+    ``override`` is the per-run CLI flag (``--max-total-steps``); the env knob is
+    ``RELAY_MAX_TOTAL_STEPS``; ``config.json``'s top-level ``max_total_steps`` is
+    the next rung; the built-in default is :data:`DEFAULT_MAX_TOTAL_STEPS` (50).
+    Returns a positive ceiling, or ``None`` for "unbounded" when explicitly
+    disabled (``0`` / ``off`` / ``none``). Invalid values fall through to the next
+    source. Precedence mirrors the rest of Relay (env wins over saved config).
+    """
+    for candidate in (override, os.environ.get("RELAY_MAX_TOTAL_STEPS")):
+        parsed = _parse_ceiling(candidate)
+        if parsed is not _UNSET:
+            return parsed  # type: ignore[return-value]
+    config = config if config is not None else store.load_config()
+    cfg_val = config.get("max_total_steps") if isinstance(config, dict) else None
+    parsed = _parse_ceiling(cfg_val)
+    if parsed is not _UNSET:
+        return parsed  # type: ignore[return-value]
+    return DEFAULT_MAX_TOTAL_STEPS
+
+
 def assumption_summary(level: str) -> str:
     """A short, plain-language description of what the dial does at ``level``.
 

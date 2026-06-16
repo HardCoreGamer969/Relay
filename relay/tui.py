@@ -34,9 +34,12 @@ experience-level projection slots in there without a refactor.
 from __future__ import annotations
 
 import asyncio
+import platform
 import random
 import re
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Callable
 
 from rich.text import Text
@@ -67,7 +70,9 @@ from relay.config import (
     default_config,
     env_override_for,
     load_models,
+    resolve_max_total_steps,
 )
+from relay.debug import build_debug_bundle, summarize_run
 from relay.orchestrator import Event
 from relay.providers import (
     DISCOVERY_LIST,
@@ -1029,6 +1034,8 @@ COMMANDS: list[Command] = [
             run=lambda app: app._cmd_assume()),
     Command("cost", "Cost", "Session + per-goal spend; toggle / reset the counter", "ops",
             run=lambda app: app._cmd_cost()),
+    Command("log", "Log", "Export a debug log (.md) to share when reporting an issue", "ops",
+            run=lambda app: app._cmd_log()),
     Command("clear", "Clear", "Clear the conversation + activity panes", "ops",
             run=lambda app: app._cmd_clear(), enabled=lambda app: not _run_active(app)),
 ]
@@ -2040,6 +2047,111 @@ class RelayTuiApp(App):
             self.query_one("#activity", RichLog).clear()
         except Exception:  # noqa: BLE001 -- panes not mounted (welcome view)
             pass
+
+    # -- /log: a shareable, redacted debug export -------------------------------
+    #
+    # A beta tester who hits a problem runs /log and gets one timestamped Markdown
+    # file capturing the whole picture -- config, outcome, conversation, activity,
+    # plan, memory -- to attach to a GitHub issue. It is safe to paste in public BY
+    # CONSTRUCTION: the builder writes key PRESENCE only (never a value), and the
+    # whole bundle is run through redact_secrets (with the live key strings) as the
+    # final step. Assembled from existing state -- ZERO model calls, no upload.
+
+    def _cmd_log(self) -> None:
+        """Open the scope dialog (current project / full session); the choice writes
+        a timestamped, REDACTED debug .md to cwd and names the path."""
+        options = [
+            {"title": "Current project", "value": "current", "category": "scope",
+             "description": "The most recent project's transcript, activity, and outcome",
+             "on_select": (lambda v: self._write_debug_log("current"))},
+            {"title": "Full session", "value": "session", "category": "scope",
+             "description": "Everything this session (incl. the current project) -- for "
+                            "repetitive issues across projects",
+             "on_select": (lambda v: self._write_debug_log("session"))},
+        ]
+        self.push_screen(SelectDialog(
+            title="Export a debug log -- which scope?", options=options))
+
+    def _write_debug_log(self, scope: str) -> None:
+        """Build the bundle for ``scope``, redact it, and write a timestamped .md to
+        cwd; then confirm the full path. A write/permissions failure surfaces a
+        friendly line (the friendly-error spirit), never a traceback."""
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        try:
+            bundle = self._build_debug_bundle(scope, timestamp=timestamp)
+        except Exception as exc:  # noqa: BLE001 -- never crash the TUI on export
+            self._write_conversation(
+                f"(could not assemble the debug log: {exc.__class__.__name__})"
+            )
+            return
+        path = Path.cwd() / f"relay-debug-{timestamp}.md"
+        try:
+            path.write_text(bundle, encoding="utf-8")
+        except OSError as exc:
+            reason = exc.strerror or str(exc).splitlines()[0]
+            self._write_conversation(f"(could not write the debug log: {reason})")
+            return
+        self._write_conversation(
+            f"Debug log written to {path} -- safe to attach to a GitHub issue "
+            "(no keys included)."
+        )
+
+    def _build_debug_bundle(self, scope: str, *, timestamp: str) -> str:
+        """Assemble the redacted bundle for ``scope`` from EXISTING state (no model
+        call). Current scope renders the current run's structured transcript; full
+        session renders the session-spanning conversation buffer -- the structured
+        outcome/plan/memory are the current project's in both (the app keeps no
+        per-project history; the bundle header says so)."""
+        runner = self._runner
+        if scope == "session":
+            transcript_lines = list(self._conversation_lines)
+        else:
+            transcript_lines = (
+                [format_turn(t) for t in runner.transcript.turns]
+                if runner is not None else []
+            )
+        activity_lines = list(self._activity_lines)
+
+        outcome = runner.outcome if runner is not None else None
+        cost = runner.ledger.total_cost() if runner is not None else None
+        run = summarize_run(outcome, cost=cost)
+        result = getattr(outcome, "result", None) if outcome is not None else None
+        plan = getattr(result, "plan", None)
+        memory = getattr(result, "memory", None)
+
+        from relay import __version__
+
+        return build_debug_bundle(
+            scope=scope,
+            version=__version__,
+            python_version=platform.python_version(),
+            platform_str=platform.platform(),
+            resolution=describe_resolution(),
+            assumption_level=self._assumption_level,
+            max_total_steps=resolve_max_total_steps(),
+            run=run,
+            transcript_lines=transcript_lines,
+            activity_lines=activity_lines,
+            plan=plan,
+            memory=memory,
+            known_secrets=self._live_key_values(),
+            timestamp=timestamp,
+        )
+
+    def _live_key_values(self) -> list[str]:
+        """The actual resolved key strings (env or auth.json) per provider, handed to
+        the redactor to strip VERBATIM. These are never written into the bundle --
+        the builder emits key presence only; this list is the exact-removal backstop."""
+        values: list[str] = []
+        for pid in known_providers():
+            try:
+                profile = resolve_provider(pid)
+                key = resolve_key(pid, profile.key_env)
+            except Exception:  # noqa: BLE001 -- a bad provider id: skip it
+                key = None
+            if key:
+                values.append(key)
+        return values
 
     # -- cancel + clean shutdown (the money-leak guard) --------------------------
 

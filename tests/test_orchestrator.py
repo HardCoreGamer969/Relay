@@ -238,12 +238,15 @@ def test_follow_up_then_accept_completes(tmp_path):
         ],
         hands=[
             '<edit path="x.txt">v1</edit>\n<done>first attempt</done>',
-            '<edit path="x.txt">v2</edit>\n<done>fixed</done>',
+            # The follow-up re-edits the now-EXISTING x.txt, so it must read it first
+            # (the read-before-edit guard, v0.0.23) -- read+edit in one turn.
+            '<read path="x.txt"/>\n<edit path="x.txt">v2</edit>\n<done>fixed</done>',
         ],
     )
     result = run_planned("x", tmp_path, models=CFG, client=client, max_followups_per_step=2)
 
     assert result.status == STATUS_COMPLETED
+    assert (tmp_path / "x.txt").read_text(encoding="utf-8") == "v2"  # the guarded re-edit applied
     assert len(_hands_calls(client)) == 2  # initial + 1 follow-up
     assert any(e.kind == "decision" and "follow-up" in e.detail.lower() for e in result.memory.entries)
 

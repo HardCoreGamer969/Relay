@@ -136,6 +136,83 @@ def execute_action(tools: Tools, action: Action) -> str:
         return f"error: {exc}"
 
 
+# --- the read-before-edit guard (v0.0.23, the hands/executor only) ------------
+#
+# The hands may not <edit> an EXISTING file it has not read (with a still-current
+# read) earlier in this run. Two purposes: (1) prevent blind edits -- changing a
+# file from a stale/assumed picture; and (2) let the hands catch a hallucinating
+# brain -- if the step assumes the file looks like X but it is Z, the hands (now
+# forced to have the real contents in view) can report the discrepancy rather than
+# applying a wrong change.
+#
+# Freshness is CONTENT-hash based, not step-scoped: a read stays valid as long as
+# the file's contents are unchanged (so unchanged files need no pointless re-read),
+# but ANY edit invalidates the file's recorded read, so the next edit needs a fresh
+# read reflecting the new state. The refusal is a NORMAL, recoverable observation
+# (not a parse failure or step abort): the loop continues so the hands can read-then
+# -edit, or speak up about a mismatch.
+
+
+def _read_before_edit_refusal(path: str) -> str:
+    return (
+        f'Refused: you must read "{path}" before editing it -- its current contents '
+        f'may differ from what you expect. Use <read path="{path}"/> first.'
+    )
+
+
+def read_is_current(tools: Tools, path: str, reads: dict[str, str]) -> bool:
+    """True iff ``path`` was read this run AND its contents are unchanged since the
+    read (the recorded content hash still matches what is on disk)."""
+    recorded = reads.get(tools.canonical(path))
+    if recorded is None:
+        return False
+    return tools.content_hash(path) == recorded
+
+
+def record_read(tools: Tools, path: str, reads: dict[str, str]) -> None:
+    """Record ``path``'s current content hash, marking a later edit of it allowed.
+    A no-op if the file cannot be hashed (missing/directory)."""
+    digest = tools.content_hash(path)
+    if digest is not None:
+        reads[tools.canonical(path)] = digest
+
+
+def invalidate(tools: Tools, path: str, reads: dict[str, str]) -> None:
+    """Drop any recorded read for ``path`` (a write changed it, so a subsequent edit
+    must re-read to reflect the new state)."""
+    reads.pop(tools.canonical(path), None)
+
+
+def guarded_execute_action(tools: Tools, action: Action, reads: dict[str, str] | None) -> str:
+    """:func:`execute_action` plus the read-before-edit guard (hands/executor only).
+
+    - ``<read>`` of an existing file: execute, then record its content hash so a
+      later ``<edit>`` is allowed.
+    - ``<edit>`` to a NEW file (path absent): allowed unconditionally (creation is a
+      core operation -- there is nothing to read).
+    - ``<edit>`` to an EXISTING file with no current read: REFUSED -- the file is left
+      untouched and a recoverable observation tells the hands to read it first.
+    - ``<edit>`` to an existing file with a current read: applied, then the read is
+      invalidated (the edit changed the file).
+
+    ``reads is None`` disables the guard (plain :func:`execute_action`) -- the solo
+    single-model loop does not track reads.
+    """
+    if reads is None:
+        return execute_action(tools, action)
+    if action.kind == "edit":
+        path = action.path or ""
+        if tools.exists(path) and not read_is_current(tools, path, reads):
+            return _read_before_edit_refusal(path)  # do NOT write; recoverable observation
+        observation = execute_action(tools, action)
+        invalidate(tools, path, reads)  # the edit changed the file: a later edit needs a fresh read
+        return observation
+    observation = execute_action(tools, action)
+    if action.kind == "read" and not observation.startswith("error:"):
+        record_read(tools, action.path or "", reads)
+    return observation
+
+
 def run_task(
     goal: str,
     project_root: str | Path,

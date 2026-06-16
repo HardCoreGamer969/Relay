@@ -32,7 +32,7 @@ from relay.loop import (
     STATUS_COMPLETED,
     STATUS_MAX_STEPS,
     describe_action,
-    execute_action,
+    guarded_execute_action,
 )
 from relay.memory import PlanMemory, memory_budget, texts_near_duplicate
 from relay.models import call_model
@@ -86,6 +86,7 @@ Work the current step ONE action at a time, using these EXACT tags:
 
 Rules:
 - Paths are relative to the project root; you cannot escape it.
+- Before editing an existing file, read it first; if its actual contents don't match what the step assumes, say so rather than forcing the change.
 - Some destructive bash commands are refused by policy ("BLOCKED by policy: ...")
   or need approval ("DENIED ..."); adapt rather than re-emitting them verbatim.
 - Stay scoped to YOUR current step. Do NOT do later steps.
@@ -225,6 +226,7 @@ def _run_executor_step(
     resolve_question: Callable[[str], _QuestionResolution] | None = None,
     extra_instruction: str | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    reads: dict[str, str] | None = None,
 ) -> _StepOutcome:
     """Run the hands in a fresh, narrow context until done/blocked/budget/question.
 
@@ -246,6 +248,12 @@ def _run_executor_step(
     transcript: list[str] = []
     consecutive_parse_failures = 0
     calls = 0
+    # Read-tracking for the read-before-edit guard. ``run_planned`` passes a shared
+    # run-scoped map (a read in an earlier step stays valid while the file is
+    # unchanged); a direct call gets a fresh per-step map. The guard is enforced in
+    # ``guarded_execute_action`` below.
+    if reads is None:
+        reads = {}
 
     for _ in range(max(max_steps, 0)):
         # Fast cancel: poll BEFORE issuing the next call. A cancel that arrived during
@@ -306,7 +314,7 @@ def _run_executor_step(
                     "is complete, <question> if you need info, or <blocked> if stuck -- do not plan."
                 )
                 continue
-            observation = execute_action(tools, action)
+            observation = guarded_execute_action(tools, action, reads)
             if emit is not None:
                 emit("exec_action", describe_action(action), {"kind": action.kind, "observation": observation})
             rendered = f"[{describe_action(action)}]\n{observation}"
@@ -537,6 +545,10 @@ def run_planned(
         return finalize(plan)
 
     tools = Tools(Path(project_root), approver=approver, auto_approve=auto_approve)
+    # Run-scoped read-tracking for the read-before-edit guard (v0.0.23): which files
+    # the hands has read, by content hash. Shared across every step of this run, so a
+    # read stays valid while the file is unchanged (content-valid, not step-scoped).
+    reads: dict[str, str] = {}
 
     escalations = 0
     revisions = 0
@@ -608,7 +620,7 @@ def run_planned(
         outcome = _run_executor_step(
             step, plan, goal, tools, hands_role=hands_role, models=models, ledger=ledger,
             client=client, max_steps=step_budget, emit=emit, resolve_question=resolver,
-            cancel_check=cancel_check,
+            cancel_check=cancel_check, reads=reads,
         )
         executor_calls += outcome.calls
         followups_used = 0
@@ -655,7 +667,7 @@ def run_planned(
             outcome = _run_executor_step(
                 step, plan, goal, tools, hands_role=hands_role, models=models, ledger=ledger,
                 client=client, max_steps=step_budget, emit=emit, resolve_question=resolver,
-                extra_instruction=review.followup, cancel_check=cancel_check,
+                extra_instruction=review.followup, cancel_check=cancel_check, reads=reads,
             )
             executor_calls += outcome.calls
 

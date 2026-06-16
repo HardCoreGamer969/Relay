@@ -14,6 +14,7 @@ both). Real isolation (process/container sandboxing) is a later milestone (v0.95
 
 from __future__ import annotations
 
+import hashlib
 import re
 import subprocess
 from dataclasses import dataclass
@@ -134,6 +135,43 @@ class Tools:
         target.write_text(content, encoding="utf-8")
         lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
         return f"wrote {path} ({len(content)} bytes, {lines} lines)"
+
+    # -- read-tracking support (v0.0.23: the read-before-edit guard) ----------
+    #
+    # Freshness is CONTENT-based, never mtime: the user is on Windows where mtime
+    # is unreliable, and a content hash is the robust "has this file changed since
+    # I read it?" signal. These three are the filesystem primitives the executor's
+    # guard (``relay.loop``) calls; they never raise (a bad path -> a benign answer).
+
+    def exists(self, path: str) -> bool:
+        """Whether ``path`` resolves (inside the root) to an existing regular file."""
+        try:
+            target = self._resolve(path)
+        except PathEscapeError:
+            return False
+        return target.exists() and target.is_file()
+
+    def content_hash(self, path: str) -> str | None:
+        """sha256 hex of the file's bytes, or ``None`` when it cannot be hashed
+        (missing, a directory, escapes the root, or unreadable)."""
+        try:
+            target = self._resolve(path)
+        except PathEscapeError:
+            return None
+        if not target.exists() or target.is_dir():
+            return None
+        try:
+            return hashlib.sha256(target.read_bytes()).hexdigest()
+        except OSError:
+            return None
+
+    def canonical(self, path: str) -> str:
+        """A stable read-tracking key for ``path`` (its resolved absolute path when
+        inside the root, else the raw string), so ``./a`` and ``a`` map to one entry."""
+        try:
+            return str(self._resolve(path))
+        except PathEscapeError:
+            return path
 
     def bash(self, command: str) -> str:
         """Run ``command`` (cwd pinned to ``project_root``) subject to the policy.

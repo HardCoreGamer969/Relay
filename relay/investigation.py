@@ -11,8 +11,13 @@ The CONSUMER supplies:
   - ``system``         the system prompt for this kind of decision;
   - ``seed``           the user message describing what to investigate;
   - ``terminators``    the tag name(s) whose presence ends the loop (e.g. ``verdict``);
-  - ``parse_terminal`` its parser, applied to the terminating reply -> its result type;
-  - ``safe_default``   a zero-arg factory for the result returned on exhaustion;
+  - ``parse_terminal`` a one-arg ``(reply) -> result`` callable (the consumer's parser); it
+    MAY close over extra context the bare interface does not thread -- e.g.
+    answer_or_escalate binds the executor's question via
+    ``lambda reply: _parse_resolution(reply, question)`` -- so a consumer whose parser needs
+    more than the reply still fits without any signature change;
+  - ``safe_default``   a zero-arg ``() -> result`` factory for the result on exhaustion (it
+    may likewise close over context, e.g. ``lambda: _parse_resolution("", question)``);
   - ``budget``         the max number of brain turns (small -- it verifies, not builds);
   - the brain ``brain_role`` / ``models`` / ``client`` / ``ledger`` / ``emit`` / ``tools``.
 
@@ -46,11 +51,15 @@ checked against the four anomaly-cluster consumers. Each fits:
     Needs the ``is_terminal`` refinement "a NON-EMPTY ``<plan>`` or an ``<abort>``" (an
     empty ``<plan></plan>`` should keep investigating, not terminate). *Paper-validated.*
   - **evolve_plan** -- as replan, seed = reason + memory. *Paper-validated.*
-  - **answer_or_escalate** -- system ``_ANSWER_SYSTEM``, terminator ``("decision",)``,
-    parser ``_parse_resolution(reply, question)`` -> ``Resolution``, seed = the question +
-    goal + plan + memory (+ value-add: read the code to self-answer), budget = its own,
-    safe_default = ``_parse_resolution("", question)`` (conservative escalate).
-    *Paper-validated.*
+  - **answer_or_escalate** -- system ``_ANSWER_SYSTEM``, terminator ``("decision",)``, seed =
+    the question + goal + plan + memory (+ value-add: read the code to self-answer), budget =
+    its own. Its parser, ``_parse_resolution``, takes two args (reply, question), so the
+    consumer binds the question via a CLOSURE -- which is itself the one-arg callable the
+    interface asks for, so NO signature change is needed:
+    ``parse_terminal=lambda reply: _parse_resolution(reply, question)`` and
+    ``safe_default=lambda: _parse_resolution("", question)`` -> ``Resolution`` (conservative
+    escalate). This is the same shape the wired reviewer uses, where ``_parse_review`` simply
+    needs no extra context. *Paper-validated.*
 
 Only the reviewer is wired through this primitive in v0.0.24; the other three stay as
 they are functionally and are proven-to-fit, ready to migrate without a re-architecture.

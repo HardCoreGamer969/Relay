@@ -18,6 +18,7 @@ from relay.orchestrator import (
     STATUS_ABORTED_BY_BRAIN,
     STATUS_ESCALATION_LIMIT,
     STATUS_PLANNING_FAILED,
+    STATUS_REPEATED_STEP,
     STATUS_UNRESOLVED_ESCALATION,
     run_planned,
 )
@@ -323,6 +324,52 @@ def test_brain_aborts_on_failure(tmp_path):
     )
     result = run_planned("g", tmp_path, models=CFG, client=client)
     assert result.status == STATUS_ABORTED_BY_BRAIN
+
+
+# --- v0.0.21: repetition breaker (stop a re-issued dead-end early) -----------
+
+
+def test_repeated_dead_end_step_stops_early(tmp_path):
+    # Step 0 dead-ends (blocked); the replan re-issues a NEAR-IDENTICAL step.
+    # The repetition breaker catches it the moment it would run again and stops
+    # cleanly -- WITHOUT grinding the full escalation budget (default 3).
+    client = RoutedClient(
+        brain=[
+            "<plan><step>Implement the input loop in main() to handle user navigation commands</step></plan>",
+            "<plan><step>Implement the input loop in main() to handle the navigation commands properly</step></plan>",
+        ],
+        hands=[
+            "<blocked>cannot determine the loop structure</blocked>",
+        ],
+    )
+    result = run_planned("terminal calendar", tmp_path, models=CFG, client=client)
+
+    assert result.status == STATUS_REPEATED_STEP
+    assert result.escalations == 1          # stopped after the first replan, not 3
+    assert len(_hands_calls(client)) == 1   # the re-issued step never ran (no grind)
+    status_events = [e for e in result.events if e.kind == "status"]
+    assert any(e.payload.get("status") == STATUS_REPEATED_STEP for e in status_events)
+
+
+def test_progressing_replan_is_not_short_circuited(tmp_path):
+    # A genuinely-different replan step (not a restatement of the dead-end) runs
+    # normally -- the breaker fires ONLY on a clear repeat, never on progress.
+    client = RoutedClient(
+        brain=[
+            "<plan><step>Build the config loader that reads from a toml settings file</step></plan>",
+            "<plan><step>Create the month grid renderer with seven weekday columns</step></plan>",
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
+            "<blocked>cannot find the settings format</blocked>",
+            '<edit path="grid.py">grid</edit>\n<done>created the month grid renderer</done>',
+        ],
+    )
+    result = run_planned("terminal calendar", tmp_path, models=CFG, client=client)
+
+    assert result.status == STATUS_COMPLETED  # not STATUS_REPEATED_STEP
+    assert "replanned" in _kinds(result)
+    assert len(_hands_calls(client)) == 2     # the genuinely-different step ran
 
 
 # --- narrow executor context still holds -----------------------------------

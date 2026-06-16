@@ -34,7 +34,7 @@ from relay.loop import (
     describe_action,
     execute_action,
 )
-from relay.memory import PlanMemory, memory_budget
+from relay.memory import PlanMemory, memory_budget, texts_near_duplicate
 from relay.models import call_model
 from relay.planner import (
     Plan,
@@ -55,6 +55,10 @@ from relay.transcript import Transcript, compact_transcript, record_decision, re
 STATUS_PLANNING_FAILED = "planning_failed"
 STATUS_ABORTED_BY_BRAIN = "aborted_by_brain"
 STATUS_ESCALATION_LIMIT = "escalation_limit"
+# v0.0.21: a replan re-issued a step that had ALREADY dead-ended the same way --
+# the repeated-dead-end loop. Caught the moment the re-issued step would run, so
+# the run fails fast instead of grinding the full escalation budget on it.
+STATUS_REPEATED_STEP = "repeated_step"
 STATUS_DECLINED = "declined_by_user"  # plan shown but not approved (--confirm-plan)
 # A genuine product decision was needed but no user_decision callback was
 # available, so the run stopped rather than guessing (the silent-wrong-build trap).
@@ -336,6 +340,7 @@ def _result_summary(status: str, plan: Plan) -> str:
         STATUS_MAX_STEPS: "Stopped early: the step budget ran out.",
         STATUS_CANCELLED: "Stopped: you cancelled the run.",
         STATUS_ESCALATION_LIMIT: "Stopped: too many steps failed to recover.",
+        STATUS_REPEATED_STEP: "Stopped: I kept retrying the same step without it being accepted.",
         STATUS_ABORTED_BY_BRAIN: "Stopped: I judged the goal unreachable as specified.",
         STATUS_UNRESOLVED_ESCALATION: "Paused: I needed a decision from you that I could not get.",
         STATUS_PLANNING_FAILED: "Could not produce a usable plan.",
@@ -492,6 +497,10 @@ def run_planned(
     escalations = 0
     revisions = 0
     executor_calls = 0
+    # Instructions of steps that have already dead-ended this run. The repetition
+    # breaker (v0.0.21) compares each newly-pending step against these: a replan
+    # that re-issues a near-identical already-failed step is the loop signature.
+    dead_ended_instructions: list[str] = []
 
     def make_question_resolver(step: PlanStep) -> Callable[[str], _QuestionResolution]:
         """Resolve an executor question: brain self-answers, or escalates to the user."""
@@ -623,6 +632,20 @@ def run_planned(
             emit("status", "all steps complete", {"status": STATUS_COMPLETED})
             break
 
+        # Repetition breaker (v0.0.21): a replan/evolve just re-issued a step that
+        # already dead-ended the same way -> we are looping. Stop cleanly BEFORE
+        # running it again, instead of grinding the remaining escalations (each is
+        # a full executor step + reviews + replan). Conservative by construction:
+        # it fires only on a CLEAR re-issued dead-end (a near-identical
+        # instruction), so a progressing run -- whose replan chose a genuinely
+        # different approach -- is never short-circuited.
+        if any(texts_near_duplicate(step.instruction, prior) for prior in dead_ended_instructions):
+            result.status = STATUS_REPEATED_STEP
+            emit("status",
+                 "stopped: the plan kept re-issuing a step that already failed the same way",
+                 {"status": STATUS_REPEATED_STEP, "index": step.index, "instruction": step.instruction})
+            break
+
         # Overall executor-call budget guard (the "max_steps" terminal status).
         step_budget = max_executor_steps
         if max_total_steps is not None:
@@ -691,6 +714,7 @@ def run_planned(
 
         # disposition.kind == "failed" -> record the dead end, escalate to replan.
         plan.mark_failed(step, disposition.failure_reason)
+        dead_ended_instructions.append(step.instruction)  # repetition-breaker watch list
         remember("dead_end", f"Step {step.index} failed: {disposition.failure_reason}",
                  f"failed: {disposition.failure_reason}", provenance=f"step{step.index}")
         emit("step_failed", f"step {step.index} failed: {disposition.failure_reason}",

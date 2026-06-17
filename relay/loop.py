@@ -50,6 +50,7 @@ Tools available to you:
 - write a whole file's contents (create or fully replace); parent directories are created.
 - edit a file by writing its FULL new contents; the file is replaced and parent directories are created.
 - apply_patch to make targeted multi-location / multi-file / rename / delete changes in ONE atomic patch (OpenCode envelope; all-or-nothing).
+- mkdir to create a directory (and parents) cross-platform, without a shell -- no `mkdir -p`.
 - webfetch a URL and get back its readable text.
 - bash to run a shell command whose working directory is the project root; you get stdout, stderr, and the exit code. Some destructive commands are refused by policy (you will see "BLOCKED by policy: ...") or require user approval (you will see "DENIED ..." if not approved) -- when a command is refused, adapt and find another way rather than re-emitting it verbatim.
 
@@ -63,6 +64,7 @@ prose -- emit the tag. You may emit more than one tag, but prefer one step at a 
   <write path="relative/path">FULL FILE CONTENTS</write>
   <edit path="relative/path">FULL NEW FILE CONTENTS</edit>
   <apply_patch>*** Begin Patch ... *** End Patch</apply_patch>
+  <mkdir path="relative/path"/>
   <webfetch url="https://..."/>
   <bash>command</bash>
   <done>one-line summary of what was accomplished</done>
@@ -123,6 +125,8 @@ def describe_action(action: Action) -> str:
         return "apply_patch"
     if action.kind == "webfetch":
         return f'webfetch url="{action.url}"'
+    if action.kind == "mkdir":
+        return f'mkdir path="{action.path}"'
     if action.kind == "bash":
         return f"bash: {action.content}"
     if action.kind == "done":
@@ -152,6 +156,8 @@ def execute_action(tools: Tools, action: Action) -> str:
             return tools.apply_patch(action.content or "")
         if action.kind == "webfetch":
             return tools.webfetch(action.url or "")
+        if action.kind == "mkdir":
+            return tools.mkdir(action.path or "")
         if action.kind == "bash":
             return tools.bash(action.content or "")
         return f"error: unknown action {action.kind!r}"

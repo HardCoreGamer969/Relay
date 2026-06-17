@@ -83,11 +83,11 @@ T = TypeVar("T")
 EventSink = Callable[[str, str, dict], None]
 
 # The read-only actions the brain may take while investigating. Anything else a model
-# emits (edit/bash/write/apply_patch) is refused; the brain investigation loop can
-# never write. (glob/webfetch are not granted here -- they fall to the steer-back
+# emits (edit/bash/write/apply_patch/mkdir) is refused; the brain investigation loop
+# can never write. (glob/webfetch are not granted here -- they fall to the steer-back
 # branch, also never executed -- to keep the brain's surface read-only and minimal.)
 _READ_ONLY_KINDS = ("read", "list", "grep")
-_WRITE_KINDS = ("edit", "bash", "write", "apply_patch")
+_WRITE_KINDS = ("edit", "bash", "write", "apply_patch", "mkdir")
 
 
 def _has_terminator(reply: str, terminators: Sequence[str]) -> bool:

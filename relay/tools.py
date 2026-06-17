@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import os
 import re
 import subprocess
 import urllib.error
@@ -549,6 +550,22 @@ class Tools:
                 else:
                     summary.append(f"~{sec.path}")
         return "applied patch: " + ", ".join(summary)
+
+    def mkdir(self, path: str) -> str:
+        """Create directory ``path`` and any parents, idempotently (cross-platform).
+
+        Uses :func:`os.makedirs` with ``exist_ok=True`` -- NO shell, so it works on
+        every OS (unlike ``mkdir -p``, which fails on Windows where ``-p`` is read as
+        a folder name). Creates directories ONLY (never files); a second call on an
+        existing directory is a clean "already exists", not an error.
+        """
+        target = self._resolve(path)
+        if target.exists():
+            if target.is_dir():
+                return f"directory already exists: {path}"
+            raise ToolError(f"{path} exists and is not a directory")
+        os.makedirs(target, exist_ok=True)
+        return f"created directory {path}"
 
     def webfetch(self, url: str) -> str:
         """Fetch ``url`` and return its readable text (HTML stripped to main text).

@@ -21,6 +21,7 @@ substrate. All loops are bounded so a weak model cannot burn money in a spiral.
 
 from __future__ import annotations
 
+import platform
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -68,10 +69,12 @@ STATUS_UNRESOLVED_ESCALATION = "unresolved_escalation"
 # turn and compacted transcript.
 STATUS_CANCELLED = "cancelled"
 
-EXECUTOR_SYSTEM_PROMPT = """\
+_EXECUTOR_SYSTEM_PROMPT_TEMPLATE = """\
 You are the EXECUTOR (the "hands") of Relay. You carry out ONE step of a larger
 plan, in a narrow context. You do NOT see the whole plan -- only your current
 step plus a short list of what has already been done.
+
+__PLATFORM_LINE__
 
 Work the current step ONE action at a time, using these EXACT tags:
   <thinking>private reasoning</thinking>   (optional)
@@ -87,6 +90,7 @@ Work the current step ONE action at a time, using these EXACT tags:
 -old line
 +new line
 *** End Patch</apply_patch>
+  <mkdir path="relative/path"/>             (create a directory + parents; no shell)
   <webfetch url="https://..."/>             (fetch a URL as readable text)
   <bash>command</bash>
   <question>a question you need answered to proceed</question>
@@ -94,12 +98,15 @@ Work the current step ONE action at a time, using these EXACT tags:
   <blocked>reason you cannot complete this step</blocked>
 
 Choosing a file tool:
-- write: create a new file, or replace an existing file's whole contents.
+- write: create a new file, or replace an existing file's whole contents. It creates
+  parent directories automatically -- you do NOT need to create a directory before
+  writing a file into it.
 - edit: replace a file's full contents (use write when creating).
 - apply_patch: targeted multi-location / multi-file / rename / delete changes in ONE
   atomic patch (OpenCode envelope above: *** Add File / *** Update File [+ *** Move to:]
   / *** Delete File, with @@ anchors and -/+ lines). It is all-or-nothing.
-- glob to locate files; webfetch to read a URL's docs instead of guessing.
+- glob to locate files; mkdir to create an empty directory; webfetch to read a URL's
+  docs instead of guessing.
 
 Rules:
 - Paths are relative to the project root; you cannot escape it.
@@ -112,6 +119,43 @@ Rules:
 - When THIS step is complete, emit <done>...</done>. If you are genuinely stuck,
   emit <blocked>reason</blocked> early rather than thrashing.
 """
+
+
+def _platform_guidance(system: str, platform_str: str) -> str:
+    """One tight line telling the hands WHERE it runs, so it stops emitting Unix-isms
+    into bash and prefers the dedicated tools over fragile shell."""
+    if system == "Windows":
+        return (
+            "You are running on Windows. Use Windows-appropriate shell commands "
+            "(there is no `mkdir -p`), and prefer the dedicated tools over shell where "
+            'one exists -- e.g. <mkdir path="..."/> to create directories.'
+        )
+    label = system or "an unknown platform"
+    return (
+        f"You are running on {label} ({platform_str}). Prefer the dedicated tools over "
+        'shell where one exists -- e.g. <mkdir path="..."/> to create directories rather '
+        "than shelling out."
+    )
+
+
+def build_executor_system_prompt(
+    *, system: str | None = None, platform_str: str | None = None
+) -> str:
+    """The executor system prompt with the live OS/platform line injected.
+
+    ``system`` / ``platform_str`` default to :func:`platform.system` /
+    :func:`platform.platform` (overridable for tests). The platform doesn't change
+    during a run, so :data:`EXECUTOR_SYSTEM_PROMPT` is built once at import.
+    """
+    system = platform.system() if system is None else system
+    platform_str = platform.platform() if platform_str is None else platform_str
+    return _EXECUTOR_SYSTEM_PROMPT_TEMPLATE.replace(
+        "__PLATFORM_LINE__", _platform_guidance(system, platform_str)
+    )
+
+
+EXECUTOR_SYSTEM_PROMPT = build_executor_system_prompt()
+
 
 _EXEC_PARSE_NUDGE = (
     "No valid action was found. Emit exactly one protocol tag, e.g. "

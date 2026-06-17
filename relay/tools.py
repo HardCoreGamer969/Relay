@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -32,6 +32,14 @@ class PathEscapeError(ToolError):
     """A path resolved outside ``project_root`` and was refused."""
 
 
+class PatchError(ToolError):
+    """An ``apply_patch`` envelope was malformed or a section failed validation.
+
+    The message names the failing part so the (recoverable) observation tells the
+    hands exactly what to fix -- consistent with the loop's other refusals.
+    """
+
+
 # Cap on the number of paths a single `glob` returns, so a broad pattern (e.g.
 # ``**/*``) can't flood the transcript / reviewer context. Truncation is noted.
 GLOB_MATCH_CAP = 200
@@ -41,6 +49,194 @@ def _wrote_observation(path: str, content: str) -> str:
     """The shared ``wrote <path> (<bytes> bytes, <lines> lines)`` line for edit/write."""
     lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
     return f"wrote {path} ({len(content)} bytes, {lines} lines)"
+
+
+# --- apply_patch: OpenCode's exact envelope (v0.0.26) ------------------------
+#
+# The envelope is verbatim OpenCode:
+#
+#   *** Begin Patch
+#   *** Add File: <path>          (then one or more "+" lines = initial contents)
+#   *** Delete File: <path>       (nothing follows)
+#   *** Update File: <path>       (optionally "*** Move to: <newpath>", then @@ hunks)
+#   @@ <context>                  (anchor; " "/"-"/"+"  context/remove/add lines)
+#   *** End Patch
+#
+# A patch is parsed into PatchSections, validated WHOLE, then applied all-or-nothing
+# (no partial application -- see Tools.apply_patch).
+
+_BEGIN_PATCH = "*** Begin Patch"
+_END_PATCH = "*** End Patch"
+_ADD = "*** Add File: "
+_DELETE = "*** Delete File: "
+_UPDATE = "*** Update File: "
+_MOVE = "*** Move to: "
+
+
+@dataclass
+class _Hunk:
+    """One ``@@``-anchored change within an Update section."""
+
+    anchor: str            # text after "@@ " (an existing line used to locate the hunk)
+    before: list[str]      # context + removed lines (what must currently be present)
+    after: list[str]       # context + added lines (what replaces it)
+
+
+@dataclass
+class PatchSection:
+    """One file operation inside an apply_patch envelope."""
+
+    op: str                # "add" | "update" | "delete"
+    path: str
+    move_to: str | None = None
+    add_lines: list[str] = field(default_factory=list)  # for op == "add"
+    hunks: list[_Hunk] = field(default_factory=list)     # for op == "update"
+
+
+def parse_patch(text: str) -> list[PatchSection]:
+    """Parse an OpenCode patch envelope into ordered :class:`PatchSection`s.
+
+    Raises :class:`PatchError` (naming the failing part) on any malformed envelope:
+    a missing Begin/End line, an unknown header, an Add line not starting with ``+``,
+    an Update body without ``@@`` hunks, or a bad change line.
+    """
+    lines = (text or "").splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or lines[0].strip() != _BEGIN_PATCH:
+        raise PatchError('patch must start with "*** Begin Patch"')
+    if lines[-1].strip() != _END_PATCH:
+        raise PatchError('patch must end with "*** End Patch"')
+
+    body = lines[1:-1]
+    sections: list[PatchSection] = []
+    i, n = 0, len(body)
+    while i < n:
+        line = body[i]
+        if not line.strip():
+            i += 1
+            continue
+        if line.startswith(_ADD):
+            path = line[len(_ADD):].strip()
+            i += 1
+            add_lines: list[str] = []
+            while i < n and not body[i].startswith("*** "):
+                if not body[i].startswith("+"):
+                    raise PatchError(f'Add File "{path}": every line must start with "+"')
+                add_lines.append(body[i][1:])
+                i += 1
+            sections.append(PatchSection(op="add", path=path, add_lines=add_lines))
+        elif line.startswith(_DELETE):
+            sections.append(PatchSection(op="delete", path=line[len(_DELETE):].strip()))
+            i += 1
+        elif line.startswith(_UPDATE):
+            path = line[len(_UPDATE):].strip()
+            i += 1
+            move_to = None
+            if i < n and body[i].startswith(_MOVE):
+                move_to = body[i][len(_MOVE):].strip()
+                i += 1
+            hunks: list[_Hunk] = []
+            while i < n and not body[i].startswith("*** "):
+                if not body[i].startswith("@@"):
+                    raise PatchError(
+                        f'Update File "{path}": expected an "@@" hunk header, got {body[i]!r}'
+                    )
+                anchor = body[i][2:].strip()
+                i += 1
+                before: list[str] = []
+                after: list[str] = []
+                while i < n and not body[i].startswith("*** ") and not body[i].startswith("@@"):
+                    change = body[i]
+                    if change.startswith("+"):
+                        after.append(change[1:])
+                    elif change.startswith("-"):
+                        before.append(change[1:])
+                    elif change.startswith(" "):
+                        before.append(change[1:])
+                        after.append(change[1:])
+                    elif change == "":
+                        before.append("")
+                        after.append("")
+                    else:
+                        raise PatchError(
+                            f'Update File "{path}": change lines must start with " ", "+", or "-"; '
+                            f"got {change!r}"
+                        )
+                    i += 1
+                hunks.append(_Hunk(anchor=anchor, before=before, after=after))
+            if not hunks:
+                raise PatchError(f'Update File "{path}": no "@@" hunks')
+            sections.append(PatchSection(op="update", path=path, move_to=move_to, hunks=hunks))
+        else:
+            raise PatchError(f"unknown patch line: {line!r}")
+
+    if not sections:
+        raise PatchError("patch contains no file sections")
+    return sections
+
+
+def _find_line(lines: list[str], anchor: str, start: int = 0) -> int:
+    """Index of the first line at/after ``start`` equal to ``anchor`` (exact, then
+    whitespace-stripped). ``-1`` if not found."""
+    for i in range(start, len(lines)):
+        if lines[i] == anchor:
+            return i
+    target = anchor.strip()
+    for i in range(start, len(lines)):
+        if lines[i].strip() == target:
+            return i
+    return -1
+
+
+def _find_block(lines: list[str], block: list[str], start: int) -> int:
+    """Index of the first contiguous occurrence of ``block`` at/after ``start``
+    (exact, then whitespace-stripped per line). ``-1`` if not found."""
+    m = len(block)
+    for i in range(start, len(lines) - m + 1):
+        if lines[i:i + m] == block:
+            return i
+    stripped = [b.strip() for b in block]
+    for i in range(start, len(lines) - m + 1):
+        if [ln.strip() for ln in lines[i:i + m]] == stripped:
+            return i
+    return -1
+
+
+def _apply_hunks(original: str, hunks: list[_Hunk], path: str) -> str:
+    """Apply ``hunks`` to ``original`` text, returning the new text.
+
+    Raises :class:`PatchError` if an anchor or a hunk's context block does not
+    locate -- the caller relies on this for atomic validation (a non-locating hunk
+    fails the WHOLE patch before anything is written)."""
+    trailing_nl = original.endswith("\n")
+    lines = original.split("\n")
+    if trailing_nl:
+        lines = lines[:-1]  # drop the empty tail from the trailing newline
+    for hunk in hunks:
+        start = 0
+        anchored = bool(hunk.anchor)
+        if anchored:
+            idx = _find_line(lines, hunk.anchor)
+            if idx == -1:
+                raise PatchError(f'Update File "{path}": anchor not found: "@@ {hunk.anchor}"')
+            start = idx  # search INCLUSIVE of the anchor: it may be the first changed line
+        if hunk.before:
+            pos = _find_block(lines, hunk.before, start)
+            if pos == -1:
+                raise PatchError(
+                    f'Update File "{path}": a hunk\'s context did not match the file'
+                )
+            lines[pos:pos + len(hunk.before)] = hunk.after
+        else:  # pure insertion: after the anchor line, or at the top when unanchored
+            at = start + 1 if anchored else 0
+            lines[at:at] = hunk.after
+    result = "\n".join(lines)
+    if trailing_nl:
+        result += "\n"
+    return result
 
 
 @dataclass
@@ -188,6 +384,67 @@ class Tools:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return _wrote_observation(path, content)
+
+    def apply_patch(self, patch_text: str) -> str:
+        """Apply an OpenCode patch envelope ATOMICALLY (all-or-nothing).
+
+        The WHOLE patch is validated first -- every section parses, Add targets don't
+        already exist, Update/Delete targets DO exist, every Update hunk's anchor/
+        context locates, and a Move-to target is free. Only if all of that holds is
+        ANYTHING written; on any failure NOTHING is applied and a clear observation
+        names the failing section. The read-before-edit guard for Update sections is
+        enforced by the caller (``relay.loop``) BEFORE this runs.
+
+        Returns a concise summary, e.g.
+        ``applied patch: +hello.txt, ~src/main.py (renamed from src/app.py), -obsolete.txt``.
+        """
+        try:
+            sections = parse_patch(patch_text)
+        except PatchError as exc:
+            return f"apply_patch failed: {exc}"
+
+        # --- validate the WHOLE patch (compute Update results in memory) ---
+        updated_text: dict[int, str] = {}
+        try:
+            for idx, sec in enumerate(sections):
+                if sec.op == "add":
+                    if self.exists(sec.path):
+                        raise PatchError(f'Add File "{sec.path}" already exists')
+                elif sec.op == "delete":
+                    if not self.exists(sec.path):
+                        raise PatchError(f'Delete File "{sec.path}" does not exist')
+                elif sec.op == "update":
+                    if not self.exists(sec.path):
+                        raise PatchError(f'Update File "{sec.path}" does not exist')
+                    updated_text[idx] = _apply_hunks(self.read(sec.path), sec.hunks, sec.path)
+                    if sec.move_to and sec.move_to != sec.path and self.exists(sec.move_to):
+                        raise PatchError(f'Move to "{sec.move_to}" already exists')
+        except PatchError as exc:
+            return f"apply_patch failed: {exc}"
+
+        # --- apply (every check passed; no half-application possible now) ---
+        summary: list[str] = []
+        for idx, sec in enumerate(sections):
+            if sec.op == "add":
+                target = self._resolve(sec.path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                body = "\n".join(sec.add_lines)
+                target.write_text(body + ("\n" if sec.add_lines else ""), encoding="utf-8")
+                summary.append(f"+{sec.path}")
+            elif sec.op == "delete":
+                self._resolve(sec.path).unlink()
+                summary.append(f"-{sec.path}")
+            else:  # update (with optional rename)
+                dest = sec.move_to or sec.path
+                dest_target = self._resolve(dest)
+                dest_target.parent.mkdir(parents=True, exist_ok=True)
+                dest_target.write_text(updated_text[idx], encoding="utf-8")
+                if sec.move_to and sec.move_to != sec.path:
+                    self._resolve(sec.path).unlink()
+                    summary.append(f"~{dest} (renamed from {sec.path})")
+                else:
+                    summary.append(f"~{sec.path}")
+        return "applied patch: " + ", ".join(summary)
 
     # -- read-tracking support (v0.0.23: the read-before-edit guard) ----------
     #

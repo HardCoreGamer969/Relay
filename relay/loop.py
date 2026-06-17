@@ -23,7 +23,7 @@ from relay.config import ModelConfig
 from relay.models import call_model
 from relay.protocol import Action, parse
 from relay.telemetry import Ledger
-from relay.tools import ToolError, Tools
+from relay.tools import PatchError, ToolError, Tools, parse_patch
 
 # How many consecutive parse failures to tolerate before aborting the run.
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
@@ -111,6 +111,8 @@ def describe_action(action: Action) -> str:
     if action.kind == "glob":
         base = f' path="{action.path}"' if action.path and action.path != "." else ""
         return f'glob pattern="{action.pattern}"{base}'
+    if action.kind == "apply_patch":
+        return "apply_patch"
     if action.kind == "bash":
         return f"bash: {action.content}"
     if action.kind == "done":
@@ -136,6 +138,8 @@ def execute_action(tools: Tools, action: Action) -> str:
             return tools.write(action.path or "", action.content or "")
         if action.kind == "glob":
             return tools.glob(action.pattern or "", action.path or ".")
+        if action.kind == "apply_patch":
+            return tools.apply_patch(action.content or "")
         if action.kind == "bash":
             return tools.bash(action.content or "")
         return f"error: unknown action {action.kind!r}"
@@ -217,6 +221,25 @@ def guarded_execute_action(tools: Tools, action: Action, reads: dict[str, str] |
             return _read_before_edit_refusal(path)  # do NOT write; recoverable observation
         observation = execute_action(tools, action)
         invalidate(tools, path, reads)  # the write changed the file: a later edit needs a fresh read
+        return observation
+    if action.kind == "apply_patch":
+        try:
+            sections = parse_patch(action.content or "")
+        except PatchError as exc:
+            return f"apply_patch failed: {exc}"  # malformed: clear, recoverable observation
+        # Per-section read guard: every Update target that EXISTS needs a current read
+        # (same rule as edit/write); Add is exempt, Delete needs existence (checked in
+        # Tools.apply_patch). Refuse the WHOLE patch if any Update target is unread.
+        for sec in sections:
+            if sec.op == "update" and tools.exists(sec.path) and not read_is_current(tools, sec.path, reads):
+                return _read_before_edit_refusal(sec.path)
+        observation = tools.apply_patch(action.content or "")
+        if observation.startswith("applied patch"):
+            # The patch changed these files: a later edit of any of them needs a fresh read.
+            for sec in sections:
+                invalidate(tools, sec.path, reads)
+                if sec.move_to:
+                    invalidate(tools, sec.move_to, reads)
         return observation
     observation = execute_action(tools, action)
     if action.kind == "read" and not observation.startswith("error:"):

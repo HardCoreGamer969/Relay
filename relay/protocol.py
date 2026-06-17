@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 # Action kinds the parser can produce.
 KINDS = (
     "read", "list", "grep", "edit", "bash", "done", "plan", "abort", "blocked", "question",
-    "write", "glob",
+    "write", "glob", "apply_patch",
 )
 
 
@@ -106,6 +106,7 @@ _BLOCKED_RE = re.compile(r"<blocked>(.*?)</blocked>", re.DOTALL)
 _QUESTION_RE = re.compile(r"<question>(.*?)</question>", re.DOTALL)
 _EDIT_RE = re.compile(r"""<edit\s+([^>]*?)>(.*?)</edit>""", re.DOTALL)
 _WRITE_RE = re.compile(r"""<write\s+([^>]*?)>(.*?)</write>""", re.DOTALL)
+_APPLY_PATCH_RE = re.compile(r"<apply_patch>(.*?)</apply_patch>", re.DOTALL)
 _BASH_RE = re.compile(r"<bash>(.*?)</bash>", re.DOTALL)
 _DONE_RE = re.compile(r"<done>(.*?)</done>", re.DOTALL)
 _SELF_CLOSING_RE = re.compile(r"<(read|list|grep|glob)\b([^>]*?)/>", re.DOTALL)
@@ -183,6 +184,12 @@ def parse(text: str) -> ParseResult:
 
     # Plan first, so <step>/<edit>/etc. inside a plan body are not parsed loose.
     consume(_PLAN_RE, _add_plan)
+    # apply_patch next: its body is a patch envelope that may ADD a file whose content
+    # contains tag-like lines (e.g. +<edit ...>), so mask it early before loose scans.
+    consume(
+        _APPLY_PATCH_RE,
+        lambda m: placed.append((m.start(), Action(kind="apply_patch", content=_strip_block_newlines(m.group(1))))),
+    )
     # write next: its body is arbitrary file content that may contain tag-like lines,
     # so mask it early before the loose-tag scans below (same reasoning as edit).
     def _add_write(m: re.Match[str]) -> None:

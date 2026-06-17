@@ -106,6 +106,8 @@ def describe_action(action: Action) -> str:
         return f'grep pattern="{action.pattern}" path="{action.path}"'
     if action.kind == "edit":
         return f'edit path="{action.path}"'
+    if action.kind == "write":
+        return f'write path="{action.path}"'
     if action.kind == "bash":
         return f"bash: {action.content}"
     if action.kind == "done":
@@ -127,6 +129,8 @@ def execute_action(tools: Tools, action: Action) -> str:
             return tools.grep(action.pattern or "", action.path or "")
         if action.kind == "edit":
             return tools.edit(action.path or "", action.content or "")
+        if action.kind == "write":
+            return tools.write(action.path or "", action.content or "")
         if action.kind == "bash":
             return tools.bash(action.content or "")
         return f"error: unknown action {action.kind!r}"
@@ -187,25 +191,27 @@ def guarded_execute_action(tools: Tools, action: Action, reads: dict[str, str] |
     """:func:`execute_action` plus the read-before-edit guard (hands/executor only).
 
     - ``<read>`` of an existing file: execute, then record its content hash so a
-      later ``<edit>`` is allowed.
-    - ``<edit>`` to a NEW file (path absent): allowed unconditionally (creation is a
-      core operation -- there is nothing to read).
-    - ``<edit>`` to an EXISTING file with no current read: REFUSED -- the file is left
-      untouched and a recoverable observation tells the hands to read it first.
-    - ``<edit>`` to an existing file with a current read: applied, then the read is
-      invalidated (the edit changed the file).
+      later ``<edit>``/``<write>`` is allowed.
+    - ``<edit>``/``<write>`` to a NEW file (path absent): allowed unconditionally
+      (creation is a core operation -- there is nothing to read).
+    - ``<edit>``/``<write>`` to an EXISTING file with no current read: REFUSED -- the
+      file is left untouched and a recoverable observation tells the hands to read it.
+    - ``<edit>``/``<write>`` to an existing file with a current read: applied, then the
+      read is invalidated (the write changed the file).
 
     ``reads is None`` disables the guard (plain :func:`execute_action`) -- the solo
     single-model loop does not track reads.
     """
     if reads is None:
         return execute_action(tools, action)
-    if action.kind == "edit":
+    if action.kind in ("edit", "write"):
+        # Both write a whole file. New file -> allowed (nothing to read); existing file
+        # without a current read -> refused (don't blind-clobber a file you haven't seen).
         path = action.path or ""
         if tools.exists(path) and not read_is_current(tools, path, reads):
             return _read_before_edit_refusal(path)  # do NOT write; recoverable observation
         observation = execute_action(tools, action)
-        invalidate(tools, path, reads)  # the edit changed the file: a later edit needs a fresh read
+        invalidate(tools, path, reads)  # the write changed the file: a later edit needs a fresh read
         return observation
     observation = execute_action(tools, action)
     if action.kind == "read" and not observation.startswith("error:"):

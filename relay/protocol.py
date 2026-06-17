@@ -38,7 +38,10 @@ import re
 from dataclasses import dataclass, field
 
 # Action kinds the parser can produce.
-KINDS = ("read", "list", "grep", "edit", "bash", "done", "plan", "abort", "blocked", "question")
+KINDS = (
+    "read", "list", "grep", "edit", "bash", "done", "plan", "abort", "blocked", "question",
+    "write",
+)
 
 
 @dataclass
@@ -48,8 +51,10 @@ class Action:
     Fields are populated per ``kind``:
       - ``read`` / ``list``: ``path``
       - ``grep``: ``pattern`` + ``path``
-      - ``edit``: ``path`` + ``content`` (full new file contents)
-      - ``bash``: ``content`` (the command)
+      - ``edit`` / ``write``: ``path`` + ``content`` (full new file contents)
+      - ``bash`` / ``apply_patch``: ``content`` (the command / the patch envelope)
+      - ``glob``: ``pattern`` + ``path`` (the base dir to match under)
+      - ``webfetch``: ``url``
       - ``done`` / ``abort`` / ``blocked``: ``content`` (the summary/reason)
       - ``plan``: ``steps`` (ordered step instructions)
     """
@@ -59,6 +64,7 @@ class Action:
     pattern: str | None = None
     content: str | None = None
     steps: list[str] | None = None
+    url: str | None = None
 
 
 @dataclass
@@ -99,6 +105,7 @@ _ABORT_RE = re.compile(r"<abort>(.*?)</abort>", re.DOTALL)
 _BLOCKED_RE = re.compile(r"<blocked>(.*?)</blocked>", re.DOTALL)
 _QUESTION_RE = re.compile(r"<question>(.*?)</question>", re.DOTALL)
 _EDIT_RE = re.compile(r"""<edit\s+([^>]*?)>(.*?)</edit>""", re.DOTALL)
+_WRITE_RE = re.compile(r"""<write\s+([^>]*?)>(.*?)</write>""", re.DOTALL)
 _BASH_RE = re.compile(r"<bash>(.*?)</bash>", re.DOTALL)
 _DONE_RE = re.compile(r"<done>(.*?)</done>", re.DOTALL)
 _SELF_CLOSING_RE = re.compile(r"<(read|list|grep)\b([^>]*?)/>", re.DOTALL)
@@ -176,6 +183,16 @@ def parse(text: str) -> ParseResult:
 
     # Plan first, so <step>/<edit>/etc. inside a plan body are not parsed loose.
     consume(_PLAN_RE, _add_plan)
+    # write next: its body is arbitrary file content that may contain tag-like lines,
+    # so mask it early before the loose-tag scans below (same reasoning as edit).
+    def _add_write(m: re.Match[str]) -> None:
+        path = _attrs(m.group(1)).get("path")
+        if path:
+            placed.append(
+                (m.start(), Action(kind="write", path=path, content=_strip_block_newlines(m.group(2))))
+            )
+
+    consume(_WRITE_RE, _add_write)
     consume(_ABORT_RE, lambda m: placed.append((m.start(), Action(kind="abort", content=m.group(1).strip()))))
     consume(_BLOCKED_RE, lambda m: placed.append((m.start(), Action(kind="blocked", content=m.group(1).strip()))))
 

@@ -32,6 +32,12 @@ class PathEscapeError(ToolError):
     """A path resolved outside ``project_root`` and was refused."""
 
 
+def _wrote_observation(path: str, content: str) -> str:
+    """The shared ``wrote <path> (<bytes> bytes, <lines> lines)`` line for edit/write."""
+    lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+    return f"wrote {path} ({len(content)} bytes, {lines} lines)"
+
+
 @dataclass
 class Tools:
     """Filesystem + shell tools confined to ``project_root``.
@@ -133,8 +139,21 @@ class Tools:
         target = self._resolve(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
-        return f"wrote {path} ({len(content)} bytes, {lines} lines)"
+        return _wrote_observation(path, content)
+
+    def write(self, path: str, content: str) -> str:
+        """Write ``content`` as the WHOLE contents of ``path`` (create or overwrite).
+
+        Distinct from ``edit`` in intent -- ``write`` is the create-or-replace-an-
+        entire-file tool. Parent directories are created as needed. The read-before
+        -edit guard (in :mod:`relay.loop`) exempts creating a NEW file but requires a
+        current read before overwriting an EXISTING one (you shouldn't blind-clobber a
+        file you haven't seen); a successful write invalidates the recorded read.
+        """
+        target = self._resolve(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return _wrote_observation(path, content)
 
     # -- read-tracking support (v0.0.23: the read-before-edit guard) ----------
     #

@@ -46,9 +46,46 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.25 (trust/feel fixes: conversational plan reaction, session-sticky working dir, full multi-line paste)
+## Status — v0.0.26 (Tier-1 tool expansion: `write`, `glob`, `apply_patch`, `webfetch`)
 
-Three things made Relay feel robotic or untrustworthy in real use; this release fixes all
+The hands had to funnel almost everything through `bash` — fragile, cp1252-hazardous on
+Windows, and hard to parse. This release gives the executor four more first-class tools, all
+**Relay text-protocol tags** parsed by `parse()` and executed via `Tools` (never native
+tool/function-calling — the moat), each advertised in the executor prompt so the hands knows
+when to reach for it.
+
+- **`write`** — `<write path="...">FULL CONTENTS</write>`: create or replace a whole file in
+  one action. It threads the v0.0.23 read-before-edit guard: creating a **new** file needs no
+  read; **overwriting an existing** file requires a current read first (don't blind-clobber a
+  file you haven't seen), and a successful write invalidates the recorded read.
+- **`glob`** — `<glob pattern="**/*.py"/>` (optional base dir): fast stdlib `pathlib` path
+  matching so the hands stops shelling out to `find`/`ls`. Returns paths relative to the
+  working dir, one per line, bounded (200, with a truncation note); read-only.
+- **`apply_patch`** — `<apply_patch>*** Begin Patch … *** End Patch</apply_patch>`: OpenCode's
+  **exact** envelope (`*** Add File` / `*** Update File` [+ `*** Move to:`] / `*** Delete File`,
+  with `@@` anchors and `-`/`+` lines), for targeted multi-location / multi-file / rename /
+  delete changes. It is **additive — `edit` is retained** — and **atomic**: the whole patch is
+  validated first (sections parse, Add targets free, Update/Delete targets exist, every `@@`
+  hunk locates) and applied all-or-nothing; no half-applied patches. The read guard is honored
+  **per section**: Add is exempt, every Update needs a current read (else the *whole* patch is
+  refused), Delete needs existence; on success every written/moved/deleted file's read is
+  invalidated.
+- **`webfetch`** — `<webfetch url="https://..."/>`: fetch a URL as readable text (stdlib
+  `urllib` + a minimal HTML→text pass; no new dependency). The one network-touching tool:
+  read-only GET, a real User-Agent (the default urllib UA is 403'd by some hosts), a 15s
+  timeout so it can't hang the loop, output bounded to 4000 chars with a truncation note, and
+  **friendly-on-error** (a concise `webfetch failed: …`, never a raw traceback). The network
+  call sits behind a seam so the tests are network-free.
+
+All four are covered by network-free headless tests; the read-only-brain investigation loop
+explicitly refuses `write`/`apply_patch` (it can never write). The live feel — the hands
+actually using `glob`/`apply_patch`/`webfetch` in a real run — is the maintainer's to verify;
+it is not simulated here.
+
+Under that, **v0.0.25** (trust/feel fixes: conversational plan reaction, session-sticky
+working dir, full multi-line paste) still stands.
+
+Three things made Relay feel robotic or untrustworthy in real use; that release fixed all
 three.
 
 - **The brain interprets your plan reply — no keyword match.** When the brain proposed a

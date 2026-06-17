@@ -77,16 +77,33 @@ Work the current step ONE action at a time, using these EXACT tags:
   <thinking>private reasoning</thinking>   (optional)
   <read path="relative/path"/>
   <list path="relative/path"/>
+  <glob pattern="**/*.py"/>                 (find files by pattern -- prefer over bash find/ls)
   <grep pattern="regex" path="relative/path"/>
+  <write path="relative/path">FULL FILE CONTENTS</write>
   <edit path="relative/path">FULL NEW FILE CONTENTS</edit>
+  <apply_patch>*** Begin Patch
+*** Update File: relative/path
+@@ context line
+-old line
++new line
+*** End Patch</apply_patch>
+  <webfetch url="https://..."/>             (fetch a URL as readable text)
   <bash>command</bash>
   <question>a question you need answered to proceed</question>
   <done>one-line summary of what THIS step accomplished</done>
   <blocked>reason you cannot complete this step</blocked>
 
+Choosing a file tool:
+- write: create a new file, or replace an existing file's whole contents.
+- edit: replace a file's full contents (use write when creating).
+- apply_patch: targeted multi-location / multi-file / rename / delete changes in ONE
+  atomic patch (OpenCode envelope above: *** Add File / *** Update File [+ *** Move to:]
+  / *** Delete File, with @@ anchors and -/+ lines). It is all-or-nothing.
+- glob to locate files; webfetch to read a URL's docs instead of guessing.
+
 Rules:
 - Paths are relative to the project root; you cannot escape it.
-- Before editing an existing file, read it first; if its actual contents don't match what the step assumes, say so rather than forcing the change.
+- Before editing an existing file, read it first; if its actual contents don't match what the step assumes, say so rather than forcing the change. This read-first rule covers edit, an existing-file write, and every apply_patch Update section (creating a new file with write or an apply_patch Add File needs no read).
 - Some destructive bash commands are refused by policy ("BLOCKED by policy: ...")
   or need approval ("DENIED ..."); adapt rather than re-emitting them verbatim.
 - Stay scoped to YOUR current step. Do NOT do later steps.

@@ -247,3 +247,14 @@ def test_executor_prompt_has_read_before_edit_guidance():
     text = " ".join(EXECUTOR_SYSTEM_PROMPT.split())
     assert "read it first" in text
     assert "Before editing an existing file" in text
+
+
+def test_executor_prompt_advertises_the_new_tools():
+    """The hands must be told about write/glob/apply_patch/webfetch and that the
+    read-first rule extends to existing-file write + apply_patch Update sections."""
+    text = " ".join(EXECUTOR_SYSTEM_PROMPT.split())
+    assert "<write" in text and "<glob" in text
+    assert "<apply_patch>" in text and "*** Begin Patch" in text
+    assert "<webfetch" in text
+    # The read-first rule is explicitly extended to write + apply_patch Update.
+    assert "existing-file write" in text and "apply_patch Update" in text

@@ -243,7 +243,7 @@ from relay.runlog import (
     load_records,
 )
 from relay.telemetry import CallRecord, Ledger
-from relay.tools import PathEscapeError, ToolError, Tools
+from relay.tools import PatchError, PathEscapeError, PatchSection, ToolError, Tools, parse_patch
 from relay.transcript import (
     Transcript,
     Turn,
@@ -252,7 +252,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.25"
+__version__ = "0.0.26"
 
 __all__ = [
     # v0.01 -- model layer
@@ -270,6 +270,10 @@ __all__ = [
     "Tools",
     "ToolError",
     "PathEscapeError",
+    # v0.0.26 -- the apply_patch envelope (Tier-1 tool expansion)
+    "PatchError",
+    "PatchSection",
+    "parse_patch",
     "run_task",
     "StepResult",
     "TaskResult",

@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 # Action kinds the parser can produce.
 KINDS = (
     "read", "list", "grep", "edit", "bash", "done", "plan", "abort", "blocked", "question",
-    "write",
+    "write", "glob",
 )
 
 
@@ -108,7 +108,7 @@ _EDIT_RE = re.compile(r"""<edit\s+([^>]*?)>(.*?)</edit>""", re.DOTALL)
 _WRITE_RE = re.compile(r"""<write\s+([^>]*?)>(.*?)</write>""", re.DOTALL)
 _BASH_RE = re.compile(r"<bash>(.*?)</bash>", re.DOTALL)
 _DONE_RE = re.compile(r"<done>(.*?)</done>", re.DOTALL)
-_SELF_CLOSING_RE = re.compile(r"<(read|list|grep)\b([^>]*?)/>", re.DOTALL)
+_SELF_CLOSING_RE = re.compile(r"<(read|list|grep|glob)\b([^>]*?)/>", re.DOTALL)
 
 
 def _attrs(text: str) -> dict[str, str]:
@@ -223,6 +223,11 @@ def parse(text: str) -> ParseResult:
             if attrs.get("pattern") and attrs.get("path"):
                 placed.append(
                     (m.start(), Action(kind="grep", pattern=attrs["pattern"], path=attrs["path"]))
+                )
+        elif kind == "glob":
+            if attrs.get("pattern"):
+                placed.append(
+                    (m.start(), Action(kind="glob", pattern=attrs["pattern"], path=attrs.get("path", ".")))
                 )
 
     placed.sort(key=lambda item: item[0])

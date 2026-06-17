@@ -108,6 +108,9 @@ def describe_action(action: Action) -> str:
         return f'edit path="{action.path}"'
     if action.kind == "write":
         return f'write path="{action.path}"'
+    if action.kind == "glob":
+        base = f' path="{action.path}"' if action.path and action.path != "." else ""
+        return f'glob pattern="{action.pattern}"{base}'
     if action.kind == "bash":
         return f"bash: {action.content}"
     if action.kind == "done":
@@ -131,6 +134,8 @@ def execute_action(tools: Tools, action: Action) -> str:
             return tools.edit(action.path or "", action.content or "")
         if action.kind == "write":
             return tools.write(action.path or "", action.content or "")
+        if action.kind == "glob":
+            return tools.glob(action.pattern or "", action.path or ".")
         if action.kind == "bash":
             return tools.bash(action.content or "")
         return f"error: unknown action {action.kind!r}"

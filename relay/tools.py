@@ -32,6 +32,11 @@ class PathEscapeError(ToolError):
     """A path resolved outside ``project_root`` and was refused."""
 
 
+# Cap on the number of paths a single `glob` returns, so a broad pattern (e.g.
+# ``**/*``) can't flood the transcript / reviewer context. Truncation is noted.
+GLOB_MATCH_CAP = 200
+
+
 def _wrote_observation(path: str, content: str) -> str:
     """The shared ``wrote <path> (<bytes> bytes, <lines> lines)`` line for edit/write."""
     lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
@@ -129,6 +134,35 @@ class Tools:
                 if regex.search(line):
                     out.append(f"{prefix}{lineno}: {line}")
         return "\n".join(out) if out else "(no matches)"
+
+    def glob(self, pattern: str, base: str = ".") -> str:
+        """Return paths matching ``pattern`` under ``base``, relative to the root.
+
+        Uses stdlib :meth:`pathlib.Path.glob` (so ``**`` recurses), one path per line,
+        sorted, bounded to :data:`GLOB_MATCH_CAP` (with a truncation note). Read-only --
+        no read-guard interaction. ``base`` is confined to the project root like every
+        other path; an empty result is a clean ``(no matches)``.
+        """
+        if not pattern:
+            raise ToolError("glob requires a pattern")
+        root = self._resolve(base)
+        if not root.exists():
+            raise ToolError(f"no such path: {base}")
+        if not root.is_dir():
+            raise ToolError(f"{base} is not a directory")
+        project = self.project_root.resolve()
+        rels: list[str] = []
+        for match in sorted(root.glob(pattern)):
+            try:
+                rels.append(match.relative_to(project).as_posix())
+            except ValueError:  # outside the root (shouldn't happen): show absolute
+                rels.append(match.as_posix())
+        if not rels:
+            return "(no matches)"
+        if len(rels) > GLOB_MATCH_CAP:
+            shown = rels[:GLOB_MATCH_CAP]
+            return "\n".join(shown) + f"\n... ({len(rels) - GLOB_MATCH_CAP} more, truncated)"
+        return "\n".join(rels)
 
     def edit(self, path: str, content: str) -> str:
         """Write ``content`` as the full new contents of ``path``.

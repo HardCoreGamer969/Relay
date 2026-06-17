@@ -29,7 +29,9 @@ from relay.bridge import (
     EngineRunner,
     InputRouter,
     InputState,
+    RunOutcome,
     UiRequest,
+    WorkingDirSession,
 )
 from brain_fakes import is_reaction_call, reaction_for_messages
 from relay.config import ModelConfig
@@ -514,3 +516,66 @@ def test_bridge_explicit_ceiling_is_respected(tmp_path):
     # default -- setdefault only fills it when absent.
     runner = _bare_runner(tmp_path, run_kwargs={"max_total_steps": 3})
     assert runner._run_kwargs["max_total_steps"] == 3
+
+
+# --- v0.0.25: session-sticky working directory (Part 2) ----------------------
+
+
+def test_working_dir_session_defaults_to_launch_root(tmp_path):
+    session = WorkingDirSession(tmp_path)
+    assert session.working_dir == tmp_path.resolve()
+    assert session.is_launch_root()
+
+
+def test_set_working_dir_persists_and_resolves_relative(tmp_path):
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    session = WorkingDirSession(tmp_path)
+    session.set_working_dir("a")  # relative to the launch root
+    assert session.working_dir == (tmp_path / "a").resolve()
+    assert not session.is_launch_root()
+    session.set_working_dir("b")  # relative to the CURRENT working dir (composes)
+    assert session.working_dir == (tmp_path / "a" / "b").resolve()
+
+
+def test_completed_run_establishes_working_dir(tmp_path):
+    sub = tmp_path / "established"
+    sub.mkdir()
+    session = WorkingDirSession(tmp_path)
+    changed = session.adopt_from_outcome(
+        RunOutcome(status=STATUS_COMPLETED, working_dir=str(sub))
+    )
+    assert changed and session.working_dir == sub.resolve()
+
+
+def test_cancelled_plan_cwd_change_does_not_silently_persist(tmp_path):
+    # A working-dir change that lived only in a never-executed (cancelled/declined/
+    # errored) plan must NOT take effect: adoption is gated on a completed run.
+    session = WorkingDirSession(tmp_path)
+    ghost = str(tmp_path / "ghost_from_cancelled_plan")
+    for status in (STATUS_DECLINED, STATUS_CANCELLED, STATUS_ERROR):
+        adopted = session.adopt_from_outcome(RunOutcome(status=status, working_dir=ghost))
+        assert adopted is False
+        assert session.is_launch_root()  # untouched -- still the launch root
+
+
+def test_run_operates_from_the_session_sticky_working_dir(tmp_path):
+    # Drive the bridge/run-start path: a goal started with the session's sticky dir
+    # operates THERE (the file lands in the subfolder, not the launch root).
+    sub = tmp_path / "lunar_lander_testing"
+    sub.mkdir()
+    session = WorkingDirSession(tmp_path)
+    session.set_working_dir(sub)
+
+    client = _ArcClient(
+        hands=['<edit path="made.txt">hi</edit>\n<done>built it</done>'], escalate=False
+    )
+    sink = _UiSink()
+    runner = sink.runner(str(session.working_dir), client)
+    runner.start("build the lander")
+    sink.next_request(1).deliver("ok")  # the brain reads this as approve -> commit
+
+    outcome = sink.finished()
+    assert outcome.status == STATUS_COMPLETED
+    assert (sub / "made.txt").exists()           # operated from the sticky subfolder
+    assert not (tmp_path / "made.txt").exists()  # NOT the launch root
+    assert runner.join(WAIT_S)

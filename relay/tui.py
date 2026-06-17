@@ -60,6 +60,7 @@ from relay.bridge import (
     InputState,
     RunOutcome,
     UiRequest,
+    WorkingDirSession,
 )
 from relay.config import (
     ASSUMPTION_LEVELS,
@@ -1034,6 +1035,8 @@ COMMANDS: list[Command] = [
             run=lambda app: app._cmd_runs()),
     Command("assume", "Assume", "Set the assumption level for this session", "ops",
             run=lambda app: app._cmd_assume()),
+    Command("cwd", "Working dir", "Show / set the session working directory", "ops",
+            run=lambda app: app._cmd_cwd(), enabled=lambda app: not _run_active(app)),
     Command("cost", "Cost", "Session + per-goal spend; toggle / reset the counter", "ops",
             run=lambda app: app._cmd_cost()),
     Command("log", "Log", "Export a debug log (.md) to share when reporting an issue", "ops",
@@ -1115,6 +1118,11 @@ class RelayTuiApp(App):
     ) -> None:
         super().__init__()
         self._root = root
+        # The working directory is SESSION-sticky: it starts at the launch root but,
+        # once established (set explicitly via /cwd, or adopted from a completed run),
+        # persists across subsequent goals instead of re-defaulting to the launch root
+        # each goal. Every run's root is threaded from here (see _start_run).
+        self._session = WorkingDirSession(root)
         self._models = models if models is not None else load_models()
         self._client = client
         # Setup-flow seams (injected by tests; default to the real provider funcs).
@@ -1424,8 +1432,11 @@ class RelayTuiApp(App):
             self._write_conversation("")  # a blank line between runs
         self._write_conversation(f"you (goal): {goal}")
         self._router.begin_run()
+        # Thread the SESSION-sticky working dir as this run's root -- not the launch
+        # root -- so a working dir established earlier in the session is where this
+        # goal operates.
         self._runner = EngineRunner(
-            self._root,
+            str(self._session.working_dir),
             models=self._models,
             client=self._client,
             assumption_level=self._assumption_level,
@@ -1537,6 +1548,11 @@ class RelayTuiApp(App):
         if cost is not None:
             self._goal_cost = cost
             self._session_cost += cost
+        # A COMPLETED run may have established a new working dir; adopt it so it
+        # persists for the next goal. A cancelled/declined/errored run reports nothing
+        # adoptable, so a cwd change that lived only in a cancelled plan never persists.
+        if self._session.adopt_from_outcome(outcome):
+            self._announce_working_dir(established=False)
         self._update_status()
 
     # -- conversation pane: rendered from the Transcript ------------------------
@@ -1595,6 +1611,9 @@ class RelayTuiApp(App):
             f"[{state.value}] {hint}  |  "
             f"brain={self._models.brain}  hands={self._models.hands}"
         )
+        cwd = self._cwd_segment()
+        if cwd:
+            base = f"{base}  |  {cwd}"
         cost = self._cost_segment()
         # The plain buffer is what headless tests assert on; the widget gets a styled
         # render so the cost segment can stand out (and pulse on a change in v0.0.20).
@@ -1608,6 +1627,32 @@ class RelayTuiApp(App):
         self.query_one("#prompt", Input).placeholder = placeholder_for_state(
             state, self._placeholder
         )
+
+    def _cwd_segment(self) -> str:
+        """The status-line working-dir segment, shown when the sticky working dir
+        has moved off the launch root (so the user can SEE where Relay will work).
+        At the launch root the default is obvious, so nothing extra is shown."""
+        session = self._session
+        if session.is_launch_root():
+            return ""
+        try:
+            label = session.working_dir.relative_to(session.launch_root).as_posix()
+        except ValueError:
+            label = session.working_dir.name
+        return f"cwd={label}"
+
+    def _announce_working_dir(self, *, established: bool) -> None:
+        """Surface where Relay will work now (a visible notice). ``established`` is
+        True for an explicit set, False when adopted from a completed run."""
+        wd = self._session.working_dir
+        line = f"working directory {'set' if established else 'now'}: {wd}"
+        if self._view == "working":
+            self._write_activity(line, actor=ACTOR_BRAIN)
+        else:
+            try:
+                self.query_one("#hint", Static).update(line)
+            except Exception:  # noqa: BLE001 -- hint not mounted
+                pass
 
     # -- live cost: a two-tier counter (per-goal + session); reads ALREADY-tracked
     # cost off the run's ledger, so the whole path makes ZERO model calls. Relay
@@ -2004,6 +2049,40 @@ class RelayTuiApp(App):
     def _set_assume(self, level: str) -> None:
         self._assumption_level = level
         self._update_status()
+
+    def _cmd_cwd(self) -> None:
+        """Show the current session working dir and let the user set a new one.
+
+        The working dir is session-sticky: a set here persists across subsequent
+        goals (until changed) -- the next goal operates from it, not the launch
+        root. Guarded to non-running states (the command's ``enabled`` predicate)."""
+        current = self._session.working_dir
+        self.push_screen(TextEntryDialog(
+            title="Working directory (persists across goals)",
+            label=f"Currently: {current}\nEnter a new directory "
+                  "(relative to the current one, or absolute):",
+            password=False, placeholder="e.g. lunar_lander_testing",
+            on_submit=self._set_working_dir,
+        ))
+
+    def _set_working_dir(self, path: str) -> tuple[bool, str]:
+        """Establish a new session working dir (must be an existing directory).
+
+        Returns ``(ok, note)`` so the entry dialog can show a rejection inline. A
+        relative path is resolved against the current working dir."""
+        raw = (path or "").strip()
+        if not raw:
+            return False, "enter a directory"
+        target = Path(raw)
+        if not target.is_absolute():
+            target = self._session.working_dir / target
+        target = target.resolve()
+        if not target.is_dir():
+            return False, f"not an existing directory: {target}"
+        self._session.set_working_dir(target)
+        self._announce_working_dir(established=True)
+        self._update_status()
+        return True, f"working dir set to {target}"
 
     def _cmd_cost(self) -> None:
         """Show session + per-goal spend, and offer toggle / reset. Dialog-driven (no

@@ -45,6 +45,7 @@ from relay.config import ModelConfig, resolve_max_total_steps
 from relay.conversation import DEFAULT_MAX_ROUNDS, ConversationResult, plan_conversationally
 from relay.orchestrator import (
     STATUS_CANCELLED,
+    STATUS_COMPLETED,
     STATUS_DECLINED,
     Event,
     PlannedTaskResult,
@@ -315,12 +316,88 @@ class RunOutcome:
     ``cancelled``, ``declined_by_user``, ...) or :data:`STATUS_ERROR` when the
     engine raised (``error`` carries the one-line reason). ``result`` is None
     when execution never started (declined / cancelled during planning / error).
+
+    ``working_dir`` is the directory a COMPLETED run established as the new
+    session working dir, if any (None otherwise). It is the extension point the
+    session adopts from -- and the gate (see :class:`WorkingDirSession`) ensures a
+    cwd change carried by a non-completed run is never silently adopted.
     """
 
     status: str
     result: PlannedTaskResult | None = None
     conversation: ConversationResult | None = None
     error: str = ""
+    working_dir: str | None = None
+
+
+class WorkingDirSession:
+    """The session-sticky working directory: the base for the NEXT run's root.
+
+    Relay used to re-default every goal's root to the immutable LAUNCH root, so a
+    working dir the user had established (e.g. "we're working in lunar_lander_testing")
+    evaporated the moment they cancelled a plan and started a new goal -- the new
+    goal built in the launch root instead. This holds the effective working dir as
+    SESSION state: once established it persists across subsequent goals until
+    explicitly changed, rather than resetting each run.
+
+    Two ways a working dir becomes established, and one guard:
+      - :meth:`set_working_dir` -- the user (or brain) sets it explicitly. Immediate
+        and persistent.
+      - :meth:`adopt_from_outcome` -- a COMPLETED run that reported a new working dir
+        has it adopted. A cancelled / declined / errored run reports nothing adoptable,
+        so a cwd change that lived only in a never-executed (cancelled) plan can NEVER
+        silently take effect.
+
+    Paths resolve relative to the CURRENT working dir (so a relative change is
+    relative to where we are now), and are confined to the launch root's tree is
+    NOT enforced here -- the engine's :class:`~relay.tools.Tools` sandbox confines
+    file/bash ops within whatever root it is handed; this only decides that root.
+    """
+
+    def __init__(self, launch_root: str | Path) -> None:
+        self.launch_root = Path(launch_root).resolve()
+        self._cwd = self.launch_root
+
+    @property
+    def working_dir(self) -> Path:
+        """The effective working dir -- the base/root for the next run."""
+        return self._cwd
+
+    def is_launch_root(self) -> bool:
+        """Whether the working dir is still the original launch root (unchanged)."""
+        return self._cwd == self.launch_root
+
+    def set_working_dir(self, path: str | Path) -> Path:
+        """Explicitly establish a new working dir (resolved; immediate; persistent).
+
+        A relative ``path`` is resolved against the CURRENT working dir, so
+        successive relative moves compose. Returns the resolved directory.
+        """
+        self._cwd = self._resolve(path)
+        return self._cwd
+
+    def adopt_from_outcome(self, outcome: RunOutcome | None) -> bool:
+        """Adopt a run's established working dir ONLY if the run completed.
+
+        Returns True when the working dir changed. A non-completed outcome (cancelled,
+        declined, error) is left untouched -- the structural guard that a cancelled-plan
+        cwd change does not silently persist.
+        """
+        if outcome is None or outcome.status != STATUS_COMPLETED:
+            return False
+        target = outcome.working_dir
+        if not target:
+            return False
+        resolved = self._resolve(target)
+        changed = resolved != self._cwd
+        self._cwd = resolved
+        return changed
+
+    def _resolve(self, path: str | Path) -> Path:
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = self._cwd / candidate
+        return candidate.resolve()
 
 
 class EngineRunner:

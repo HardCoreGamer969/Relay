@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 # Action kinds the parser can produce.
 KINDS = (
     "read", "list", "grep", "edit", "bash", "done", "plan", "abort", "blocked", "question",
-    "write", "glob", "apply_patch",
+    "write", "glob", "apply_patch", "webfetch",
 )
 
 
@@ -109,7 +109,7 @@ _WRITE_RE = re.compile(r"""<write\s+([^>]*?)>(.*?)</write>""", re.DOTALL)
 _APPLY_PATCH_RE = re.compile(r"<apply_patch>(.*?)</apply_patch>", re.DOTALL)
 _BASH_RE = re.compile(r"<bash>(.*?)</bash>", re.DOTALL)
 _DONE_RE = re.compile(r"<done>(.*?)</done>", re.DOTALL)
-_SELF_CLOSING_RE = re.compile(r"<(read|list|grep|glob)\b([^>]*?)/>", re.DOTALL)
+_SELF_CLOSING_RE = re.compile(r"<(read|list|grep|glob|webfetch)\b([^>]*?)/>", re.DOTALL)
 
 
 def _attrs(text: str) -> dict[str, str]:
@@ -236,6 +236,9 @@ def parse(text: str) -> ParseResult:
                 placed.append(
                     (m.start(), Action(kind="glob", pattern=attrs["pattern"], path=attrs.get("path", ".")))
                 )
+        elif kind == "webfetch":
+            if attrs.get("url"):
+                placed.append((m.start(), Action(kind="webfetch", url=attrs["url"])))
 
     placed.sort(key=lambda item: item[0])
     return ParseResult(actions=[action for _, action in placed], thinking=thinking)

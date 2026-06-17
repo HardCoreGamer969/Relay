@@ -15,8 +15,11 @@ both). Real isolation (process/container sandboxing) is a later milestone (v0.95
 from __future__ import annotations
 
 import hashlib
+import html
 import re
 import subprocess
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -43,6 +46,51 @@ class PatchError(ToolError):
 # Cap on the number of paths a single `glob` returns, so a broad pattern (e.g.
 # ``**/*``) can't flood the transcript / reviewer context. Truncation is noted.
 GLOB_MATCH_CAP = 200
+
+# webfetch bounds (v0.0.26): the one network-touching tool. Bounded length + a real
+# timeout so it can't flood context or hang the loop; a real User-Agent because the
+# default urllib UA is 403'd by some hosts (e.g. models.dev). stdlib only -- no dep.
+WEBFETCH_CHAR_CAP = 4000
+WEBFETCH_MAX_BYTES = 2_000_000
+WEBFETCH_TIMEOUT_S = 15
+_WEBFETCH_UA = "Relay/0.0.26 (coding agent; +https://github.com/)"
+
+_SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style)\b.*?</\1>")
+_TAG_RE = re.compile(r"(?s)<[^>]+>")
+
+
+def _http_get(url: str) -> str:
+    """GET ``url`` and return the decoded body text (stdlib urllib).
+
+    A thin seam so tests can monkeypatch it (``relay.tools._http_get``) and stay
+    network-free. Sets a real User-Agent, a timeout, and a byte cap.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": _WEBFETCH_UA})
+    with urllib.request.urlopen(request, timeout=WEBFETCH_TIMEOUT_S) as response:
+        raw = response.read(WEBFETCH_MAX_BYTES)
+        charset = response.headers.get_content_charset() or "utf-8"
+    return raw.decode(charset, errors="replace")
+
+
+def _html_to_text(source: str) -> str:
+    """Minimal, stdlib HTML -> readable text: drop script/style, strip tags, unescape
+    entities, and collapse runaway whitespace. Best-effort (not a full renderer)."""
+    text = _SCRIPT_STYLE_RE.sub(" ", source)
+    text = _TAG_RE.sub(" ", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n[ \t]*\n\s*", "\n\n", text)
+    return text.strip()
+
+
+def _short_fetch_reason(exc: Exception) -> str:
+    """A concise, ASCII-safe reason for a failed fetch (never a traceback/blob)."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code}"
+    if isinstance(exc, urllib.error.URLError):
+        return f"{exc.reason}"
+    reason = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+    return reason[:120]
 
 
 def _wrote_observation(path: str, content: str) -> str:
@@ -445,6 +493,27 @@ class Tools:
                 else:
                     summary.append(f"~{sec.path}")
         return "applied patch: " + ", ".join(summary)
+
+    def webfetch(self, url: str) -> str:
+        """Fetch ``url`` and return its readable text (HTML stripped to main text).
+
+        The one network-touching tool: read-only (GET), bounded
+        (:data:`WEBFETCH_CHAR_CAP` with a truncation note), timed out
+        (:data:`WEBFETCH_TIMEOUT_S`), and friendly-on-error -- a failure returns a
+        concise ``webfetch failed: ...`` observation, never a raw traceback/blob, so
+        the loop can adapt. Only http(s) URLs are accepted.
+        """
+        url = (url or "").strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return f"webfetch failed: only http(s) URLs are supported (got {url!r})"
+        try:
+            raw = _http_get(url)
+        except Exception as exc:  # noqa: BLE001 -- any fetch failure -> a friendly note
+            return f"webfetch failed: could not fetch {url} ({_short_fetch_reason(exc)})"
+        text = _html_to_text(raw)
+        if len(text) > WEBFETCH_CHAR_CAP:
+            return text[:WEBFETCH_CHAR_CAP] + f"\n... (truncated at {WEBFETCH_CHAR_CAP} chars)"
+        return text if text else "(empty response)"
 
     # -- read-tracking support (v0.0.23: the read-before-edit guard) ----------
     #

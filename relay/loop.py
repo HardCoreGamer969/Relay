@@ -113,6 +113,8 @@ def describe_action(action: Action) -> str:
         return f'glob pattern="{action.pattern}"{base}'
     if action.kind == "apply_patch":
         return "apply_patch"
+    if action.kind == "webfetch":
+        return f'webfetch url="{action.url}"'
     if action.kind == "bash":
         return f"bash: {action.content}"
     if action.kind == "done":
@@ -140,6 +142,8 @@ def execute_action(tools: Tools, action: Action) -> str:
             return tools.glob(action.pattern or "", action.path or ".")
         if action.kind == "apply_patch":
             return tools.apply_patch(action.content or "")
+        if action.kind == "webfetch":
+            return tools.webfetch(action.url or "")
         if action.kind == "bash":
             return tools.bash(action.content or "")
         return f"error: unknown action {action.kind!r}"

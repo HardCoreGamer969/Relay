@@ -226,31 +226,87 @@ def parse_patch(text: str) -> list[PatchSection]:
     return sections
 
 
-def _find_line(lines: list[str], anchor: str, start: int = 0) -> int:
-    """Index of the first line at/after ``start`` equal to ``anchor`` (exact, then
-    whitespace-stripped). ``-1`` if not found."""
-    for i in range(start, len(lines)):
-        if lines[i] == anchor:
-            return i
-    target = anchor.strip()
-    for i in range(start, len(lines)):
-        if lines[i].strip() == target:
-            return i
+# --- fuzzy hunk matching (v0.0.27): OpenCode's progressive-leniency cascade ---
+#
+# The hands emits patches whose context near-misses the file (smart quotes,
+# em-dashes, non-breaking spaces, trailing/leading whitespace) -- exact-only
+# matching failed on the FIRST real apply_patch use. We locate both the ``@@``
+# anchor and the old-lines block via a four-pass cascade (mirroring OpenCode's
+# ``seekSequence`` / ``tryMatch``): each pass tries the WHOLE pattern with a more
+# lenient comparator, and the first pass that locates it anywhere wins. This is
+# per-pass whole-pattern equality (never partial/substring), so it cannot match a
+# wrong location -- a genuine content mismatch still fails (and the patch aborts).
+#
+# NOTE: OpenCode also has an end-of-file anchor (``*** End of File``) that searches
+# from the file end first. Relay's envelope has no such marker (an anchor is just the
+# ``@@`` text), so that leniency does not apply here and is intentionally skipped.
+
+# Common Unicode punctuation -> ASCII, applied (after trimming) only in the final,
+# most-lenient pass. ``…`` -> ``...`` is multi-char, so we sub via regex (not a
+# 1:1 str.translate).
+_PUNCT_MAP = {
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",   # single quotes
+    "“": '"', "”": '"', "„": '"', "‟": '"',   # double quotes
+    "‐": "-", "‑": "-", "‒": "-",                   # dashes
+    "–": "-", "—": "-", "―": "-",
+    "…": "...",                                               # ellipsis
+    " ": " ",                                                 # non-breaking space
+}
+_PUNCT_RE = re.compile("|".join(re.escape(ch) for ch in _PUNCT_MAP))
+
+
+def _normalize_unicode(text: str) -> str:
+    """Map common Unicode punctuation (smart quotes, dashes, ellipsis, NBSP) to ASCII."""
+    return _PUNCT_RE.sub(lambda m: _PUNCT_MAP[m.group(0)], text)
+
+
+# The four passes, exact -> most lenient. Each is a whole-line comparator.
+def _cmp_exact(a: str, b: str) -> bool:
+    return a == b
+
+
+def _cmp_rstrip(a: str, b: str) -> bool:
+    return a.rstrip() == b.rstrip()
+
+
+def _cmp_trim(a: str, b: str) -> bool:
+    return a.strip() == b.strip()
+
+
+def _cmp_normalized(a: str, b: str) -> bool:
+    return _normalize_unicode(a.strip()) == _normalize_unicode(b.strip())
+
+
+_COMPARATORS = (_cmp_exact, _cmp_rstrip, _cmp_trim, _cmp_normalized)
+
+
+def _try_match(lines: list[str], pattern: list[str], start: int, compare) -> bool:
+    """Whether ``pattern`` matches ``lines[start:start+len]`` line-for-line under
+    ``compare`` (the whole pattern, not a partial/substring match)."""
+    if start < 0 or start + len(pattern) > len(lines):
+        return False
+    return all(compare(lines[start + k], pattern[k]) for k in range(len(pattern)))
+
+
+def _seek_once(lines: list[str], pattern: list[str], start: int) -> int:
+    """Locate ``pattern`` at/after ``start`` via the four-pass cascade. ``-1`` if no
+    pass matches anywhere. An empty pattern matches at ``start`` (degenerate)."""
+    if not pattern:
+        return start
+    for compare in _COMPARATORS:
+        for i in range(start, len(lines) - len(pattern) + 1):
+            if _try_match(lines, pattern, i, compare):
+                return i
     return -1
 
 
-def _find_block(lines: list[str], block: list[str], start: int) -> int:
-    """Index of the first contiguous occurrence of ``block`` at/after ``start``
-    (exact, then whitespace-stripped per line). ``-1`` if not found."""
-    m = len(block)
-    for i in range(start, len(lines) - m + 1):
-        if lines[i:i + m] == block:
-            return i
-    stripped = [b.strip() for b in block]
-    for i in range(start, len(lines) - m + 1):
-        if [ln.strip() for ln in lines[i:i + m]] == stripped:
-            return i
-    return -1
+def _seek_sequence(lines: list[str], pattern: list[str], start: int = 0) -> int:
+    """:func:`_seek_once` plus the trailing-empty-line retry: if the pattern does not
+    locate and its last line is empty, drop that trailing empty line and retry."""
+    idx = _seek_once(lines, pattern, start)
+    if idx == -1 and pattern and pattern[-1] == "":
+        idx = _seek_once(lines, pattern[:-1], start)
+    return idx
 
 
 def _apply_hunks(original: str, hunks: list[_Hunk], path: str) -> str:
@@ -267,12 +323,12 @@ def _apply_hunks(original: str, hunks: list[_Hunk], path: str) -> str:
         start = 0
         anchored = bool(hunk.anchor)
         if anchored:
-            idx = _find_line(lines, hunk.anchor)
+            idx = _seek_sequence(lines, [hunk.anchor], 0)
             if idx == -1:
                 raise PatchError(f'Update File "{path}": anchor not found: "@@ {hunk.anchor}"')
             start = idx  # search INCLUSIVE of the anchor: it may be the first changed line
         if hunk.before:
-            pos = _find_block(lines, hunk.before, start)
+            pos = _seek_sequence(lines, hunk.before, start)
             if pos == -1:
                 raise PatchError(
                     f'Update File "{path}": a hunk\'s context did not match the file'

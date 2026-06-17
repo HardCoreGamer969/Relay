@@ -46,7 +46,53 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.24 (the agentic reviewer: a read-only brain-investigation primitive, wired to the reviewer first)
+## Status — v0.0.25 (trust/feel fixes: conversational plan reaction, session-sticky working dir, full multi-line paste)
+
+Three things made Relay feel robotic or untrustworthy in real use; this release fixes all
+three.
+
+- **The brain interprets your plan reply — no keyword match.** When the brain proposed a
+  plan and asked "does this look good?", the reply was run through a hardcoded affirmative
+  **keyword match**: only `ok`-style words committed, so a natural "yes that looks perfect!"
+  did *nothing*. That's backwards — there's a language model right there that understands
+  intent. The commit gate is now the brain's **interpretation** of your reply
+  (`_classify_reaction`): it emits a `<reaction>` of `approve` | `approve_changes` | `revise`
+  | `reject` | `unclear` (reusing the `call_model("brain", …)` path and the text-tag protocol,
+  never native tool-calling). **approve** commits; **approve_changes** folds the tweak you
+  asked for in the same breath into the plan *then* proceeds (never committing the un-modified
+  plan and losing your change); **revise** re-plans and re-presents; **reject** aborts cleanly;
+  and an **unclear** reply makes the brain ask one brief clarifying question rather than guess
+  — committing spends money and edits files, so an ambiguous reply is never assumed to be
+  approve (an unparseable classification also falls back to *unclear*, never *approve*). The
+  round cap is unchanged, so `--confirm-plan`'s single-round behavior still holds. No
+  affirmative-literal commit gate remains.
+- **The working directory is session-sticky.** You'd create a folder, say "work inside it,"
+  the brain would draw up a plan, you'd cancel it and start a new goal — and Relay forgot the
+  working directory, building in the launch root instead. The cwd was per-run and **always
+  re-defaulted to the immutable launch root each goal**: `Tools` pins every `bash` call to
+  `cwd=project_root` (so a `cd` never persists), and the TUI built every run from `self._root`,
+  which was never updated — so "work inside lunar_lander_testing" could only live as steps in a
+  plan, and cancelling that plan evaporated the intent. Now a `WorkingDirSession` holds the
+  effective working dir as **session state**: once established (set explicitly via the new
+  `/cwd` command, or adopted from a **completed** run) it persists across subsequent goals
+  until changed, and each run's root is threaded from it. The guard: adoption is **gated on a
+  completed run**, so a cwd change that lived only in a never-executed (cancelled) plan can
+  never silently take effect. The current working dir is surfaced in the status line
+  (`cwd=…`).
+- **A multi-line paste is captured in full.** Pasting multi-line text into the prompt kept
+  only the **first line** — Textual's single-line `Input` truncates a paste to
+  `splitlines()[0]`, silently dropping the rest and corrupting a pasted goal/spec. `PromptInput`
+  now captures the **whole** paste (a newline within a paste is content, not a submit, so it
+  never submits on its own), while typed **Enter-to-submit is unchanged**.
+
+All three are covered by network-free headless tests (the brain reading each reaction
+category; the session-sticky cwd persisting across goals while a cancelled-plan change does
+not; a multi-line paste landing in full while typed Enter still submits). The live feel — a
+natural "looks perfect!" committing, pasting a multi-line goal, working in a subfolder across
+goals — is the maintainer's to verify in a real session; it is not simulated here.
+
+Under that, **v0.0.24** (the agentic reviewer: a read-only brain-investigation primitive,
+wired to the reviewer first) still stands.
 
 The brain's step reviewer was the worst of a cluster of one-shot "judge-from-a-snippet"
 calls: it **gated every step** yet literally **could not see the file it judged** — it got

@@ -153,6 +153,7 @@ from relay.bridge import (
     RunOutcome,
     SubmitOutcome,
     UiRequest,
+    WorkingDirSession,
 )
 from relay.catalog import (
     Catalog,
@@ -251,7 +252,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.24"
+__version__ = "0.0.25"
 
 __all__ = [
     # v0.01 -- model layer
@@ -334,6 +335,8 @@ __all__ = [
     "InputState",
     "SubmitOutcome",
     "STATUS_CANCELLED",
+    # v0.0.25 -- the session-sticky working directory
+    "WorkingDirSession",
     # v0.0.13 -- model catalog + provider profiles (multi-provider seam)
     "Catalog",
     "Cost",

@@ -46,7 +46,39 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.26 (Tier-1 tool expansion: `write`, `glob`, `apply_patch`, `webfetch`)
+## Status — v0.0.27 (tool-hardening: apply_patch fuzzy matching, Windows/Unix commands, housekeeping)
+
+A live run on a multi-file Python project surfaced three real problems; this release fixes
+each.
+
+- **`apply_patch` now matches fuzzily** (it failed on its *first* real use with "a hunk's
+  context did not match the file"). The matcher was exact-only, so the hands' near-misses —
+  smart quotes, em-dashes, non-breaking spaces, trailing/leading whitespace — never matched
+  and it fell back to a whole-file `write`. Hunk and `@@`-anchor location now use OpenCode's
+  **four-pass progressive-leniency cascade** (exact → rstrip → trim → unicode-normalized,
+  where the last pass maps smart quotes / the dash family / ellipsis / non-breaking space to
+  ASCII), plus a trailing-empty-line retry. Each pass tries the **whole** pattern (never a
+  substring), so it can't match a wrong location — a genuine mismatch still fails, and
+  apply_patch stays atomic (validate-whole-then-apply) and per-section read-guarded.
+- **Windows/Unix commands.** The hands runs on Windows but emitted `mkdir -p` (which Windows
+  reads as a folder named `-p`). Three coordinated fixes: a shell-free, idempotent
+  **`mkdir`** tool (`<mkdir path="..."/>` → `os.makedirs(..., exist_ok=True)`, cross-platform,
+  creates directories only — and refused by the read-only brain); the **platform injected into
+  the executor prompt** (on Windows it says there is no `mkdir -p`, use the tool) so the hands
+  stops emitting Unix-isms and prefers tools over shell; and a prompt note that **`write`
+  auto-creates parent directories**, so the hands stops `mkdir`-ing before writing.
+- **Housekeeping.** A committed `scripts/test.sh` runs the suite and exits with *pytest's*
+  status even when its output is piped, so a red suite can no longer be masked as green by the
+  `pytest | tail` pattern (documented in Develop). And the flaky
+  `test_clear_is_disabled_and_inert_mid_run` — which raced the periodic transcript-sync timer
+  against a bare fake runner — now gives the fake an empty transcript and passes reliably.
+
+All three are covered by network-free headless tests. The live feel — re-running the notes-CLI
+project and watching `apply_patch` actually apply with no `mkdir -p` failures — is the
+maintainer's to verify; it is not simulated here.
+
+Under that, **v0.0.26** (Tier-1 tool expansion: `write`, `glob`, `apply_patch`, `webfetch`)
+still stands.
 
 The hands had to funnel almost everything through `bash` — fragile, cp1252-hazardous on
 Windows, and hard to parse. This release gives the executor four more first-class tools, all
@@ -983,12 +1015,21 @@ catalog resolved from.
 
 ```bash
 pip install -e ".[dev]"
-pytest
+scripts/test.sh            # the whole suite (recommended)
+scripts/test.sh tests/test_tools.py   # forward any pytest args
 ```
 
 Tests are network-free — the OpenAI-compatible client is mocked and the catalog
 is served from a local fixture (`RELAY_MODELS_URL`) with the cache isolated to a
-tmp dir, so `pytest` never makes a real API call.
+tmp dir, so the suite never makes a real API call.
+
+**Run the suite via `scripts/test.sh`, not `pytest … | tail`.** Piping pytest
+into `tail` (or `head`, etc.) makes the shell report *the pipe's last command's*
+exit status — so a **red suite returns 0 and can be committed as green**. The
+script runs pytest, prints a tail for a quick read, and then exits with *pytest's*
+status, so a failure always propagates (even when its own output is piped). If you
+invoke pytest directly and pipe it, use `set -o pipefail` (or check
+`${PIPESTATUS[0]}`) so the failure isn't swallowed.
 
 ## Naming
 

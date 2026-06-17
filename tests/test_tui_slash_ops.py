@@ -154,8 +154,12 @@ def test_clear_is_disabled_and_inert_mid_run(tmp_path):
         async with app.run_test() as pilot:
             await pilot.pause()
             app._write_conversation("you (goal): build x")
-            # Simulate an in-flight run.
-            app._runner = SimpleNamespace(is_running=True)
+            # Simulate an in-flight run. Include an (empty) transcript so the periodic
+            # _sync_transcript timer can safely run during the test instead of racing a
+            # bare SimpleNamespace and crashing on a missing .transcript.
+            app._runner = SimpleNamespace(
+                is_running=True, transcript=SimpleNamespace(turns=[])
+            )
             # Hidden from the popover...
             assert "clear" not in {c.name for c in visible_commands(app)}
             # ...and inert even if invoked directly (the run is never clobbered).

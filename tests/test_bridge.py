@@ -31,6 +31,7 @@ from relay.bridge import (
     InputState,
     UiRequest,
 )
+from brain_fakes import is_reaction_call, reaction_for_messages
 from relay.config import ModelConfig
 from relay.loop import STATUS_COMPLETED
 from relay.orchestrator import STATUS_CANCELLED, STATUS_DECLINED, Event
@@ -321,6 +322,8 @@ class _ArcClient:
             return _resp("<scope>small</scope><reason>self-contained</reason>")
         if "precise, executor-ready plan" in system:
             return _resp(f"{self._plan}<headline>{self._headline}</headline>")
+        if is_reaction_call(system):
+            return _resp(reaction_for_messages(messages))
         if "asked a question mid-step" in system:
             if self._escalate:
                 return _resp("<decision>escalate</decision>"

@@ -95,7 +95,7 @@ _STATE_HINTS = {
     InputState.IDLE: "type a goal to start",
     InputState.PLANNING: "planning... (esc to cancel)",
     InputState.EXECUTING: "executing... (esc to cancel)",
-    InputState.AWAITING_REACTION: "react to the plan ('ok' commits)",
+    InputState.AWAITING_REACTION: "react to the plan (approve to build it)",
     InputState.AWAITING_DECISION: "the agent needs your decision",
     InputState.AWAITING_APPROVAL: "approve the command? (yes/no)",
 }
@@ -131,7 +131,7 @@ _GENERATING_STATES = (InputState.PLANNING, InputState.EXECUTING)
 # State-aware placeholders: the one box's PURPOSE changes with what the engine is
 # waiting for, so the prompt should say what a submit now means. Short.
 _STATE_PLACEHOLDERS = {
-    InputState.AWAITING_REACTION: "React to the plan, or type 'ok'...",
+    InputState.AWAITING_REACTION: "React to the plan (approve, or ask for changes)...",
     InputState.AWAITING_DECISION: "Your answer...",
     InputState.AWAITING_APPROVAL: "Approve this command? (y/n)...",
     InputState.PLANNING: "The agent is working... (esc to cancel)",
@@ -383,10 +383,12 @@ def describe_event_for_activity(event: Event) -> tuple[str | None, str]:
         return ACTOR_BRAIN, f"memory += [{p.get('kind', '')}] {p.get('summary', '')}"
     if kind == "scope_assessed":
         return ACTOR_BRAIN, f"scope: {p.get('scope', '')} -> {p.get('posture', '')}"
-    if kind in ("scoping_question", "elicitation"):
+    if kind in ("scoping_question", "elicitation", "clarify"):
         return ACTOR_BRAIN, f"asks: {p.get('question', msg)}"
     if kind == "user_reacted":
         return ACTOR_YOU, f"reacted: {p.get('reaction', msg)}"
+    if kind == "rejected":
+        return ACTOR_YOU, "rejected the plan"
     if kind == "committed":
         return ACTOR_YOU, "committed the plan"
     # status / transcript_compacted / not_committed / anything else: a system line.

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 from textual.widgets import Input
 
+from brain_fakes import is_reaction_call, reaction_for_messages
 from relay.bridge import RunOutcome
 from relay.config import ModelConfig
 from relay.tui import COMMANDS, RelayTuiApp, SelectDialog
@@ -66,6 +67,8 @@ class _NoCostParking:
             return _resp_nocost("<scope>small</scope><reason>self-contained</reason>")
         if "precise, executor-ready plan" in system:
             return _resp_nocost("<plan><step>do the thing</step></plan><headline>A thing.</headline>")
+        if is_reaction_call(system):
+            return _resp_nocost(reaction_for_messages(messages))
         return _resp_nocost("<verdict>accept</verdict>")
 
 

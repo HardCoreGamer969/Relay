@@ -9,12 +9,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import relay.conversation as conv
+from brain_fakes import extract_user_reply, is_reaction_call, reaction_for_messages
 from relay.config import ModelConfig
 from relay.conversation import (
     Plan,
     _derive_headline,
     _derive_plain,
-    _is_commit,
     _posture,
     plan_conversationally,
 )
@@ -37,6 +37,7 @@ class _ConvBrain:
         self.prompts = []
         self.scope_calls = 0
         self.propose_calls = 0
+        self.reaction_calls = 0
 
     def __call__(self, role, messages, **kwargs):
         # Flatten whitespace so dispatch markers match across prompt line wraps.
@@ -49,6 +50,10 @@ class _ConvBrain:
             self.propose_calls += 1
             reply = self._propose.pop(0) if self._propose else self._last_propose
             return _resp(reply)
+        if is_reaction_call(system):
+            # The fake stands in for the model's judgment of the user's reply.
+            self.reaction_calls += 1
+            return _resp(reaction_for_messages(messages))
         return _resp("")
 
 
@@ -77,12 +82,6 @@ def test_posture_table_dial_modulation():
     assert _posture("small", "auto") == "propose_fast"
     assert _posture("large", "auto") == "elicit_first"
     assert _posture("ambiguous", "auto") == "scoping_question"
-
-
-def test_is_commit():
-    assert _is_commit("ok") and _is_commit("looks good") and _is_commit("LGTM.") and _is_commit("")
-    assert not _is_commit("add dark mode")
-    assert not _is_commit("yes but drop the login")
 
 
 # --- scope posture ----------------------------------------------------------
@@ -311,3 +310,146 @@ def test_derive_headline_prefers_brain_text_else_derives():
     derived = _derive_headline(plan, "")
     assert derived.startswith("Proposed a 2-step plan") and "alpha step" in derived
     assert _derive_headline(Plan(steps=[]), "") == "Proposed a plan (no steps)."
+
+
+# --- v0.0.25: the brain INTERPRETS the reply (no keyword commit gate) --------
+
+
+class _ReactionBrain:
+    """A fake brain: scripted scope/propose replies + an EXPLICIT <reaction> per
+    user reply, so each category's routing through the loop is pinned directly.
+
+    This stands in for the model's judgment of the reply -- the production gate is
+    the model's interpretation, never a keyword match.
+    """
+
+    def __init__(self, scope_reply, propose_replies, reactions):
+        self.scope_reply = scope_reply
+        self._propose = list(propose_replies)
+        self._last_propose = propose_replies[-1]
+        self._reactions = dict(reactions)  # user reply -> <reaction>...</reaction> string
+        self.reaction_replies: list[str] = []
+
+    def __call__(self, role, messages, **kwargs):
+        system = " ".join(messages[0]["content"].split())
+        if "assess the goal's SCOPE" in system:
+            return _resp(self.scope_reply)
+        if "precise, executor-ready plan" in system:
+            return _resp(self._propose.pop(0) if self._propose else self._last_propose)
+        if is_reaction_call(system):
+            reply = extract_user_reply(messages)
+            self.reaction_replies.append(reply)
+            return _resp(self._reactions.get(reply, "<reaction>unclear</reaction>"))
+        return _resp("")
+
+
+_SMALL = "<scope>small</scope><reason>x</reason>"
+
+
+def test_natural_affirmative_commits_via_brain(monkeypatch):
+    # The headline bug: a natural "yes that looks perfect!" must commit -- the brain
+    # reads it as approve; no literal "== 'ok'" gate would have caught it.
+    brain = _ReactionBrain(
+        _SMALL, ["<plan><step>build it</step></plan>"],
+        {"yes that looks perfect!": "<reaction>approve</reaction>"},
+    )
+    monkeypatch.setattr(conv, "call_model", brain)
+    result = plan_conversationally("a thing", ".", models=CFG, client=object(),
+                                   user_turn=_scripted_user("yes that looks perfect!"))
+    assert result.committed is True
+    assert result.rounds == 1
+    assert any(e["kind"] == "committed" for e in result.events)
+
+
+def test_approve_with_changes_folds_change_then_proceeds(monkeypatch):
+    # The user approves the direction but asks for a tweak in the same breath: the
+    # plan must be REVISED with that change before committing -- not committed as-is.
+    brain = _ReactionBrain(
+        _SMALL,
+        ["<plan><step>step one</step><step>step two original</step></plan>",
+         "<plan><step>step one</step><step>step two uses a config file</step></plan>"],
+        {"looks good but change step 2 to use a config file":
+         "<reaction>approve_changes</reaction><change>make step 2 use a config file</change>"},
+    )
+    monkeypatch.setattr(conv, "call_model", brain)
+    result = plan_conversationally("a thing", ".", models=CFG, client=object(),
+                                   user_turn=_scripted_user("looks good but change step 2 to use a config file"))
+    assert result.committed is True
+    # The change was folded in BEFORE committing (the plan changed, not committed as-is).
+    instructions = [s.instruction for s in result.plan.steps]
+    assert any("config file" in s for s in instructions)
+    assert "step two original" not in instructions
+    assert any(e["kind"] == "plan_revised" for e in result.events)
+
+
+def test_revise_replans_then_commits(monkeypatch):
+    # "rethink the whole approach" -> revise -> a new proposal is presented; the user
+    # then approves the revised plan.
+    brain = _ReactionBrain(
+        _SMALL,
+        ["<plan><step>first approach</step></plan>",
+         "<plan><step>rethought approach</step></plan>"],
+        {"actually rethink the whole approach": "<reaction>revise</reaction>"
+         "<change>rethink the whole approach</change>",
+         "looks good": "<reaction>approve</reaction>"},
+    )
+    monkeypatch.setattr(conv, "call_model", brain)
+    result = plan_conversationally(
+        "a thing", ".", models=CFG, client=object(),
+        user_turn=_scripted_user("actually rethink the whole approach", "looks good"),
+    )
+    assert result.committed is True
+    assert result.rounds == 2
+    assert any("rethought" in s.instruction for s in result.plan.steps)
+    assert any(e["kind"] == "plan_revised" for e in result.events)
+
+
+def test_reject_aborts_cleanly(monkeypatch):
+    brain = _ReactionBrain(
+        _SMALL, ["<plan><step>build it</step></plan>"],
+        {"no, cancel": "<reaction>reject</reaction>"},
+    )
+    monkeypatch.setattr(conv, "call_model", brain)
+    result = plan_conversationally("a thing", ".", models=CFG, client=object(),
+                                   user_turn=_scripted_user("no, cancel"))
+    assert result.committed is False
+    assert any(e["kind"] == "rejected" for e in result.events)
+    assert not any(e["kind"] == "committed" for e in result.events)
+
+
+def test_unclear_asks_clarifying_question_not_commit(monkeypatch):
+    # An ambiguous reply must NOT be guessed as approve (commit spends money + edits
+    # files): the brain asks a brief clarifying question instead.
+    brain = _ReactionBrain(
+        _SMALL, ["<plan><step>build it</step></plan>"],
+        {"hmm, maybe": "<reaction>unclear</reaction>"
+         "<clarify>Just to confirm -- go ahead, or change something first?</clarify>"},
+    )
+    monkeypatch.setattr(conv, "call_model", brain)
+
+    shown: list[str] = []
+
+    def capturing_user(prompt):
+        shown.append(prompt)
+        return "hmm, maybe"  # stays ambiguous both rounds
+
+    result = plan_conversationally("a thing", ".", models=CFG, client=object(),
+                                   user_turn=capturing_user, max_rounds=2)
+    assert result.committed is False
+    clarify_events = [e for e in result.events if e["kind"] == "clarify"]
+    assert clarify_events  # a clarifying question WAS asked
+    # ...and it was actually put to the user (shown as the next prompt), not guessed.
+    assert any("Just to confirm" in p for p in shown)
+    assert not any(e["kind"] == "committed" for e in result.events)
+
+
+def test_no_keyword_commit_gate_remains():
+    # The commit gate is the brain's interpretation -- the old affirmative-literal
+    # match must be entirely gone.
+    import inspect
+
+    assert not hasattr(conv, "_is_commit")
+    assert not hasattr(conv, "_COMMIT_PHRASES")
+    src = inspect.getsource(conv.plan_conversationally)
+    assert "_COMMIT_PHRASES" not in src
+    assert "== 'ok'" not in src and '== "ok"' not in src

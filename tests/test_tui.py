@@ -14,6 +14,7 @@ import asyncio
 import time
 from types import SimpleNamespace
 
+from brain_fakes import is_reaction_call, reaction_for_messages
 from relay.bridge import InputState
 from relay.config import ModelConfig
 from relay.loop import STATUS_COMPLETED
@@ -60,6 +61,8 @@ class _ArcClient:
             return _resp("<scope>small</scope><reason>self-contained</reason>")
         if "precise, executor-ready plan" in system:
             return _resp(f"<plan><step>add login</step></plan><headline>{self._headline}</headline>")
+        if is_reaction_call(system):
+            return _resp(reaction_for_messages(messages))
         if "asked a question mid-step" in system:
             return _resp("<decision>escalate</decision>"
                          "<ask_user>Should login support OAuth?</ask_user>")
@@ -222,6 +225,8 @@ class _AssumeClient:
                 "<headline>Build the store.</headline>"
                 "<assume>use SQLite</assume><assume>no auth</assume>"
             )
+        if is_reaction_call(system):
+            return _resp(reaction_for_messages(messages))
         if "readable narrative" in system.lower():
             return _resp("Earlier you committed a small plan.")
         return _resp("<verdict>accept</verdict>")

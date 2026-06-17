@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from brain_fakes import is_reaction_call, reaction_for_messages
 from relay.config import ModelConfig
 from relay.conversation import plan_conversationally
 from relay.loop import STATUS_COMPLETED
@@ -52,6 +53,8 @@ class _Client:
             return _resp("<scope>small</scope><reason>self-contained</reason>")
         if "precise, executor-ready plan" in system:
             return _resp("<plan><step>add login</step></plan>")
+        if is_reaction_call(system):
+            return _resp(reaction_for_messages(messages))
         if "asked a question mid-step" in system:
             if self._escalate:
                 return _resp("<decision>escalate</decision><ask_user>Should login support "

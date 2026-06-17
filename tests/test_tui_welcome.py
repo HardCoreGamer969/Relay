@@ -15,6 +15,7 @@ import random
 import time
 from types import SimpleNamespace
 
+from brain_fakes import is_reaction_call, reaction_for_messages
 from relay.bridge import InputState
 from relay.config import ModelConfig
 from relay.tui import (
@@ -54,6 +55,8 @@ class _ParkingClient:
             return _resp("<scope>small</scope><reason>self-contained</reason>")
         if "precise, executor-ready plan" in system:
             return _resp("<plan><step>do the thing</step></plan><headline>A small thing.</headline>")
+        if is_reaction_call(system):
+            return _resp(reaction_for_messages(messages))
         return _resp("<verdict>accept</verdict>")
 
 
@@ -111,7 +114,7 @@ def test_placeholder_is_state_aware():
     idle = "Describe the goal..."
     # Awaiting states each get their own short cue.
     assert placeholder_for_state(InputState.AWAITING_REACTION, idle) != idle
-    assert "ok" in placeholder_for_state(InputState.AWAITING_REACTION, idle)
+    assert "approve" in placeholder_for_state(InputState.AWAITING_REACTION, idle)
     assert placeholder_for_state(InputState.AWAITING_DECISION, idle) == "Your answer..."
     assert "y/n" in placeholder_for_state(InputState.AWAITING_APPROVAL, idle)
     # Idle (and welcome) falls back to the per-launch rotating phrase.
@@ -148,7 +151,7 @@ def test_placeholder_follows_engine_state(tmp_path):
             assert placeholder == placeholder_for_state(
                 InputState.AWAITING_REACTION, app._placeholder
             )
-            assert "ok" in placeholder
+            assert "approve" in placeholder
             await _teardown(pilot, app)
 
     asyncio.run(main())

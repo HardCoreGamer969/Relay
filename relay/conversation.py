@@ -60,15 +60,20 @@ _POSTURE_BY_LEVEL = {
     "5": {"small": "elicit_first", "large": "elicit_first", "ambiguous": "elicit_first"},
 }
 
-# A user reply that is purely affirmative commits the shown plan; anything else is
-# a free-form revision reaction. Trailing punctuation is stripped before matching.
-_COMMIT_PHRASES = {
-    "", "ok", "okay", "yes", "y", "go", "commit", "approve", "approved", "looks good",
-    "lgtm", "ship it", "ship", "do it", "proceed", "sounds good", "perfect", "great",
-    "good", "done", "yep", "yeah", "build it",
-}
-
 EventSink = Callable[[str, str, dict], None]
+
+# How the brain may classify the user's reaction to a proposed plan. The category
+# comes from the MODEL understanding the reply, never a keyword match (see
+# _classify_reaction): there is a language model right here that understands
+# intent, so interpreting the human's natural-language reply is its judgment.
+_REACTION_CATEGORIES = {"approve", "approve_changes", "revise", "reject", "unclear"}
+
+# The fallback clarifying question when the brain classifies a reply as unclear but
+# offers no question of its own. Commit spends money and edits files, so an
+# ambiguous reply is NEVER guessed as approve -- Relay asks instead.
+_DEFAULT_CLARIFY = (
+    "Just to confirm -- should I go ahead and build this, or do you want changes first?"
+)
 
 _SCOPE_SYSTEM = """\
 You are the PLANNER (the "brain") of Relay. Before planning, assess the goal's
@@ -120,6 +125,37 @@ _PROPOSE_GRAMMAR = (
 
 _PLAN_NUDGE = "Emit a <plan> with <step>...</step> children (and any <assume> tags)."
 
+# The brain interprets the user's plain-language reaction to a proposed plan. The
+# point is that the CATEGORY is the model's judgment of intent -- not a keyword
+# match -- mirroring how a mature agent reads "yes that looks perfect!" the same
+# way it reads "ok". Parsed deterministically from the <reaction> tag below.
+_REACTION_SYSTEM = """\
+You are the PLANNER (the "brain") of Relay. You proposed a plan and the user has
+replied in plain language. INTERPRET their reply the way a person would -- do NOT
+keyword-match -- and classify what they want so Relay can react:
+
+- approve: they are satisfied and want you to proceed AS PROPOSED. "ok", "yes that
+  looks perfect!", "go for it", "ship it", "lgtm" all mean approve.
+- approve_changes: they approve the direction BUT ask for a modification in the
+  same breath (e.g. "looks good, but make step 2 use Postgres"). Capture the exact
+  change so it can be folded in before proceeding -- do not drop it.
+- revise: they want changes or are not satisfied and expect a NEW proposal (e.g.
+  "change the approach", "no, do X instead"). Capture the feedback.
+- reject: they want to STOP entirely (e.g. "no", "cancel", "scrap it").
+- unclear: the reply is genuinely ambiguous -- you cannot confidently tell which of
+  the above it is (e.g. "hmm, maybe"). Committing spends money and edits files, so
+  do NOT guess approve: ask ONE brief clarifying question instead.
+"""
+
+_REACTION_GRAMMAR = (
+    "Reply using ONLY these tags:\n"
+    "<reaction>approve|approve_changes|revise|reject|unclear</reaction>\n"
+    "<change>the exact change or feedback to fold in</change>"
+    "  (REQUIRED for approve_changes and revise; omit otherwise)\n"
+    "<clarify>one brief clarifying question</clarify>"
+    "  (REQUIRED for unclear; omit otherwise)"
+)
+
 
 @dataclass
 class ScopeAssessment:
@@ -162,10 +198,6 @@ def _tags(name: str, text: str) -> list[str]:
     return [m.group(1).strip() for m in re.finditer(rf"<{name}>(.*?)</{name}>", text or "", re.DOTALL) if m.group(1).strip()]
 
 
-def _is_commit(reply: str) -> bool:
-    return (reply or "").strip().lower().rstrip("!.") in _COMMIT_PHRASES
-
-
 def _posture(scope: str, level: str) -> str:
     table = _POSTURE_BY_LEVEL.get(level, _POSTURE_BY_LEVEL["auto"])
     return table.get(scope, "propose_fast")
@@ -186,7 +218,10 @@ def _derive_plain(plan: Plan, assumptions: list[str]) -> str:
         for assumption in assumptions:
             lines.append(f"  - {assumption}")
     lines.append("")
-    lines.append("React in plain language (e.g. \"make it dark mode\"), or say 'ok' to build it.")
+    lines.append(
+        "React in plain language -- e.g. \"make it dark mode\" to change it, or "
+        "\"looks good\" to build it. (I read your reply, so say it however you like.)"
+    )
     return "\n".join(lines)
 
 
@@ -285,6 +320,53 @@ def _propose(
     return Plan(steps=[]), [], ""  # bounded: give up to an empty plan rather than loop
 
 
+@dataclass
+class ReactionClassification:
+    """The brain's read of one user reaction to a proposed plan.
+
+    ``category`` is one of :data:`_REACTION_CATEGORIES`; ``change`` carries the
+    requested modification/feedback (for approve_changes / revise) and ``clarify``
+    the brain's question (for unclear). This is the COMMIT GATE: a plan commits
+    only when the brain interprets the reply as approve (or approve_changes, after
+    folding the change) -- there is no affirmative-keyword check anywhere.
+    """
+
+    category: str
+    change: str = ""
+    clarify: str = ""
+
+
+def _classify_reaction(
+    goal, plan, reaction, *, models, ledger, client, brain_role
+) -> ReactionClassification:
+    """Have the brain INTERPRET the user's reply to the proposed plan.
+
+    Reuses the ``call_model("brain", ...)`` path and the text-tag protocol (no
+    native tool-calling): the brain emits ``<reaction>...</reaction>`` (+ ``<change>``
+    / ``<clarify>`` where relevant), parsed deterministically here. An unparseable
+    or unknown classification is treated as ``unclear`` -- NEVER an implicit approve
+    -- so a confused model can't trigger a spend-and-edit commit.
+    """
+    steps_block = "\n".join(f"- {s.instruction}" for s in plan.steps) or "(no steps)"
+    user = (
+        f"Goal: {goal}\n\n"
+        f"The plan you proposed:\n{steps_block}\n\n"
+        f"The user's reply:\n{reaction}\n\n"
+        f"{_REACTION_GRAMMAR}"
+    )
+    reply = call_model(
+        brain_role,
+        [{"role": "system", "content": _REACTION_SYSTEM}, {"role": "user", "content": user}],
+        models=models, ledger=ledger, client=client,
+    ).text
+    category = (_tag("reaction", reply) or "").lower().strip()
+    if category not in _REACTION_CATEGORIES:
+        category = "unclear"
+    return ReactionClassification(
+        category=category, change=_tag("change", reply) or "", clarify=_tag("clarify", reply) or ""
+    )
+
+
 def plan_conversationally(
     goal: str,
     project_root: str | Path,
@@ -374,31 +456,29 @@ def plan_conversationally(
     # display (result.plain_plan, shown by user_turn) keeps the full detail.
     transcript.record("brain", "proposal", headline, refs=[f"step{s.index}" for s in plan.steps])
 
-    # 4. Reaction loop: show -> commit or fold-and-revise, bounded by max_rounds.
-    while result.rounds < max_rounds:
-        reaction = user_turn(result.plain_plan)
-        result.rounds += 1
-        if _is_commit(reaction):
-            # Commit is a user-facing decision: recorded transcript-first, then
-            # derived into memory (provenance links the entry to this commit turn).
-            record_decision(
-                transcript, memory,
-                text=reaction or "(approved as proposed)",
-                detail=f"User committed the plan ({len(plan.steps)} step(s)): "
-                       + "; ".join(s.instruction for s in plan.steps),
-                summary="user committed the plan",
-                kind="decision", phase="commit", speaker="user",
-                refs=[f"step{s.index}" for s in plan.steps],
-            )
-            result.committed = True
-            emit("committed", "plan committed", {"steps": [s.instruction for s in plan.steps]})
-            return result
-        emit("user_reacted", reaction, {"reaction": reaction})
-        transcript.record("user", "reaction", reaction)
-        if result.rounds >= max_rounds:
-            break  # no further round to show a revision; stop without committing
+    def commit(reaction_text: str) -> ConversationResult:
+        """Finalize: commit ``result.plan``. A user-facing decision, so it is
+        recorded transcript-first, then derived into memory (provenance links the
+        entry to this commit turn)."""
+        steps = result.plan.steps
+        record_decision(
+            transcript, memory,
+            text=reaction_text or "(approved as proposed)",
+            detail=f"User committed the plan ({len(steps)} step(s)): "
+                   + "; ".join(s.instruction for s in steps),
+            summary="user committed the plan",
+            kind="decision", phase="commit", speaker="user",
+            refs=[f"step{s.index}" for s in steps],
+        )
+        result.committed = True
+        emit("committed", "plan committed", {"steps": [s.instruction for s in steps]})
+        return result
+
+    def revise_plan(feedback: str) -> None:
+        """Fold ``feedback`` into a revised plan and re-render (no commit here)."""
+        nonlocal plan, assumptions, headline
         plan, assumptions, headline = _propose(
-            goal, digest, assumption_level, answers, plan, reaction, mem_ctx,
+            goal, digest, assumption_level, answers, result.plan, feedback, mem_ctx,
             models=models, ledger=ledger, client=client, brain_role=brain_role,
         )
         result.plan = plan
@@ -407,6 +487,53 @@ def plan_conversationally(
         emit("plan_revised", "plan revised",
              {"plain": result.plain_plan, "steps": [s.instruction for s in plan.steps], "assumptions": assumptions})
         transcript.record("brain", "proposal", headline, refs=[f"step{s.index}" for s in plan.steps])
+
+    # 4. Reaction loop: the user reacts in plain language; the BRAIN interprets the
+    # reply (no keyword match) and we react to the category, bounded by max_rounds.
+    prompt = result.plain_plan
+    while result.rounds < max_rounds:
+        reaction = user_turn(prompt)
+        result.rounds += 1
+        classification = _classify_reaction(
+            goal, result.plan, reaction,
+            models=models, ledger=ledger, client=client, brain_role=brain_role,
+        )
+        category = classification.category
+
+        if category == "approve":
+            return commit(reaction)
+
+        # Every other category records the user's reaction turn for the thread.
+        emit("user_reacted", reaction, {"reaction": reaction, "reaction_class": category})
+        transcript.record("user", "reaction", reaction)
+
+        if category == "reject":
+            emit("rejected", "user rejected the plan", {"reaction": reaction})
+            return result  # aborts cleanly: not committed
+
+        if category == "unclear":
+            # Ambiguous reply: ASK rather than guess approve (commit spends money +
+            # edits files). The clarifying question is the next prompt shown.
+            question = classification.clarify or _DEFAULT_CLARIFY
+            emit("clarify", question, {"question": question})
+            transcript.record("brain", "planning", question)
+            result.questions_asked += 1
+            prompt = question
+            continue
+
+        if category == "approve_changes":
+            # The user approved the direction but asked for a tweak in the same
+            # breath: fold it in, then PROCEED with the revised plan (never commit
+            # the un-modified plan and lose the change).
+            revise_plan(classification.change or reaction)
+            return commit(reaction)
+
+        # revise: the user wants a new proposal -> re-plan with their feedback and
+        # re-present next round (if a round remains to show it).
+        if result.rounds >= max_rounds:
+            break  # no further round to show a revision; stop without committing
+        revise_plan(classification.change or reaction)
+        prompt = result.plain_plan
 
     emit("not_committed", f"no commit within {max_rounds} round(s)", {})
     return result

@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 from relay.config import ModelConfig
 from relay.loop import STATUS_COMPLETED, STATUS_MAX_STEPS
-from relay.memory import PlanMemory
+from relay.memory import POOL_SHARED, MemoryBus, PlanMemory, memory_budget
 from relay.orchestrator import (
     STATUS_ABORTED_BY_BRAIN,
     STATUS_ESCALATION_LIMIT,
@@ -737,6 +737,88 @@ from relay.transcript import Transcript  # noqa: E402
 
 def _committed(*instructions):
     return Plan.from_instructions(list(instructions))
+
+
+# --- v0.0.29: three-pool memory (per-pool budgets + write routing) -----------
+
+
+class _FakeCatalog:
+    """Minimal catalog stand-in exposing only context_limit (what resolve uses)."""
+
+    def __init__(self, limits):
+        self._limits = limits  # {(provider, model): int}
+
+    def context_limit(self, provider, model):
+        return self._limits.get((provider, model))
+
+
+def _one_step_run(tmp_path, **kw):
+    """A committed 1-step run that completes immediately (brain accepts, hands done)."""
+    client = RoutedClient(
+        brain=["<verdict>accept</verdict>"],
+        hands=['<edit path="x.txt">X</edit>\n<done>created x</done>'],
+    )
+    return run_planned(
+        "g", tmp_path, models=CFG, client=client,
+        committed_plan=_committed("create x.txt"), **kw,
+    )
+
+
+def test_run_memory_is_a_bus_budgeted_per_actor_window(tmp_path, monkeypatch):
+    # Each actor's window resolves independently (env overrides here); the bus budgets
+    # each pool to its OWN window, and shared to the smaller of the two.
+    monkeypatch.setenv("RELAY_BRAIN_CONTEXT", "40000")
+    monkeypatch.setenv("RELAY_HANDS_CONTEXT", "12000")
+    result = _one_step_run(tmp_path)
+    assert isinstance(result.memory, MemoryBus)
+    assert result.memory.brain_budget == memory_budget(40000)
+    assert result.memory.hands_budget == memory_budget(12000)
+    assert result.memory.shared_budget == memory_budget(12000)  # min(40000, 12000)
+
+
+def test_loop_passes_catalog_so_window_is_not_the_8192_default(tmp_path, monkeypatch):
+    # No env overrides: without the catalog rung an unprobed model falls to 8192.
+    # The loop passes provider + catalog, so each actor gets its REAL window.
+    monkeypatch.delenv("RELAY_BRAIN_CONTEXT", raising=False)
+    monkeypatch.delenv("RELAY_HANDS_CONTEXT", raising=False)
+    catalog = _FakeCatalog({
+        (CFG.brain_provider, CFG.brain): 200000,
+        (CFG.hands_provider, CFG.hands): 128000,
+    })
+    result = _one_step_run(tmp_path, catalog=catalog)
+    assert result.memory.brain_budget == memory_budget(200000)  # not memory_budget(8192)
+    assert result.memory.hands_budget == memory_budget(128000)
+
+
+def test_step_facts_go_to_the_brain_pool(tmp_path):
+    # Step-done facts are brain reasoning -> the brain pool (not shared, not hands).
+    result = _one_step_run(tmp_path)
+    assert any(e.kind == "fact" for e in result.memory.brain.entries)
+    assert not result.memory.shared.entries  # nothing shared on a plain happy path
+    assert not result.memory.hands.entries
+
+
+def test_self_answer_decision_graduates_to_shared(tmp_path):
+    # A self-answered technical question is an authoritative decision the hands must
+    # honor -> the SHARED pool, so a later hands read can see it.
+    client = RoutedClient(
+        brain=[
+            "<decision>self_answer</decision><answer>use config.toml</answer>",
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
+            "<question>where is config?</question>",
+            '<edit path="c.py">x</edit>\n<done>wrote it</done>',
+        ],
+    )
+    result = run_planned(
+        "g", tmp_path, models=CFG, client=client,
+        committed_plan=_committed("write the loader"),
+    )
+    assert result.status == STATUS_COMPLETED
+    decisions = [e for e in result.memory.shared.entries if e.kind == "decision"]
+    assert any("config.toml" in e.detail for e in decisions)
+    assert not [e for e in result.memory.brain.entries if e.kind == "decision"]
 
 
 def test_cancel_check_stops_at_the_next_step_boundary(tmp_path):

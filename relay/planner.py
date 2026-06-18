@@ -23,7 +23,7 @@ from relay.config import ModelConfig, assumption_directive
 from relay.context import DEFAULT_CONTEXT_WINDOW
 from relay.investigation import investigate
 from relay.loop import describe_action, execute_action
-from relay.memory import PlanMemory, memory_budget
+from relay.memory import MemoryBus, PlanMemory, memory_budget
 from relay.models import call_model
 from relay.protocol import parse
 from relay.telemetry import Ledger
@@ -480,7 +480,7 @@ def _bounded_text(text: str, max_chars: int) -> str:
 
 
 def _memory_context(
-    memory: PlanMemory | None,
+    memory: "PlanMemory | MemoryBus | None",
     query: str,
     budget_tokens: int,
     *,
@@ -488,8 +488,20 @@ def _memory_context(
     models: ModelConfig | None,
     ledger: Ledger | None,
 ) -> str:
-    """Window-aware (budget-bounded) memory slice -- never the whole store."""
-    if memory is None or not memory.entries or budget_tokens <= 0:
+    """Window-aware (budget-bounded) memory slice -- never the whole store.
+
+    The single funnel for every brain-side read. With a :class:`MemoryBus`
+    (v0.0.29) it returns the brain's ``brain ∪ shared`` union, capped to
+    ``budget_tokens`` (the brain-window budget). With a plain
+    :class:`PlanMemory` it is the single-pool slice, unchanged.
+    """
+    if memory is None or budget_tokens <= 0:
+        return ""
+    if isinstance(memory, MemoryBus):
+        return memory.brain_context(
+            query, budget_tokens, client=client, models=models, ledger=ledger
+        )
+    if not memory.entries:
         return ""
     return memory.compacted_context(
         query, budget_tokens=budget_tokens, client=client, models=models, ledger=ledger

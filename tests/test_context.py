@@ -159,6 +159,26 @@ def test_local_probe_failure_falls_through_to_default(monkeypatch):
     assert (window, source) == (DEFAULT_CONTEXT_WINDOW, "default")
 
 
+def test_env_override_names_the_var_consulted(monkeypatch):
+    # v0.0.29: the hands resolves its OWN env override and must NOT inherit the
+    # brain's RELAY_BRAIN_CONTEXT.
+    monkeypatch.setenv("RELAY_BRAIN_CONTEXT", "111111")
+    monkeypatch.setenv("RELAY_HANDS_CONTEXT", "22222")
+    brain_w, brain_src = resolve_context_window("vendor/brain")
+    hands_w, hands_src = resolve_context_window("vendor/hands", env_override="RELAY_HANDS_CONTEXT")
+    assert (brain_w, brain_src) == (111111, "override")
+    assert (hands_w, hands_src) == (22222, "override")  # NOT 111111
+
+
+def test_hands_env_override_does_not_leak_the_brain_override(monkeypatch):
+    # Only RELAY_BRAIN_CONTEXT is set; the hands resolution (env_override pointed at
+    # RELAY_HANDS_CONTEXT) must fall THROUGH it, not pick up the brain's value.
+    monkeypatch.setenv("RELAY_BRAIN_CONTEXT", "111111")
+    monkeypatch.delenv("RELAY_HANDS_CONTEXT", raising=False)
+    window, source = resolve_context_window("vendor/hands", env_override="RELAY_HANDS_CONTEXT")
+    assert window == DEFAULT_CONTEXT_WINDOW and source == "default"  # not 111111
+
+
 def test_resolution_never_raises_even_if_client_blows_up(monkeypatch):
     monkeypatch.delenv("RELAY_BRAIN_CONTEXT", raising=False)
 

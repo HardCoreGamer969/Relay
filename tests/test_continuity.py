@@ -15,7 +15,7 @@ from brain_fakes import is_reaction_call, reaction_for_messages
 from relay.config import ModelConfig
 from relay.conversation import plan_conversationally
 from relay.loop import STATUS_COMPLETED
-from relay.memory import PlanMemory
+from relay.memory import MemoryBus
 from relay.orchestrator import run_planned
 from relay.planner import Plan
 from relay.transcript import Transcript
@@ -138,14 +138,17 @@ def test_escalation_is_phrased_with_conversation_context(tmp_path):
 
 
 def test_escalation_decision_is_authoritative_turn_with_linked_memory(tmp_path):
-    memory = PlanMemory()
+    memory = MemoryBus()
     client, transcript, result = _converse_then_run(
         tmp_path, user_decision=lambda q: "yes, Google OAuth", memory=memory
     )
 
     decision_turns = [t for t in transcript.turns if t.phase == "decision"]
     assert len(decision_turns) == 1                       # the authoritative record
-    confirmations = [e for e in memory.entries if e.kind == "confirmation"]
+    # v0.0.29: the user confirmation is an authoritative directive, so it graduates to
+    # the SHARED pool (where the hands can see it), NOT the brain pool.
+    confirmations = [e for e in memory.shared.entries if e.kind == "confirmation"]
+    assert not [e for e in memory.brain.entries if e.kind == "confirmation"]
     # The memory entry is DERIVED from the turn: provenance points back at it.
     assert any(c.provenance == f"transcript:{decision_turns[0].id}" for c in confirmations)
     assert any("OAuth" in c.detail for c in confirmations)

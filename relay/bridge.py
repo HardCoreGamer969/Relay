@@ -43,7 +43,7 @@ from typing import Callable
 
 from relay.config import ModelConfig, resolve_max_total_steps
 from relay.conversation import DEFAULT_MAX_ROUNDS, ConversationResult, plan_conversationally
-from relay.memory import PlanMemory
+from relay.memory import MemoryBus
 from relay.orchestrator import (
     STATUS_CANCELLED,
     STATUS_COMPLETED,
@@ -448,7 +448,7 @@ class Session(WorkingDirSession):
     def __init__(self, launch_root: str | Path) -> None:
         super().__init__(launch_root)
         self.transcript = Transcript()
-        self.memory = PlanMemory()
+        self.memory = MemoryBus()
         self.goal: str | None = None
         self.last_plan: Plan | None = None
         self.revisions = 0
@@ -461,7 +461,7 @@ class Session(WorkingDirSession):
         plan but keeps all of this. The working DIR is left as-is (it is a workspace
         location, not conversation/memory/plan)."""
         self.transcript = Transcript()
-        self.memory = PlanMemory()
+        self.memory = MemoryBus()
         self.goal = None
         self.last_plan = None
         self.revisions = 0
@@ -576,7 +576,7 @@ class EngineRunner:
         on_finished: Callable[[RunOutcome], None],
         run_kwargs: dict | None = None,
         transcript: Transcript | None = None,
-        memory: PlanMemory | None = None,
+        memory: MemoryBus | None = None,
     ) -> None:
         self.project_root = Path(project_root)
         self.models = models
@@ -590,7 +590,7 @@ class EngineRunner:
         # continuation run keeps the same conversation + learnings; a bare runner
         # (tests) gets fresh ones, unchanged from before.
         self.transcript = transcript if transcript is not None else Transcript()
-        self.memory = memory if memory is not None else PlanMemory()
+        self.memory = memory if memory is not None else MemoryBus()
         self.outcome: RunOutcome | None = None
         self._on_finished = on_finished
         self._run_kwargs = dict(run_kwargs or {})  # extra run_planned knobs (tests)

@@ -39,7 +39,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, replace
 
 from relay.config import ModelConfig
-from relay.memory import PlanMemory, estimate_tokens
+from relay.memory import POOL_BRAIN, MemoryBus, PlanMemory, estimate_tokens
 from relay.models import call_model
 from relay.telemetry import Ledger
 
@@ -153,7 +153,7 @@ class Transcript:
 
 def record_decision(
     transcript: Transcript,
-    memory: PlanMemory | None,
+    memory: "PlanMemory | MemoryBus | None",
     *,
     text: str,
     detail: str,
@@ -162,6 +162,7 @@ def record_decision(
     phase: str = "decision",
     speaker: str = "user",
     refs: list[str] | None = None,
+    pool: str = POOL_BRAIN,
 ) -> tuple[Turn, "object | None"]:
     """Record a user-facing decision: TRANSCRIPT FIRST, then derive a memory entry.
 
@@ -172,12 +173,20 @@ def record_decision(
     pointing back at that turn. The transcript is the source of truth; the memory
     entry is the derived, re-derivable extract. Returns ``(turn, entry_or_None)``.
 
+    ``pool`` selects the destination pool when ``memory`` is a
+    :class:`~relay.memory.MemoryBus` (v0.0.29) -- e.g. a user confirmation is an
+    authoritative directive the hands must honor, so the orchestrator records it to
+    ``POOL_SHARED``. A plain :class:`~relay.memory.PlanMemory` ignores ``pool``
+    (single-pool, unchanged behavior).
+
     Purely-internal brain facts (executor outcomes, dead ends) are NOT decisions
     and should still go straight to memory -- they are not conversation turns.
     """
     turn = transcript.record(speaker, phase, text, refs=list(refs or []))
     entry = None
-    if memory is not None:
+    if isinstance(memory, MemoryBus):
+        entry = memory.remember(kind, detail, summary, pool=pool, provenance=f"transcript:{turn.id}")
+    elif memory is not None:
         entry = memory.remember(kind, detail, summary, provenance=f"transcript:{turn.id}")
     return turn, entry
 

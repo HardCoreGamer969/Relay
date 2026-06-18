@@ -35,7 +35,13 @@ from relay.loop import (
     describe_action,
     guarded_execute_action,
 )
-from relay.memory import PlanMemory, memory_budget, texts_near_duplicate
+from relay.memory import (
+    POOL_BRAIN,
+    POOL_SHARED,
+    MemoryBus,
+    PlanMemory,
+    texts_near_duplicate,
+)
 from relay.models import call_model
 from relay.planner import (
     Plan,
@@ -191,7 +197,7 @@ class PlannedTaskResult:
     escalations: int = 0
     ledger: Ledger | None = None
     events: list[Event] = field(default_factory=list)
-    memory: PlanMemory | None = None
+    memory: "MemoryBus | PlanMemory | None" = None
     revisions: int = 0
     # The effective global step ceiling for this run (None = unbounded), so a
     # surface can tell the user how to raise it when STATUS_MAX_STEPS is hit.
@@ -468,6 +474,21 @@ def _result_summary(status: str, plan: Plan, *, max_total_steps: int | None = No
     return f"{phrasing} ({done}/{total} step(s) completed.)"
 
 
+def _ensure_bus(memory: "MemoryBus | PlanMemory | None") -> MemoryBus:
+    """Normalize the run's memory to a :class:`MemoryBus` (v0.0.29).
+
+    ``None`` -> a fresh bus. A :class:`MemoryBus` is used as-is (the session's bus,
+    threaded across steer/queue continuations). A legacy :class:`PlanMemory` (a
+    direct caller / older test) is adopted AS the brain pool, so its entries and any
+    brain-pool writes stay visible on that same object.
+    """
+    if isinstance(memory, MemoryBus):
+        return memory
+    if isinstance(memory, PlanMemory):
+        return MemoryBus(brain=memory)
+    return MemoryBus()
+
+
 def _adopt_revision(plan: Plan, revised: Plan) -> Plan:
     """Splice a revision into the plan: keep done/failed steps, replace the tail.
 
@@ -505,6 +526,7 @@ def run_planned(
     max_plan_revisions: int = 5,
     max_total_steps: int | None = None,
     context_window: int | None = None,
+    catalog: Any | None = None,
     on_event: EventCallback | None = None,
     plan_gate: Callable[[Plan], bool] | None = None,
     committed_plan: Plan | None = None,
@@ -559,14 +581,27 @@ def run_planned(
     brain calls and excluded from the executor budget.
     """
     ledger = ledger if ledger is not None else Ledger()
-    memory = memory if memory is not None else PlanMemory()
+    memory = _ensure_bus(memory)  # v0.0.29: the run's memory is the three-pool bus
     transcript = transcript if transcript is not None else Transcript()
     result = PlannedTaskResult(goal=goal, ledger=ledger, memory=memory, transcript=transcript)
     result.max_total_steps = max_total_steps  # so a surface can tell the user how to raise it
 
     cfg = models if models is not None else load_models()
-    window, _source = resolve_context_window(cfg.brain, client=client, override=context_window)
-    mem_budget = memory_budget(window)
+    # v0.0.29: resolve BOTH actor windows and budget each pool to its own (passing
+    # provider + catalog so a catalog model gets its real window instead of the 8192
+    # default). The hands reads RELAY_HANDS_CONTEXT for its manual override, never the
+    # brain's. The brain-window budget (mem_budget) is what the brain calls + transcript
+    # renders use; the bus holds the per-pool split internally.
+    brain_window, _bsrc = resolve_context_window(
+        cfg.brain, provider=cfg.brain_provider, client=client,
+        override=context_window, catalog=catalog,
+    )
+    hands_window, _hsrc = resolve_context_window(
+        cfg.hands, provider=cfg.hands_provider, client=client,
+        catalog=catalog, env_override="RELAY_HANDS_CONTEXT",
+    )
+    memory.configure_budgets(brain_window=brain_window, hands_window=hands_window)
+    mem_budget = memory.brain_budget
 
     def emit(kind: str, message: str, payload: dict | None = None) -> None:
         event = Event(kind, message, payload or {})
@@ -574,13 +609,18 @@ def run_planned(
         if on_event is not None:
             on_event(event)
 
-    def remember(kind: str, detail: str, summary: str, *, provenance: str, tags=None) -> None:
+    def remember(
+        kind: str, detail: str, summary: str, *, provenance: str, pool: str = POOL_BRAIN, tags=None
+    ) -> None:
         # Suppressed near-duplicates return None; don't surface a memory_write for
         # an entry that was not actually stored (else the activity feed would show
-        # the very restatements dedup just dropped).
-        stored = memory.remember(kind, detail, summary, provenance=provenance, tags=list(tags or []))
+        # the very restatements dedup just dropped). ``pool`` routes the write
+        # (v0.0.29): brain reasoning -> POOL_BRAIN (default), authoritative directives
+        # / hands findings -> POOL_SHARED.
+        stored = memory.remember(kind, detail, summary, pool=pool, provenance=provenance, tags=list(tags or []))
         if stored is not None:
-            emit("memory_write", f"{kind}: {summary}", {"kind": kind, "summary": summary, "provenance": provenance})
+            emit("memory_write", f"{kind}: {summary}",
+                 {"kind": kind, "summary": summary, "provenance": provenance, "pool": pool})
 
     def finalize(plan_for_summary: Plan | None) -> PlannedTaskResult:
         """Close the conversation thread on ANY terminal path: a deterministic
@@ -653,9 +693,12 @@ def run_planned(
             for kind, detail, summary in resolution.records:
                 remember(kind, detail, summary, provenance=f"step{step.index} brain")
             if resolution.kind == "self_answer":
+                # An authoritative decision the hands must honor -> the SHARED pool, so
+                # the hands (which reads shared) sees it, not just the brain.
                 remember(
                     "decision", f"Q: {question} -> A: {resolution.answer}",
-                    f"answered '{question}': {resolution.answer}", provenance=f"step{step.index} self-answer",
+                    f"answered '{question}': {resolution.answer}",
+                    provenance=f"step{step.index} self-answer", pool=POOL_SHARED,
                 )
                 emit("brain_self_answered", question,
                      {"question": question, "answer": resolution.answer, "reasoning": resolution.reasoning})
@@ -678,11 +721,12 @@ def run_planned(
                 detail=f"User decided on '{resolution.question_for_user}': {answer}",
                 summary=f"user: {answer}",
                 kind="confirmation", phase="decision", speaker="user",
-                refs=[f"step{step.index}"],
+                refs=[f"step{step.index}"], pool=POOL_SHARED,
             )
             if entry is not None:
                 emit("memory_write", f"confirmation: user: {answer}",
-                     {"kind": "confirmation", "summary": f"user: {answer}", "provenance": entry.provenance})
+                     {"kind": "confirmation", "summary": f"user: {answer}",
+                      "provenance": entry.provenance, "pool": POOL_SHARED})
             emit("user_decided", answer, {"question": resolution.question_for_user, "answer": answer})
             return _QuestionResolution(answer=answer)
 

@@ -46,9 +46,43 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.27 (tool-hardening: apply_patch fuzzy matching, Windows/Unix commands, housekeeping)
+## Status — v0.0.28 (esc = interrupt with steer + queue; the session lives on)
 
-A live run on a multi-file Python project surfaced three real problems; this release fixes
+**esc** is no longer "stop the run" — it is a full **interrupt**, and the **session is
+never torn down** by it. esc halts the *run* at the clean executor-call boundary (the
+v0.0.20 cancel-seam safety is intact: no mid-call teardown, clean worker join, money-leak
+guard), then lands you at an interrupt prompt with the conversation, working dir, memory, and
+cost tally all preserved. From there the fork is:
+
+- **Type input → steer** (the default, since an interrupt usually means "fix this now"). A
+  steer goes through the **brain**: the existing `replan` is invoked with your input as new
+  direction, producing a revised plan for the **remaining** work (completed steps stay done),
+  and execution resumes on it. A steer counts as a plan revision (bounded by
+  `max_plan_revisions`). `/redirect <input>` is the explicit form.
+- **Empty / esc again → stop**: the current plan is abandoned but the **session persists** —
+  your next input begins fresh planning *within the same session*, never a teardown.
+
+Alongside steer (apply now) is a fully functional **input queue** (apply next): **`/queue
+<input>`** holds your input without interrupting the current step; when it finishes, the
+queued item is consumed next (FIFO) as a new direction in the same session. **up-arrow** is
+one unified **recall-and-edit** affordance across goals, steers, and queued items — recall a
+recent input into the prompt, edit it, re-submit (or re-queue). The queue **mechanism is
+complete**; its interim UI is deliberately minimal (a `queued: N` status segment) — surfacing
+and polishing it is the upcoming UI-overhaul milestone.
+
+**`/clear`** remains the distinct full-session **reset** (conversation, memory, plan, queue,
+history wiped) — clearly different from **stop**, which keeps all of that and only abandons the
+current plan.
+
+Everything is text-protocol (steer reuses `replan`; no native tool-calling). All of it is
+covered by network-free headless tests. The live feel — interrupting mid-run, steering with a
+correction, queuing a next task, up-arrow editing a queued item, stop-vs-`/clear` — is the
+maintainer's to verify; it is not simulated here.
+
+Under that, **v0.0.27** (tool-hardening: apply_patch fuzzy matching, Windows/Unix commands,
+housekeeping) still stands.
+
+A live run on a multi-file Python project surfaced three real problems; that release fixed
 each.
 
 - **`apply_patch` now matches fuzzily** (it failed on its *first* real use with "a hunk's

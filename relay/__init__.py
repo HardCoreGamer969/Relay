@@ -148,9 +148,12 @@ from relay.bridge import (
     BridgeCancelled,
     EngineBridge,
     EngineRunner,
+    InputHistory,
+    InputQueue,
     InputRouter,
     InputState,
     RunOutcome,
+    Session,
     SubmitOutcome,
     UiRequest,
     WorkingDirSession,
@@ -252,7 +255,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.27"
+__version__ = "0.0.28"
 
 __all__ = [
     # v0.01 -- model layer
@@ -341,6 +344,10 @@ __all__ = [
     "STATUS_CANCELLED",
     # v0.0.25 -- the session-sticky working directory
     "WorkingDirSession",
+    # v0.0.28 -- esc=interrupt: the durable session + steer/queue + recall
+    "Session",
+    "InputQueue",
+    "InputHistory",
     # v0.0.13 -- model catalog + provider profiles (multi-provider seam)
     "Catalog",
     "Cost",

@@ -798,6 +798,65 @@ def test_step_facts_go_to_the_brain_pool(tmp_path):
     assert not result.memory.hands.entries
 
 
+def test_execute_and_describe_action_handle_finding(tmp_path):
+    from relay.loop import describe_action, execute_action
+    from relay.protocol import Action
+    from relay.tools import Tools
+
+    action = Action(kind="finding", content="something is off")
+    assert describe_action(action) == "finding: something is off"
+    # In the solo loop / brain investigation a finding is a no-op note, never a tool op
+    # and never an "unknown action" error.
+    assert execute_action(Tools(tmp_path), action) == "(finding noted)"
+
+
+def test_hands_finding_lands_in_shared_and_reaches_the_brain(tmp_path):
+    # The hands emits a <finding> mid-step (non-blocking), then completes. The finding
+    # must: land in SHARED (not brain/hands), NOT end the step, surface on the feed,
+    # and be visible to the brain (which reads brain UNION shared) on its review call.
+    client = RoutedClient(
+        brain=["<verdict>accept</verdict>"],
+        hands=[
+            "<finding>auth.py stores the password in plaintext</finding>",
+            '<edit path="x.txt">X</edit>\n<done>created x</done>',
+        ],
+    )
+    result = run_planned(
+        "g", tmp_path, models=CFG, client=client,
+        committed_plan=_committed("create x.txt"),
+    )
+    assert result.status == STATUS_COMPLETED
+    assert (tmp_path / "x.txt").read_text(encoding="utf-8") == "X"
+    # Routed to shared; absent from brain + hands pools.
+    assert [e for e in result.memory.shared.entries if "plaintext" in e.detail]
+    assert not [e for e in result.memory.brain.entries if "plaintext" in e.detail]
+    assert not [e for e in result.memory.hands.entries if "plaintext" in e.detail]
+    # Non-step-ending: the hands ran TWICE (finding turn, then the done turn).
+    assert len(_hands_calls(client)) == 2
+    # Surfaced on the activity feed.
+    assert any(ev.kind == "hands_finding" for ev in result.events)
+    # The brain's step review (the only brain call) saw it via brain UNION shared.
+    review_prompt = " ".join(m["content"] for m in _brain_calls(client)[0]["messages"])
+    assert "plaintext" in review_prompt
+
+
+def test_finding_does_not_route_to_the_brain_pool(tmp_path):
+    # The hands channel writes ONLY to shared; the brain pool stays clean of findings.
+    client = RoutedClient(
+        brain=["<verdict>accept</verdict>"],
+        hands=[
+            "<finding>the config loader ignores env vars</finding>",
+            "<done>noted and proceeding</done>",
+        ],
+    )
+    result = run_planned(
+        "g", tmp_path, models=CFG, client=client, committed_plan=_committed("inspect loader"),
+    )
+    assert result.status == STATUS_COMPLETED
+    findings = [e for e in result.memory.shared.entries if "env vars" in e.detail]
+    assert findings and findings[0].kind == "fact"  # findings are facts, never dead_end
+
+
 def test_self_answer_decision_graduates_to_shared(tmp_path):
     # A self-answered technical question is an authoritative decision the hands must
     # honor -> the SHARED pool, so a later hands read can see it.

@@ -100,6 +100,7 @@ Work the current step ONE action at a time, using these EXACT tags:
   <webfetch url="https://..."/>             (fetch a URL as readable text)
   <bash>command</bash>
   <question>a question you need answered to proceed</question>
+  <finding>a bug, security issue, or wrong assumption to flag for the planner</finding>
   <done>one-line summary of what THIS step accomplished</done>
   <blocked>reason you cannot complete this step</blocked>
 
@@ -122,6 +123,10 @@ Rules:
 - Stay scoped to YOUR current step. Do NOT do later steps.
 - If you need information to proceed, emit <question>...</question>; the planner
   will answer it (or get an answer) and you will see "ANSWER: ..." -- then continue.
+- If you DISCOVER something the planner should know -- a bug, a security issue, or
+  that a file is not structured the way this step assumed -- emit
+  <finding>...</finding>. This does NOT end your step and you do NOT wait for a
+  reply: it is noted for the planner and you keep working.
 - When THIS step is complete, emit <done>...</done>. If you are genuinely stuck,
   emit <blocked>reason</blocked> early rather than thrashing.
 """
@@ -295,6 +300,7 @@ def _run_executor_step(
     extra_instruction: str | None = None,
     cancel_check: Callable[[], bool] | None = None,
     reads: dict[str, str] | None = None,
+    on_finding: Callable[[str], None] | None = None,
 ) -> _StepOutcome:
     """Run the hands in a fresh, narrow context until done/blocked/budget/question.
 
@@ -380,6 +386,22 @@ def _run_executor_step(
                 observations.append(answer_obs)
                 transcript.append(answer_obs[:_TRANSCRIPT_ENTRY_CAP])
                 break  # stop this turn; feed the answer back so the executor continues
+            if action.kind == "finding":
+                # A non-blocking note to the planner (v0.0.29): a bug / security issue
+                # / wrong assumption the hands discovered. Recorded to SHARED memory so
+                # the brain reads it next call. It does NOT end the step (unlike
+                # <blocked>) and the hands does NOT wait for an answer (unlike
+                # <question>) -- it is surfaced and the step continues. No read guard
+                # (it touches no file) and it is NOT a parse failure (a real action).
+                note = action.content or ""
+                if on_finding is not None:
+                    on_finding(note)
+                if emit is not None:
+                    emit("hands_finding", note, {"finding": note})
+                rendered = "[finding]\nrecorded for the planner"
+                observations.append(rendered)
+                transcript.append(f"[finding] {note}"[:_TRANSCRIPT_ENTRY_CAP])
+                continue
             if action.kind in ("plan", "abort"):
                 observations.append(
                     f"[{action.kind}]\nnote: you are the executor. Emit <done> when this step "
@@ -738,10 +760,17 @@ def run_planned(
         resolver = make_question_resolver(step)
         records: list[tuple[str, str, str]] = []
 
+        def record_finding(note: str) -> None:
+            # The hands surfaced a bug/discovery -> the SHARED pool (kind "fact", so it
+            # never collides with the brain's dead_end repetition-breaker entries), where
+            # the brain reads it on its next call.
+            remember("fact", f"Finding: {note}", f"finding: {note}",
+                     provenance=f"step{step.index} hands-finding", pool=POOL_SHARED)
+
         outcome = _run_executor_step(
             step, plan, goal, tools, hands_role=hands_role, models=models, ledger=ledger,
             client=client, max_steps=step_budget, emit=emit, resolve_question=resolver,
-            cancel_check=cancel_check, reads=reads,
+            cancel_check=cancel_check, reads=reads, on_finding=record_finding,
         )
         executor_calls += outcome.calls
         followups_used = 0
@@ -791,6 +820,7 @@ def run_planned(
                 step, plan, goal, tools, hands_role=hands_role, models=models, ledger=ledger,
                 client=client, max_steps=step_budget, emit=emit, resolve_question=resolver,
                 extra_instruction=review.followup, cancel_check=cancel_check, reads=reads,
+                on_finding=record_finding,
             )
             executor_calls += outcome.calls
 

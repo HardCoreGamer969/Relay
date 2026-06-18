@@ -102,6 +102,27 @@ def test_blocked_and_abort_parse_with_reason():
     assert aborted.first("abort").content == "the goal contradicts itself"
 
 
+def test_finding_parses_and_is_not_a_parse_failure():
+    # v0.0.29: <finding> is a real action (the hands surfacing a bug/discovery).
+    result = parse("<finding>auth.py stores the password in plaintext</finding>")
+    assert not result.is_parse_failure
+    assert result.first("finding").content == "auth.py stores the password in plaintext"
+
+
+def test_finding_alongside_other_actions_keeps_document_order():
+    text = '<read path="a.py"/>\n<finding>a.py has a SQL injection</finding>\n<done>looked</done>'
+    result = parse(text)
+    assert [a.kind for a in result.actions] == ["read", "finding", "done"]
+
+
+def test_finding_inside_edit_body_is_not_parsed_loose():
+    # A <finding> mentioned inside an <edit> file body must not surface a loose action.
+    text = '<edit path="x.py">text with <finding>not real</finding> inside</edit>'
+    result = parse(text)
+    assert [a.kind for a in result.actions] == ["edit"]
+    assert result.first("finding") is None
+
+
 def test_tag_inside_plan_body_is_not_parsed_loose():
     # A step that mentions an <edit> must not surface a loose edit action.
     text = '<plan><step>create x via <edit path="x">y</edit></step></plan>'

@@ -18,10 +18,14 @@ Supported tags::
     <abort>reason</abort>                    the brain: goal is unreachable (v0.04)
     <blocked>reason</blocked>                the executor: stuck on this step (v0.04)
     <question>...</question>                 the executor: needs info to proceed (v0.06)
+    <finding>...</finding>                   the executor: surface a bug/discovery (v0.0.29)
 
 ``<question>`` is distinct from ``<blocked>``: a question is mid-step (the brain
 answers it or escalates, then the executor continues), whereas ``<blocked>`` ends
-the step.
+the step. ``<finding>`` is distinct from BOTH: it is a non-blocking note the hands
+emits to tell the planner about a bug / security issue / wrong assumption -- it does
+NOT end the step and the hands does NOT wait for an answer (it is recorded to the
+shared memory pool and the hands continues working).
 
 ``<done>`` is context-dependent in v0.04: from the **executor** it means *this
 step* is complete (not the whole task); the task completes when the plan is
@@ -40,7 +44,7 @@ from dataclasses import dataclass, field
 # Action kinds the parser can produce.
 KINDS = (
     "read", "list", "grep", "edit", "bash", "done", "plan", "abort", "blocked", "question",
-    "write", "glob", "apply_patch", "webfetch", "mkdir",
+    "write", "glob", "apply_patch", "webfetch", "mkdir", "finding",
 )
 
 
@@ -55,7 +59,7 @@ class Action:
       - ``bash`` / ``apply_patch``: ``content`` (the command / the patch envelope)
       - ``glob``: ``pattern`` + ``path`` (the base dir to match under)
       - ``webfetch``: ``url``
-      - ``done`` / ``abort`` / ``blocked``: ``content`` (the summary/reason)
+      - ``done`` / ``abort`` / ``blocked`` / ``finding``: ``content`` (the summary/reason/note)
       - ``plan``: ``steps`` (ordered step instructions)
     """
 
@@ -104,6 +108,7 @@ _STEP_RE = re.compile(r"<step>(.*?)</step>", re.DOTALL)
 _ABORT_RE = re.compile(r"<abort>(.*?)</abort>", re.DOTALL)
 _BLOCKED_RE = re.compile(r"<blocked>(.*?)</blocked>", re.DOTALL)
 _QUESTION_RE = re.compile(r"<question>(.*?)</question>", re.DOTALL)
+_FINDING_RE = re.compile(r"<finding>(.*?)</finding>", re.DOTALL)
 _EDIT_RE = re.compile(r"""<edit\s+([^>]*?)>(.*?)</edit>""", re.DOTALL)
 _WRITE_RE = re.compile(r"""<write\s+([^>]*?)>(.*?)</write>""", re.DOTALL)
 _APPLY_PATCH_RE = re.compile(r"<apply_patch>(.*?)</apply_patch>", re.DOTALL)
@@ -216,6 +221,9 @@ def parse(text: str) -> ParseResult:
     # After edit/bash/done so a <question> mentioned inside one of their bodies
     # (e.g. an <edit> file body) is masked first and not parsed as a loose action.
     consume(_QUESTION_RE, lambda m: placed.append((m.start(), Action(kind="question", content=m.group(1).strip()))))
+    # <finding> (v0.0.29) last among the block tags, same masking rationale as
+    # <question>: a <finding> written inside an <edit>/<bash> body is masked first.
+    consume(_FINDING_RE, lambda m: placed.append((m.start(), Action(kind="finding", content=m.group(1).strip()))))
 
     # Self-closing tags last, scanned over the fully-masked text.
     for m in _SELF_CLOSING_RE.finditer(masked):

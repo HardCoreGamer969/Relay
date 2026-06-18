@@ -131,6 +131,8 @@ def describe_action(action: Action) -> str:
         return f"bash: {action.content}"
     if action.kind == "done":
         return f"done: {action.content}"
+    if action.kind == "finding":
+        return f"finding: {action.content}"
     return action.kind
 
 
@@ -160,6 +162,12 @@ def execute_action(tools: Tools, action: Action) -> str:
             return tools.mkdir(action.path or "")
         if action.kind == "bash":
             return tools.bash(action.content or "")
+        if action.kind == "finding":
+            # A <finding> is a note to the planner, not a tool op. It has no file
+            # effect and never touches the filesystem; the orchestrator's executor
+            # loop routes it to shared memory. Here (the solo loop / brain
+            # investigation) it is simply acknowledged, never executed.
+            return "(finding noted)"
         return f"error: unknown action {action.kind!r}"
     except ToolError as exc:
         return f"error: {exc}"

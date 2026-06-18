@@ -51,6 +51,8 @@ from textual.widgets import Button, Checkbox, Input, Label, RichLog, Select, Sta
 from relay.bridge import (
     ACTION_ANSWER,
     ACTION_START,
+    ACTION_STEER,
+    ACTION_STOP,
     EVENT_PHASE,
     REQUEST_APPROVAL,
     REQUEST_REACTION,
@@ -59,9 +61,10 @@ from relay.bridge import (
     InputRouter,
     InputState,
     RunOutcome,
+    Session,
     UiRequest,
-    WorkingDirSession,
 )
+from relay.orchestrator import STATUS_CANCELLED
 from relay.config import (
     ASSUMPTION_LEVELS,
     ROLES,
@@ -99,6 +102,7 @@ _STATE_HINTS = {
     InputState.AWAITING_REACTION: "react to the plan (approve to build it)",
     InputState.AWAITING_DECISION: "the agent needs your decision",
     InputState.AWAITING_APPROVAL: "approve the command? (yes/no)",
+    InputState.INTERRUPTED: "interrupted -- type to redirect, esc again to stop",
 }
 
 # The rotating welcome greetings -- one shown per launch. Warmer than "Goal:";
@@ -1143,11 +1147,15 @@ class RelayTuiApp(App):
     ) -> None:
         super().__init__()
         self._root = root
-        # The working directory is SESSION-sticky: it starts at the launch root but,
-        # once established (set explicitly via /cwd, or adopted from a completed run),
-        # persists across subsequent goals instead of re-defaulting to the launch root
-        # each goal. Every run's root is threaded from here (see _start_run).
-        self._session = WorkingDirSession(root)
+        # The durable SESSION: the sticky working dir PLUS the continuous transcript,
+        # memory, input queue, and recall history. esc halts a run but never the
+        # session; only /clear resets it. Every run's root/transcript/memory are
+        # threaded from here (see _start_run), so steer/queue continuations keep the
+        # same conversation, learnings, cwd, and cost.
+        self._session = Session(root)
+        # esc set this while a run is in flight, so _handle_finished knows the clean
+        # cancel was a user INTERRUPT (-> the interrupt prompt) vs. some other stop.
+        self._interrupting = False
         self._models = models if models is not None else load_models()
         self._client = client
         # Setup-flow seams (injected by tests; default to the real provider funcs).
@@ -1370,6 +1378,12 @@ class RelayTuiApp(App):
                 self._begin_first_run(text)
             else:
                 self._start_run(text)
+        elif outcome.action == ACTION_STEER:
+            # Bare-interrupt-then-type: redirect now by replanning the remainder.
+            self._start_steer(text)
+        elif outcome.action == ACTION_STOP:
+            # Empty submit at the interrupt prompt: abandon the plan, keep the session.
+            self._stop_from_interrupt()
         elif outcome.action == ACTION_ANSWER:
             # Answers that become transcript turns render via the sync pass;
             # approval answers never reach the transcript, so echo them here.
@@ -1452,14 +1466,18 @@ class RelayTuiApp(App):
         self._goal_cost = 0.0  # a new goal: zero the per-goal counter (session untouched)
         self._cost_pulse = False
         self._stopping = False
-        self._seen_turn_ids.clear()  # fresh transcript: turn ids restart at t0
+        self._interrupting = False
+        # The transcript is SESSION-owned and accumulates across runs (its turn ids are
+        # unique forever), so we do NOT clear _seen_turn_ids here -- only /clear does.
+        self._session.goal = goal
+        self._session.history.add(goal)
         if self._conversation_lines:
             self._write_conversation("")  # a blank line between runs
         self._write_conversation(f"you (goal): {goal}")
         self._router.begin_run()
-        # Thread the SESSION-sticky working dir as this run's root -- not the launch
-        # root -- so a working dir established earlier in the session is where this
-        # goal operates.
+        # Thread the SESSION-sticky working dir + the session transcript/memory, so a
+        # working dir established earlier persists AND a later steer/queue continuation
+        # keeps the same conversation + learnings.
         self._runner = EngineRunner(
             str(self._session.working_dir),
             models=self._models,
@@ -1470,8 +1488,51 @@ class RelayTuiApp(App):
             on_event=self._marshal(self._handle_event),
             on_finished=self._marshal(self._handle_finished),
             run_kwargs=self._run_kwargs,
+            transcript=self._session.transcript,
+            memory=self._session.memory,
         )
         self._runner.start(goal)
+
+    def _start_steer(self, steer: str) -> None:
+        """Apply a steer: replan the remainder of the last plan with ``steer`` folded
+        in, then resume on the revision (same session). Counts as a plan revision.
+
+        With no plan to continue (interrupted during planning), a steer is just a
+        fresh redirection -- start a new run with the steer as the goal."""
+        prior = self._session.last_plan
+        if prior is None or not getattr(prior, "steps", None):
+            self._start_run(steer)  # nothing to replan: treat as a fresh direction
+            return
+        max_revisions = self._run_kwargs.get("max_plan_revisions", 5)
+        if not self._session.can_steer(max_revisions):
+            self._write_activity(
+                f"(steer refused: plan-revision budget {max_revisions} reached)"
+            )
+            self._router.finish_run()
+            self._update_status()
+            return
+        self._session.note_steer()
+        self._goal_cost = 0.0
+        self._cost_pulse = False
+        self._stopping = False
+        self._interrupting = False
+        self._session.history.add(steer)
+        self._write_conversation(f"you (steer): {steer}")
+        self._router.begin_run()
+        self._runner = EngineRunner(
+            str(self._session.working_dir),
+            models=self._models,
+            client=self._client,
+            assumption_level=self._assumption_level,
+            auto_approve=self._auto_approve,
+            on_request=self._marshal(self._handle_request),
+            on_event=self._marshal(self._handle_event),
+            on_finished=self._marshal(self._handle_finished),
+            run_kwargs=self._run_kwargs,
+            transcript=self._session.transcript,
+            memory=self._session.memory,
+        )
+        self._runner.start_steer(self._session.goal or steer, prior, steer)
 
     # -- worker -> UI marshaling (the only crossing) ----------------------------
 
@@ -1554,6 +1615,27 @@ class RelayTuiApp(App):
 
     def _handle_finished(self, outcome: RunOutcome) -> None:
         self._sync_transcript()  # the result turn is in the transcript by now
+        cost = self._runner.ledger.total_cost() if self._runner is not None else None
+        cost_note = "" if cost is None else f" (cost ${cost:.4f})"
+        self._write_activity(f"[finished] {outcome.status}{cost_note}")
+        # Two-tier cost: fold the goal's final cost into the session cumulative BEFORE
+        # any branch, so an interrupted run's spend is preserved in the session tally.
+        if cost is not None:
+            self._goal_cost = cost
+            self._session_cost += cost
+
+        # The INTERRUPT fork: the user pressed esc and the run halted cleanly. Do NOT
+        # finish the run to IDLE -- enter the interrupt prompt (session fully intact),
+        # capturing the plan-so-far so a steer can replan its remainder.
+        if self._interrupting and outcome.status == STATUS_CANCELLED:
+            self._interrupting = False
+            self._stopping = False
+            self._session.last_plan = outcome.result.plan if outcome.result is not None else None
+            self._router.interrupt()
+            self._write_activity("[interrupted] type to redirect, or esc again to stop")
+            self._update_status()
+            return
+
         if outcome.status == STATUS_ERROR:
             detail = friendly_provider_error(outcome.error)  # never leak raw API JSON
             self._write_conversation(f"brain (error): the run failed -- {detail}")
@@ -1561,24 +1643,29 @@ class RelayTuiApp(App):
             # No execution happened (declined, or cancelled mid-conversation),
             # so no result turn exists; close the thread visibly anyway.
             self._write_conversation(f"(run ended: {outcome.status}; nothing was executed)")
-        cost = self._runner.ledger.total_cost() if self._runner is not None else None
-        cost_note = "" if cost is None else f" (cost ${cost:.4f})"
-        self._write_activity(f"[finished] {outcome.status}{cost_note}")
         self._stopping = False  # the stop landed (or the run ended on its own)
+        self._interrupting = False
         self._router.finish_run()
-        # Two-tier cost: fold the goal's final cost into the session cumulative. We flip
-        # to IDLE first (finish_run above), so _session_total() -- which adds the live
-        # goal only while in-flight -- never double-counts the fold. The per-goal
-        # counter keeps showing this goal's total until the next goal starts.
-        if cost is not None:
-            self._goal_cost = cost
-            self._session_cost += cost
         # A COMPLETED run may have established a new working dir; adopt it so it
         # persists for the next goal. A cancelled/declined/errored run reports nothing
         # adoptable, so a cwd change that lived only in a cancelled plan never persists.
         if self._session.adopt_from_outcome(outcome):
             self._announce_working_dir(established=False)
+        # Queue consumption: a clean completion picks up the next queued input (FIFO)
+        # as the next direction WITHIN the same session (same cwd/memory/cost).
+        if self._consume_queue():
+            return
         self._update_status()
+
+    def _consume_queue(self) -> bool:
+        """If the queue is non-empty, dequeue the next input and start it as the next
+        run within the same session. Returns True when a queued item was started."""
+        nxt = self._session.queue.dequeue()
+        if nxt is None:
+            return False
+        self._write_activity(f"[queue] starting next queued input ({len(self._session.queue)} left)")
+        self._start_run(nxt)
+        return True
 
     # -- conversation pane: rendered from the Transcript ------------------------
 
@@ -2262,6 +2349,12 @@ class RelayTuiApp(App):
     # -- cancel + clean shutdown (the money-leak guard) --------------------------
 
     def action_cancel_run(self) -> None:
+        """esc = INTERRUPT, not teardown. A running run halts at the clean boundary and
+        lands at the interrupt prompt (session intact); a SECOND esc (already
+        interrupted) is STOP -- abandon the plan, keep the session."""
+        if self._router.state is InputState.INTERRUPTED:
+            self._stop_from_interrupt()
+            return
         runner = self._runner
         if runner is not None and runner.is_running:
             runner.cancel()
@@ -2270,9 +2363,22 @@ class RelayTuiApp(App):
             # in-flight call returns), so a long multi-call step stops within ~one call's
             # latency instead of running to the end of the step. The in-flight request is
             # never torn down (the money-leak guard); the worker still joins cleanly.
+            # _handle_finished sees _interrupting and routes to the interrupt prompt.
+            self._interrupting = True
             self._stopping = True
-            self._write_activity("[cancel] stopping... (halts after the current call returns)")
+            self._write_activity("[interrupt] halting at the next boundary... (esc again to stop)")
             self._update_status()
+
+    def _stop_from_interrupt(self) -> None:
+        """STOP: abandon the interrupted plan but PRESERVE the session (conversation,
+        cwd, memory, cost all stay). The user's next input begins fresh planning
+        within the SAME session -- never a teardown (that is /clear)."""
+        self._router.finish_run()  # back to a clean IDLE; session state untouched
+        self._session.last_plan = None
+        self._stopping = False
+        self._interrupting = False
+        self._write_activity("[stopped] plan abandoned; session preserved (cwd/memory/cost kept)")
+        self._update_status()
 
     async def action_quit(self) -> None:
         """Quit WITHOUT orphaning the worker: cancel, join (bounded), then exit."""

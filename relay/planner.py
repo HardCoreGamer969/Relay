@@ -286,24 +286,46 @@ def replan(
     brain_role: str = "brain",
     memory: PlanMemory | None = None,
     memory_budget_tokens: int = _DEFAULT_MEMORY_BUDGET,
+    steer: str | None = None,
 ) -> Plan | None:
-    """Have the brain revise the remaining plan after a step failed.
+    """Have the brain revise the remaining plan -- after a step failed, OR after the
+    user interrupted to redirect (``steer``).
 
-    The brain receives the goal, the current plan, the failed step + a concise
-    failure summary (NOT the full transcript), and the one-line outcomes of
-    completed steps. When ``memory`` is given, a window-aware (budget-bounded)
-    slice of what has been learned is included so the brain stays consistent.
-    Returns a :class:`Plan` for the remaining work, or ``None`` on ``<abort>``.
+    The brain receives the goal, the current plan, and the one-line outcomes of
+    completed steps. For a FAILURE replan it also gets the failed step + a concise
+    failure summary; for a STEER it gets the user's new direction instead and is
+    asked to fold it into the remaining work. When ``memory`` is given, a
+    window-aware (budget-bounded) slice of what has been learned is included so the
+    brain stays consistent. Returns a :class:`Plan` for the remaining work, or
+    ``None`` on ``<abort>``. Completed steps are never repeated.
     """
     outcomes_text = (
         "\n".join(f"- [{idx}] {instr}  ->  {outcome}" for idx, instr, outcome in completed_outcomes)
         or "(none completed yet)"
     )
+    mem_focus = f"{goal} {steer}" if steer else f"{goal} {failure_summary}"
     mem_ctx = _memory_context(
-        memory, f"{goal} {failure_summary}", memory_budget_tokens,
+        memory, mem_focus, memory_budget_tokens,
         client=client, models=models, ledger=ledger,
     )
     memory_block = f"What has been learned (memory):\n{mem_ctx}\n\n" if mem_ctx else ""
+    if steer:
+        # A steer is a redirection, not a failure: the user interrupted to change
+        # course. Replan the remainder to incorporate the new direction.
+        directive = (
+            f"The user INTERRUPTED and gave new direction: {steer}\n\n"
+            "Replan the REMAINING work to incorporate this new direction. Keep the "
+            "completed steps (do not repeat them); emit a revised <plan> for what is "
+            "left, or <abort>reason</abort> if the new direction makes the goal "
+            "unreachable."
+        )
+    else:
+        directive = (
+            f"The step that FAILED: [{failed_step.index}] {failed_step.instruction}\n"
+            f"Why it failed: {failure_summary}\n\n"
+            "Emit a revised <plan> for the REMAINING work (do not repeat completed "
+            "steps), or <abort>reason</abort> if the goal is unreachable."
+        )
     messages: list[dict[str, str]] = [
         {"role": "system", "content": _REPLAN_SYSTEM},
         {
@@ -313,10 +335,7 @@ def replan(
                 f"Plan so far:\n{_render_plan(plan)}\n\n"
                 f"Completed outcomes:\n{outcomes_text}\n\n"
                 f"{memory_block}"
-                f"The step that FAILED: [{failed_step.index}] {failed_step.instruction}\n"
-                f"Why it failed: {failure_summary}\n\n"
-                "Emit a revised <plan> for the REMAINING work (do not repeat completed "
-                "steps), or <abort>reason</abort> if the goal is unreachable."
+                f"{directive}"
             ),
         },
     ]

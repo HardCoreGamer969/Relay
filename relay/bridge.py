@@ -43,6 +43,7 @@ from typing import Callable
 
 from relay.config import ModelConfig, resolve_max_total_steps
 from relay.conversation import DEFAULT_MAX_ROUNDS, ConversationResult, plan_conversationally
+from relay.memory import PlanMemory
 from relay.orchestrator import (
     STATUS_CANCELLED,
     STATUS_COMPLETED,
@@ -51,6 +52,7 @@ from relay.orchestrator import (
     PlannedTaskResult,
     run_planned,
 )
+from relay.planner import Plan, replan
 from relay.telemetry import Ledger
 from relay.transcript import Transcript
 
@@ -229,6 +231,7 @@ class InputState(str, Enum):
     AWAITING_REACTION = "awaiting_reaction"  # user_turn parked; submit answers it
     AWAITING_DECISION = "awaiting_decision"  # user_decision parked; submit answers it
     AWAITING_APPROVAL = "awaiting_approval"  # approver parked; submit answers yes/no
+    INTERRUPTED = "interrupted"              # esc halted the run; type=steer, empty/esc=stop
 
 
 _AWAITING_BY_KIND = {
@@ -241,6 +244,8 @@ _AWAITING_BY_KIND = {
 ACTION_START = "start"      # idle submit: begin a new goal
 ACTION_ANSWER = "answer"    # delivered to the parked request
 ACTION_IGNORED = "ignored"  # engine busy (or empty goal): nothing routed
+ACTION_STEER = "steer"      # interrupted + typed input: redirect now (replan remainder)
+ACTION_STOP = "stop"        # interrupted + empty/esc-again: abandon the plan, keep session
 
 
 @dataclass
@@ -290,8 +295,29 @@ class InputRouter:
         self._pending = None
         self.state = InputState.IDLE
 
+    def interrupt(self) -> None:
+        """Enter the INTERRUPTED state: the run has halted at the clean boundary and
+        the user is at the interrupt prompt. The SESSION is untouched -- this only
+        changes what the one input box now means (type=steer, empty/esc=stop)."""
+        self._pending = None
+        self.state = InputState.INTERRUPTED
+
+    @property
+    def interrupted(self) -> bool:
+        return self.state is InputState.INTERRUPTED
+
     def submit(self, text: str) -> SubmitOutcome:
-        """Route one submitted line: start a goal, answer the parked ask, or ignore."""
+        """Route one submitted line: start a goal, answer the parked ask, steer/stop
+        an interrupt, or ignore."""
+        if self.state is InputState.INTERRUPTED:
+            # The fork: typed input redirects NOW (steer); empty means STOP (abandon
+            # the plan, keep the session). An interrupt usually means "fix this now",
+            # so a non-empty submit defaults to steer.
+            if not text.strip():
+                self.state = InputState.IDLE  # stop: back to a clean idle session
+                return SubmitOutcome(ACTION_STOP, text)
+            self.state = InputState.PLANNING  # the steer kicks off a continuation run
+            return SubmitOutcome(ACTION_STEER, text)
         if self.state is InputState.IDLE:
             if not text.strip():
                 return SubmitOutcome(ACTION_IGNORED, text)
@@ -400,6 +426,127 @@ class WorkingDirSession:
         return candidate.resolve()
 
 
+class Session(WorkingDirSession):
+    """The durable SESSION: everything that outlives an individual run.
+
+    Relay's interrupt model (v0.0.28) makes esc halt the *run*, not the session.
+    Steering (replan-remainder) and queue consumption start NEW runs that must
+    continue the SAME conversation, memory, working dir, and cost -- so those live
+    here, on the session, and are threaded into each :class:`EngineRunner` rather
+    than recreated per run. Only ``/clear`` (:meth:`reset`) wipes the session.
+
+    Holds (beyond the working dir from :class:`WorkingDirSession`):
+      - ``transcript`` / ``memory``: the one continuous thread + learnings.
+      - ``goal``: the overall goal (so a steer can replan the remainder).
+      - ``last_plan``: the plan-so-far from the most recent run (a steer replans its
+        remainder; completed steps stay done).
+      - ``revisions``: how many steers have been applied (a steer counts as a plan
+        revision -- bounded by ``max_plan_revisions``).
+      - ``queue`` / ``history``: the input queue + recall history (Part 3).
+    """
+
+    def __init__(self, launch_root: str | Path) -> None:
+        super().__init__(launch_root)
+        self.transcript = Transcript()
+        self.memory = PlanMemory()
+        self.goal: str | None = None
+        self.last_plan: Plan | None = None
+        self.revisions = 0
+        self.queue = InputQueue()
+        self.history = InputHistory()
+
+    def reset(self) -> None:
+        """Full-session reset (``/clear``): wipe conversation, memory, plan, queue,
+        and recall history, and start fresh. Distinct from STOP, which abandons the
+        plan but keeps all of this. The working DIR is left as-is (it is a workspace
+        location, not conversation/memory/plan)."""
+        self.transcript = Transcript()
+        self.memory = PlanMemory()
+        self.goal = None
+        self.last_plan = None
+        self.revisions = 0
+        self.queue = InputQueue()
+        self.history = InputHistory()
+
+    def note_steer(self) -> int:
+        """Record that a steer (a plan revision) is being applied; return the new count."""
+        self.revisions += 1
+        return self.revisions
+
+    def can_steer(self, max_revisions: int) -> bool:
+        """Whether another steer is within the plan-revision budget."""
+        return self.revisions < max_revisions
+
+
+class InputQueue:
+    """An ordered FIFO of inputs to pick up when the current step/plan finishes.
+
+    ``/queue <input>`` appends; on a run's clean completion the next item is
+    consumed (dequeued) and started as the next direction within the SAME session.
+    Deterministic and ordered -- no priority, no dedup. UI-thread-only by design.
+    """
+
+    def __init__(self) -> None:
+        self._items: list[str] = []
+
+    def enqueue(self, text: str) -> None:
+        self._items.append(text)
+
+    def dequeue(self) -> str | None:
+        return self._items.pop(0) if self._items else None
+
+    def pending(self) -> list[str]:
+        return list(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __bool__(self) -> bool:
+        return bool(self._items)
+
+
+class InputHistory:
+    """Up-arrow recall: ONE unified "recall and edit" history of the user's inputs.
+
+    Records goals, steers, and queued items in order. :meth:`recall_older` walks
+    back toward the oldest entry; :meth:`recall_newer` walks forward. The cursor
+    resets on :meth:`add` (a new submission), so the next up-arrow starts from the
+    most recent. There is no second/competing up-arrow behavior -- this is it.
+    """
+
+    def __init__(self) -> None:
+        self._items: list[str] = []
+        self._cursor: int | None = None  # None = not browsing; else index into _items
+
+    def add(self, text: str) -> None:
+        if text.strip():
+            self._items.append(text)
+        self._cursor = None  # a fresh submission resets recall to the newest
+
+    def recall_older(self) -> str | None:
+        """The previous (older) input, moving back one each call. None if empty."""
+        if not self._items:
+            return None
+        if self._cursor is None:
+            self._cursor = len(self._items) - 1
+        elif self._cursor > 0:
+            self._cursor -= 1
+        return self._items[self._cursor]
+
+    def recall_newer(self) -> str | None:
+        """The next (newer) input, moving forward; '' once past the newest."""
+        if not self._items or self._cursor is None:
+            return None
+        if self._cursor < len(self._items) - 1:
+            self._cursor += 1
+            return self._items[self._cursor]
+        self._cursor = None
+        return ""  # stepped past the newest: a cleared field
+
+    def items(self) -> list[str]:
+        return list(self._items)
+
+
 class EngineRunner:
     """One conversational arc (plan -> commit -> execute) on a worker thread.
 
@@ -428,6 +575,8 @@ class EngineRunner:
         on_event: Callable[[Event], None],
         on_finished: Callable[[RunOutcome], None],
         run_kwargs: dict | None = None,
+        transcript: Transcript | None = None,
+        memory: PlanMemory | None = None,
     ) -> None:
         self.project_root = Path(project_root)
         self.models = models
@@ -437,7 +586,11 @@ class EngineRunner:
         self.auto_approve = auto_approve
         self.max_rounds = max_rounds
         self.bridge = EngineBridge(on_request=on_request, on_event=on_event)
-        self.transcript = Transcript()  # the one thread across planning + execution
+        # The transcript + memory are SESSION-owned (passed in) so a steer/queue
+        # continuation run keeps the same conversation + learnings; a bare runner
+        # (tests) gets fresh ones, unchanged from before.
+        self.transcript = transcript if transcript is not None else Transcript()
+        self.memory = memory if memory is not None else PlanMemory()
         self.outcome: RunOutcome | None = None
         self._on_finished = on_finished
         self._run_kwargs = dict(run_kwargs or {})  # extra run_planned knobs (tests)
@@ -455,6 +608,22 @@ class EngineRunner:
             raise RuntimeError("EngineRunner is single-use: one run per runner")
         self._thread = threading.Thread(
             target=self._run, args=(goal,), name="relay-engine", daemon=True
+        )
+        self._thread.start()
+
+    def start_steer(self, goal: str, prior_plan: Plan, steer: str) -> None:
+        """Spawn a STEER continuation: replan the REMAINDER of ``prior_plan`` with the
+        user's ``steer`` input folded in as new direction, then execute the revision.
+
+        Reuses the existing ``replan`` machinery (text-protocol, no native
+        tool-calling); the brain produces a revised plan for what's left and
+        completed steps are not redone. The session's transcript + memory are reused
+        so the continuation is the same conversation."""
+        if self._thread is not None:
+            raise RuntimeError("EngineRunner is single-use: one run per runner")
+        self._thread = threading.Thread(
+            target=self._run_steer, args=(goal, prior_plan, steer),
+            name="relay-engine-steer", daemon=True,
         )
         self._thread.start()
 
@@ -498,7 +667,7 @@ class EngineRunner:
                     goal, self.project_root, models=self.models, ledger=self.ledger,
                     client=self.client, approver=bridge.approver,
                     auto_approve=self.auto_approve, user_decision=bridge.user_decision,
-                    assumption_level=self.assumption_level,
+                    assumption_level=self.assumption_level, memory=self.memory,
                     committed_plan=conversation.plan, on_event=bridge.emit_event,
                     transcript=self.transcript, cancel_check=bridge.should_cancel,
                     **self._run_kwargs,
@@ -508,6 +677,45 @@ class EngineRunner:
         except BridgeCancelled:
             # A pending ask was cancelled (quit/cancel while the engine waited);
             # the worker unwinds without guessing an answer.
+            outcome = RunOutcome(status=STATUS_CANCELLED)
+        except Exception as exc:  # noqa: BLE001 -- the UI must hear about ANY failure
+            outcome = RunOutcome(status=STATUS_ERROR,
+                                 error=f"{exc.__class__.__name__}: {exc}")
+        self.outcome = outcome
+        self._on_finished(outcome)
+
+    def _run_steer(self, goal: str, prior_plan: Plan, steer: str) -> None:
+        """Worker for a steer: replan ``prior_plan``'s remainder with ``steer`` folded
+        in, then execute the revision (resuming the same session thread)."""
+        bridge = self.bridge
+        try:
+            bridge.emit_event(Event(EVENT_PHASE, "planning", {"phase": "planning"}))
+            # The step that was in-flight when the user interrupted (or the last step).
+            interrupted = prior_plan.next_pending() or (
+                prior_plan.steps[-1] if prior_plan.steps else None
+            )
+            revised = replan(
+                goal, prior_plan, interrupted, "user interrupted and redirected",
+                prior_plan.completed_outcomes(), models=self.models, ledger=self.ledger,
+                client=self.client, memory=self.memory, steer=steer,
+            )
+            if revised is None or not revised.steps:
+                # The brain aborted, or produced nothing executable: end cleanly; the
+                # session is preserved and the user can try again.
+                outcome = RunOutcome(status=STATUS_DECLINED)
+            else:
+                bridge.emit_event(Event(EVENT_PHASE, "executing", {"phase": "executing"}))
+                result = run_planned(
+                    goal, self.project_root, models=self.models, ledger=self.ledger,
+                    client=self.client, approver=bridge.approver,
+                    auto_approve=self.auto_approve, user_decision=bridge.user_decision,
+                    assumption_level=self.assumption_level, memory=self.memory,
+                    committed_plan=revised, on_event=bridge.emit_event,
+                    transcript=self.transcript, cancel_check=bridge.should_cancel,
+                    **self._run_kwargs,
+                )
+                outcome = RunOutcome(status=result.status, result=result)
+        except BridgeCancelled:
             outcome = RunOutcome(status=STATUS_CANCELLED)
         except Exception as exc:  # noqa: BLE001 -- the UI must hear about ANY failure
             outcome = RunOutcome(status=STATUS_ERROR,

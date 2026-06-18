@@ -266,10 +266,11 @@ def test_esc_instant_ack_and_clean_join(tmp_path):
             assert await _until(pilot, lambda: app._runner is not None and app._runner.is_running)
 
             # esc: assert the ack BEFORE any await, so the marshaled finish can't run yet.
+            # esc is now an INTERRUPT (halt at the boundary), acknowledged instantly.
             app.action_cancel_run()
             assert app._stopping is True
-            assert any("stopping" in line.lower() for line in app._activity_lines)
-            assert "stopping" in app._cost_segment().lower()
+            assert any("halting" in line.lower() for line in app._activity_lines)
+            assert "stopping" in app._cost_segment().lower()  # the in-flight stop cue
 
             # the worker still terminates cleanly (clean join; money-leak guard intact).
             assert await _until(pilot, lambda: not app._runner.is_running)

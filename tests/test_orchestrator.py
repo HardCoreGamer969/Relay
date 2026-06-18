@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 from relay.config import ModelConfig
 from relay.loop import STATUS_COMPLETED, STATUS_MAX_STEPS
-from relay.memory import POOL_SHARED, MemoryBus, PlanMemory, memory_budget
+from relay.memory import POOL_BRAIN, POOL_SHARED, MemoryBus, PlanMemory, memory_budget
 from relay.orchestrator import (
     STATUS_ABORTED_BY_BRAIN,
     STATUS_ESCALATION_LIMIT,
@@ -450,6 +450,14 @@ def test_stuck_loop_result_turn_is_plain_language(tmp_path):
 
 
 def test_executor_context_stays_narrow(tmp_path):
+    # v0.0.29 invariant (Stage 1): the hands sees the narrow per-step context PLUS the
+    # SHARED pool (curated directives/findings) -- but NEVER the brain pool (no brain
+    # reasoning leaks) and not yet its own hands pool. The narrow-context principle is
+    # preserved; only the curated shared channel is admitted.
+    mem = MemoryBus()
+    mem.remember("decision", "BRAINONLY_SECRET internal brain reasoning", "brain", pool=POOL_BRAIN)
+    mem.remember("confirmation", "SHARED_DIRECTIVE use oauth not api keys", "shared", pool=POOL_SHARED)
+    mem.remember("fact", "HANDSONLY_SCRATCH private hands note", "hands", pool="hands")
     client = RoutedClient(
         brain=[
             "<plan><step>STEP_ALPHA create alpha.txt</step><step>STEP_BETA create beta.txt</step></plan>",
@@ -461,7 +469,7 @@ def test_executor_context_stays_narrow(tmp_path):
             '<edit path="beta.txt">BETA</edit>\n<done>created beta.txt</done>',
         ],
     )
-    result = run_planned("g", tmp_path, models=CFG, client=client)
+    result = run_planned("g", tmp_path, models=CFG, client=client, memory=mem)
     assert result.status == STATUS_COMPLETED
 
     hands = _hands_calls(client)
@@ -476,6 +484,11 @@ def test_executor_context_stays_narrow(tmp_path):
     assert "created alpha.txt" in step1_ctx  # one-line carry-over allowed
     assert "ALPHA_RAW_CONTENT" not in step1_ctx  # prior raw transcript NOT leaked
     assert "STEP_ALPHA" not in step1_ctx
+    # The new invariant: shared directives ARE injected; the brain pool is NEVER seen;
+    # and (Stage 2 deferred) the hands does NOT yet read its own hands pool.
+    assert "SHARED_DIRECTIVE" in step0_ctx and "SHARED_DIRECTIVE" in step1_ctx
+    assert "BRAINONLY_SECRET" not in step0_ctx and "BRAINONLY_SECRET" not in step1_ctx
+    assert "HANDSONLY_SCRATCH" not in step0_ctx and "HANDSONLY_SCRATCH" not in step1_ctx
 
 
 # --- budgets / terminal statuses -------------------------------------------

@@ -256,13 +256,24 @@ class _Disposition:
 
 
 def _executor_step_prompt(
-    goal: str, step: PlanStep, plan: Plan, *, extra_instruction: str | None = None
+    goal: str,
+    step: PlanStep,
+    plan: Plan,
+    *,
+    extra_instruction: str | None = None,
+    shared_context: str = "",
 ) -> str:
     """Build the executor's NARROW per-step context.
 
     Deliberately excludes the full plan, the brain's reasoning, and prior steps'
     raw transcripts -- only the current instruction plus one-line carry-over.
     ``extra_instruction`` carries a reviewer follow-up for a corrective attempt.
+
+    ``shared_context`` (v0.0.29) is the SHARED memory slice -- the brain's
+    authoritative directives + the hands' own prior findings. It is the ONLY memory
+    the hands sees: never the brain's reasoning pool, and (Stage 1) not yet its own
+    hands pool. So the narrow-context principle holds -- no brain reasoning leaks --
+    while the hands gains the curated directives it must honor.
     """
     lines = [f"Overall goal (context only): {goal}", ""]
     carry = plan.completed_outcomes()
@@ -270,6 +281,13 @@ def _executor_step_prompt(
         lines.append("Already completed (one-line outcomes):")
         for _index, _instruction, outcome in carry:
             lines.append(f"- {outcome}")
+        lines.append("")
+    if shared_context:
+        lines.append(
+            "STANDING CONTEXT (directives + findings established so far -- honor "
+            "these; do not re-derive or contradict them):"
+        )
+        lines.append(shared_context)
         lines.append("")
     lines.append(f"YOUR CURRENT STEP: {step.instruction}")
     if extra_instruction:
@@ -301,6 +319,7 @@ def _run_executor_step(
     cancel_check: Callable[[], bool] | None = None,
     reads: dict[str, str] | None = None,
     on_finding: Callable[[str], None] | None = None,
+    shared_context: str = "",
 ) -> _StepOutcome:
     """Run the hands in a fresh, narrow context until done/blocked/budget/question.
 
@@ -317,7 +336,9 @@ def _run_executor_step(
     """
     messages: list[dict[str, str]] = [
         {"role": "system", "content": EXECUTOR_SYSTEM_PROMPT},
-        {"role": "user", "content": _executor_step_prompt(goal, step, plan, extra_instruction=extra_instruction)},
+        {"role": "user", "content": _executor_step_prompt(
+            goal, step, plan, extra_instruction=extra_instruction, shared_context=shared_context,
+        )},
     ]
     transcript: list[str] = []
     touched: list[str] = []  # files actually written this step (seed the reviewer to read them)
@@ -767,10 +788,19 @@ def run_planned(
             remember("fact", f"Finding: {note}", f"finding: {note}",
                      provenance=f"step{step.index} hands-finding", pool=POOL_SHARED)
 
+        def hands_shared() -> str:
+            # The SHARED slice the hands gets (Stage 1: shared only). Rendered fresh
+            # before each executor invocation so a directive/finding written during the
+            # step is visible on the next (follow-up) attempt.
+            return memory.hands_context(
+                step.instruction, memory.hands_budget, client=client, models=models, ledger=ledger
+            )
+
         outcome = _run_executor_step(
             step, plan, goal, tools, hands_role=hands_role, models=models, ledger=ledger,
             client=client, max_steps=step_budget, emit=emit, resolve_question=resolver,
             cancel_check=cancel_check, reads=reads, on_finding=record_finding,
+            shared_context=hands_shared(),
         )
         executor_calls += outcome.calls
         followups_used = 0
@@ -820,7 +850,7 @@ def run_planned(
                 step, plan, goal, tools, hands_role=hands_role, models=models, ledger=ledger,
                 client=client, max_steps=step_budget, emit=emit, resolve_question=resolver,
                 extra_instruction=review.followup, cancel_check=cancel_check, reads=reads,
-                on_finding=record_finding,
+                on_finding=record_finding, shared_context=hands_shared(),
             )
             executor_calls += outcome.calls
 

@@ -453,3 +453,16 @@ def test_no_keyword_commit_gate_remains():
     src = inspect.getsource(conv.plan_conversationally)
     assert "_COMMIT_PHRASES" not in src
     assert "== 'ok'" not in src and '== "ok"' not in src
+
+
+def test_memory_slice_reads_brain_union_shared_for_a_bus():
+    # v0.0.29: the planning conversation is a brain reader -- with a MemoryBus it sees
+    # brain UNION shared (budgeted to the bus's brain window), not a crash.
+    from relay.conversation import _memory_slice
+    from relay.memory import POOL_BRAIN, POOL_SHARED, MemoryBus
+
+    bus = MemoryBus().configure_budgets(brain_window=200_000, hands_window=200_000)
+    bus.remember("decision", "BRAINFACT chose sqlite", "b", pool=POOL_BRAIN)
+    bus.remember("confirmation", "SHAREDDIRECTIVE use oauth", "s", pool=POOL_SHARED)
+    out = _memory_slice(bus, "sqlite oauth", client=None, models=None, ledger=None)
+    assert "BRAINFACT" in out and "SHAREDDIRECTIVE" in out

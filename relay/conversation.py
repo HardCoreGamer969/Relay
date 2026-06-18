@@ -36,7 +36,7 @@ from typing import Any, Callable
 
 from relay.config import ModelConfig, assumption_directive
 from relay.context import DEFAULT_CONTEXT_WINDOW
-from relay.memory import PlanMemory, memory_budget
+from relay.memory import MemoryBus, PlanMemory, memory_budget
 from relay.models import call_model
 from relay.planner import MAX_PLAN_STEPS, Plan, project_digest
 from relay.protocol import parse
@@ -229,6 +229,14 @@ def _derive_plain(plan: Plan, assumptions: list[str]) -> str:
 
 
 def _memory_slice(memory, goal, *, client, models, ledger) -> str:
+    # v0.0.29: with a MemoryBus the planning conversation is a brain reader, so it
+    # sees brain UNION shared, budgeted to the bus's configured brain window (this
+    # also fixes the old hardcoded default-window budget for the bus case). A plain
+    # PlanMemory keeps the single-pool, default-window behavior unchanged.
+    if isinstance(memory, MemoryBus):
+        return memory.brain_context(
+            goal, memory.brain_budget, client=client, models=models, ledger=ledger
+        )
     if memory is None or not getattr(memory, "entries", None):
         return ""
     return memory.compacted_context(

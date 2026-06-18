@@ -853,6 +853,23 @@ def test_hands_finding_lands_in_shared_and_reaches_the_brain(tmp_path):
     assert "plaintext" in review_prompt
 
 
+def test_finding_in_the_same_turn_as_done_is_not_dropped(tmp_path):
+    # A "finished, and by the way I spotted a bug" turn: <done> ends the step, but the
+    # finding emitted in the SAME reply must STILL reach shared (order-independent
+    # pre-pass), even though <done> returns early.
+    client = RoutedClient(
+        brain=["<verdict>accept</verdict>"],
+        hands=["<done>created x</done>\n<finding>auth.py logs the raw password</finding>"],
+    )
+    result = run_planned(
+        "g", tmp_path, models=CFG, client=client, committed_plan=_committed("create x.txt"),
+    )
+    assert result.status == STATUS_COMPLETED
+    assert [e for e in result.memory.shared.entries if "password" in e.detail]
+    assert any(ev.kind == "hands_finding" for ev in result.events)
+    assert len(_hands_calls(client)) == 1  # <done> still ended the step in one turn
+
+
 def test_finding_does_not_route_to_the_brain_pool(tmp_path):
     # The hands channel writes ONLY to shared; the brain pool stays clean of findings.
     client = RoutedClient(

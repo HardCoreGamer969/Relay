@@ -381,7 +381,24 @@ def _run_executor_step(
         consecutive_parse_failures = 0
 
         observations: list[str] = []
+        # Surface findings FIRST (v0.0.29), in a pre-pass independent of where they sit
+        # relative to <done>/<blocked> in the same reply: those branches return early, so
+        # a "finished, and by the way I spotted a bug" turn would otherwise lose the
+        # finding. A <finding> is a non-blocking note to the planner -> SHARED memory; it
+        # never ends the step and carries no read guard.
         for action in parsed.actions:
+            if action.kind == "finding":
+                note = action.content or ""
+                if on_finding is not None:
+                    on_finding(note)
+                if emit is not None:
+                    emit("hands_finding", note, {"finding": note})
+                observations.append("[finding]\nrecorded for the planner")
+                transcript.append(f"[finding] {note}"[:_TRANSCRIPT_ENTRY_CAP])
+
+        for action in parsed.actions:
+            if action.kind == "finding":
+                continue  # already surfaced in the pre-pass above
             if action.kind == "blocked":
                 reason = action.content or "no reason given"
                 return _StepOutcome(False, failure_reason=f"blocked: {reason}", calls=calls, transcript=transcript)
@@ -407,22 +424,6 @@ def _run_executor_step(
                 observations.append(answer_obs)
                 transcript.append(answer_obs[:_TRANSCRIPT_ENTRY_CAP])
                 break  # stop this turn; feed the answer back so the executor continues
-            if action.kind == "finding":
-                # A non-blocking note to the planner (v0.0.29): a bug / security issue
-                # / wrong assumption the hands discovered. Recorded to SHARED memory so
-                # the brain reads it next call. It does NOT end the step (unlike
-                # <blocked>) and the hands does NOT wait for an answer (unlike
-                # <question>) -- it is surfaced and the step continues. No read guard
-                # (it touches no file) and it is NOT a parse failure (a real action).
-                note = action.content or ""
-                if on_finding is not None:
-                    on_finding(note)
-                if emit is not None:
-                    emit("hands_finding", note, {"finding": note})
-                rendered = "[finding]\nrecorded for the planner"
-                observations.append(rendered)
-                transcript.append(f"[finding] {note}"[:_TRANSCRIPT_ENTRY_CAP])
-                continue
             if action.kind in ("plan", "abort"):
                 observations.append(
                     f"[{action.kind}]\nnote: you are the executor. Emit <done> when this step "

@@ -146,17 +146,31 @@ def test_hands_context_empty_when_shared_empty():
 
 
 def test_brain_union_stays_within_the_brain_budget(monkeypatch):
-    # Force overflow in BOTH pools (tiny budget, many entries) so compaction runs;
-    # the union of the two compacted slices must still fit the brain budget.
-    monkeypatch.setattr(memory_mod, "call_model", lambda *a, **k: _fake_result("compacted note"))
+    # Force overflow in BOTH pools (tiny budget, many entries) so compaction runs; the
+    # summarizer returns a LONG note (longer than any single pool's cap) to stress the
+    # final union _fit. The rendered brain UNION shared must still fit the brain budget.
+    monkeypatch.setattr(memory_mod, "call_model", lambda *a, **k: _fake_result("note " * 400))
     bus = MemoryBus().configure_budgets(brain_window=4_096, hands_window=4_096)
     for i in range(40):
         bus.remember("fact", f"brain entry number {i} with assorted words here", f"b{i}", pool=POOL_BRAIN)
         bus.remember("fact", f"shared entry number {i} with assorted words here", f"s{i}", pool=POOL_SHARED)
     out = bus.brain_context("entry words", bus.brain_budget)
-    assert estimate_tokens(out) <= bus.brain_budget
+    assert estimate_tokens(out) <= bus.brain_budget  # mechanized: strictly within budget
     # And the shared portion is bounded by the reserved fraction (the cap mechanism).
     assert bus._shared_read_cap(bus.brain_budget) <= int(bus.brain_budget * SHARED_READ_FRACTION) + 1
+
+
+def test_brain_union_within_budget_at_a_tight_boundary(monkeypatch):
+    # A small budget where the per-pool caps + the join separator would, without the
+    # final _fit, tip 1 token over. The cap must hold exactly.
+    monkeypatch.setattr(memory_mod, "call_model", lambda *a, **k: _fake_result("x " * 200))
+    bus = MemoryBus()
+    bus.brain_budget = bus.shared_budget = bus.hands_budget = 17  # deliberately tiny + odd
+    for i in range(12):
+        bus.remember("fact", f"brain alpha {i} words words words", f"b{i}", pool=POOL_BRAIN)
+        bus.remember("fact", f"shared beta {i} words words words", f"s{i}", pool=POOL_SHARED)
+    out = bus.brain_context("words", 17)
+    assert estimate_tokens(out) <= 17
 
 
 def test_brain_context_zero_budget_is_empty():

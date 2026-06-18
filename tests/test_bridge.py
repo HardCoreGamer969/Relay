@@ -30,6 +30,7 @@ from relay.bridge import (
     InputRouter,
     InputState,
     RunOutcome,
+    Session,
     UiRequest,
     WorkingDirSession,
 )
@@ -519,6 +520,24 @@ def test_bridge_explicit_ceiling_is_respected(tmp_path):
 
 
 # --- v0.0.25: session-sticky working directory (Part 2) ----------------------
+
+
+def test_session_uses_a_memory_bus_and_reset_keeps_the_working_dir(tmp_path):
+    # v0.0.29: the durable Session holds a MemoryBus (not a single PlanMemory), and
+    # /clear (reset) wipes memory while leaving the working dir -- the cwd is workspace
+    # state, never folded into a memory pool.
+    from relay.memory import MemoryBus
+
+    session = Session(tmp_path)
+    assert isinstance(session.memory, MemoryBus)
+    session.set_working_dir("sub")
+    moved = session.working_dir
+    session.memory.remember("fact", "learned a thing", "x")
+    assert session.memory.entries
+
+    session.reset()
+    assert isinstance(session.memory, MemoryBus) and not session.memory.entries  # wiped
+    assert session.working_dir == moved  # working dir untouched by the reset
 
 
 def test_working_dir_session_defaults_to_launch_root(tmp_path):

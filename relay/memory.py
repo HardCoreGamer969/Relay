@@ -571,7 +571,9 @@ class MemoryBus:
             )
             if text:
                 parts.append(text)
-        return "\n".join(parts)
+        # Final guard: the per-pool caps sum to budget_tokens, but joining them adds a
+        # separator, so _fit the union to be STRICTLY within budget (the mechanized cap).
+        return _fit("\n".join(parts), budget_tokens)
 
     def hands_context(
         self,

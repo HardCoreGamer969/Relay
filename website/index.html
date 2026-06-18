@@ -5,12 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="Relay — a coding agent with a brain that plans and hands that execute. Any model. One command.">
   <title>Relay — Separate thinking from doing</title>
+  <link rel="icon" href="assets/logo-icon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Orbitron:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
+  <div class="scroll-progress" id="scroll-progress" aria-hidden="true"></div>
   <div class="scanlines" aria-hidden="true"></div>
   <div class="grid-bg" aria-hidden="true"></div>
   <canvas id="particles" aria-hidden="true"></canvas>
@@ -18,7 +20,8 @@
   <nav class="nav" id="nav">
     <div class="nav-inner">
       <a href="#" class="nav-logo">
-        <span class="logo-bracket">[</span>RELAY<span class="logo-bracket">]</span>
+        <img src="assets/logo-icon.svg" alt="" width="28" height="34" class="nav-logo-icon">
+        <span class="nav-logo-text">RELAY</span>
       </a>
       <div class="nav-links">
         <a href="#architecture">Architecture</a>
@@ -34,67 +37,76 @@
   </nav>
 
   <main>
-    <!-- Hero -->
-    <section class="hero" id="hero">
-      <div class="hero-content">
-        <div class="wordmark-container">
-          <pre class="wordmark" id="wordmark" aria-label="RELAY">████    █████   █         ███    █   █
-█   █   █       █        █   █    █ █
-████    ████    █        █████     █
-█  █    █       █        █   █     █
-█   █   █████   █████    █   █     █</pre>
-        </div>
-        <p class="hero-greeting" id="greeting">What are we building today?</p>
-        <h1 class="hero-title">
-          <span class="title-line">Separate <em>thinking</em> from <em>doing</em></span>
-        </h1>
-        <p class="hero-sub">
-          A coding agent with a <span class="highlight-brain">brain</span> that plans
-          and <span class="highlight-hands">hands</span> that execute.
-          Any model. One command.
-        </p>
-        <div class="hero-cta">
-          <div class="install-cmd" data-copy="pip install relay-cli">
-            <code>$ pip install relay-cli</code>
-            <button class="copy-btn" aria-label="Copy install command">copy</button>
-          </div>
-          <a href="#install" class="btn btn-primary">Get Started</a>
-          <a href="https://github.com/HardCoreGamer969/Relay" class="btn btn-ghost" target="_blank" rel="noopener">View on GitHub</a>
-        </div>
-        <div class="hero-status">
-          <span class="status-dot"></span>
-          <span>v0.0.28</span>
-          <span class="status-sep">·</span>
-          <span class="brain-hands-pair">
-            <span class="role brain">brain</span>
-            <span class="pair-arrow">◄ ►</span>
-            <span class="role hands">hands</span>
-          </span>
-        </div>
-      </div>
-      <div class="hero-terminal" id="hero-terminal">
-        <div class="terminal-chrome">
-          <div class="terminal-dots">
-            <span></span><span></span><span></span>
-          </div>
-          <span class="terminal-title">relay tui</span>
-        </div>
-        <div class="terminal-body">
-          <div class="terminal-line"><span class="t-dim">relay</span> <span class="t-cyan">›</span> <span class="t-green">What are we shipping?</span></div>
-          <div class="terminal-line"><span class="t-dim">brain</span> <span class="t-cyan">›</span> Assessing scope... <span class="t-amber">large</span></div>
-          <div class="terminal-line terminal-plan">
-            <span class="t-dim">brain</span> <span class="t-cyan">›</span> <span class="t-magenta">&lt;plan&gt;</span>
-            <div class="plan-steps">
-              <span>1. Scaffold project structure</span>
-              <span>2. Implement core API routes</span>
-              <span>3. Add auth middleware</span>
-              <span>4. Write integration tests</span>
+    <!-- Hero — sticky scroll section -->
+    <section class="hero-scroll" id="hero">
+      <div class="hero-sticky">
+        <div class="hero-bg-text" aria-hidden="true">RELAY</div>
+        <div class="hero-float hero-float-1" data-parallax="0.15" aria-hidden="true"></div>
+        <div class="hero-float hero-float-2" data-parallax="0.25" aria-hidden="true"></div>
+        <div class="hero-float hero-float-3" data-parallax="0.35" aria-hidden="true"></div>
+
+        <div class="hero-inner">
+          <div class="hero-content" data-scroll-fade>
+            <div class="logo-hero">
+              <img src="assets/logo.svg" alt="Relay" class="logo-img" width="280" height="175">
             </div>
-            <span class="t-magenta">&lt;/plan&gt;</span>
+            <p class="hero-greeting" id="greeting">What are we building today?</p>
+            <h1 class="hero-title">
+              <span class="split-text">Separate <em>thinking</em> from <em>doing</em></span>
+            </h1>
+            <p class="hero-sub">
+              A coding agent with a <span class="highlight-brain">brain</span> that plans
+              and <span class="highlight-hands">hands</span> that execute.
+              Any model. One command.
+            </p>
+            <div class="hero-cta">
+              <div class="install-cmd" data-copy="pip install relay-cli">
+                <code>$ pip install relay-cli</code>
+                <button class="copy-btn" aria-label="Copy install command">copy</button>
+              </div>
+              <a href="#install" class="btn btn-primary">Get Started</a>
+              <a href="https://github.com/HardCoreGamer969/Relay" class="btn btn-ghost" target="_blank" rel="noopener">GitHub</a>
+            </div>
+            <div class="hero-status">
+              <span class="status-dot"></span>
+              <span>v0.0.28</span>
+              <span class="status-sep">·</span>
+              <span class="brain-hands-pair">
+                <span class="role brain">brain</span>
+                <span class="pair-arrow">◄ ►</span>
+                <span class="role hands">hands</span>
+              </span>
+            </div>
           </div>
-          <div class="terminal-line"><span class="t-dim">you</span> <span class="t-cyan">›</span> <span class="t-green">looks good, ship it</span></div>
-          <div class="terminal-line"><span class="t-dim">hands</span> <span class="t-cyan">›</span> <span class="t-amber">step 1/4</span> executing...</div>
-          <div class="terminal-line typing-line"><span class="t-dim">hands</span> <span class="t-cyan">›</span> <span class="cursor-blink">█</span></div>
+
+          <div class="hero-terminal" id="hero-terminal" data-parallax="0.08">
+            <div class="terminal-chrome">
+              <div class="terminal-dots"><span></span><span></span><span></span></div>
+              <span class="terminal-title">relay tui</span>
+            </div>
+            <div class="terminal-body">
+              <div class="terminal-line"><span class="t-dim">relay</span> <span class="t-accent">›</span> <span class="t-bright">What are we shipping?</span></div>
+              <div class="terminal-line"><span class="t-dim">brain</span> <span class="t-accent">›</span> Assessing scope... <span class="t-warn">large</span></div>
+              <div class="terminal-line terminal-plan">
+                <span class="t-dim">brain</span> <span class="t-accent">›</span> <span class="t-tag">&lt;plan&gt;</span>
+                <div class="plan-steps">
+                  <span>1. Scaffold project structure</span>
+                  <span>2. Implement core API routes</span>
+                  <span>3. Add auth middleware</span>
+                  <span>4. Write integration tests</span>
+                </div>
+                <span class="t-tag">&lt;/plan&gt;</span>
+              </div>
+              <div class="terminal-line"><span class="t-dim">you</span> <span class="t-accent">›</span> <span class="t-bright">looks good, ship it</span></div>
+              <div class="terminal-line"><span class="t-dim">hands</span> <span class="t-accent">›</span> <span class="t-warn">step 1/4</span> executing...</div>
+              <div class="terminal-line typing-line"><span class="t-dim">hands</span> <span class="t-accent">›</span> <span class="cursor-blink">█</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="scroll-hint" aria-hidden="true">
+          <span>scroll</span>
+          <div class="scroll-hint-line"></div>
         </div>
       </div>
     </section>
@@ -102,21 +114,21 @@
     <!-- Value Props -->
     <section class="value-props">
       <div class="container">
-        <div class="prop-card reveal" data-delay="0">
+        <div class="prop-card reveal-up" data-delay="0">
           <div class="prop-icon">
             <svg viewBox="0 0 48 48" fill="none"><circle cx="24" cy="24" r="20" stroke="currentColor" stroke-width="1.5"/><path d="M16 24h16M24 16v16" stroke="currentColor" stroke-width="1.5"/></svg>
           </div>
           <h3>Brain + Hands</h3>
           <p>The planner sees the big picture. The executor works one focused step at a time. Less context, less cost, better results.</p>
         </div>
-        <div class="prop-card reveal" data-delay="100">
+        <div class="prop-card reveal-up" data-delay="100">
           <div class="prop-icon">
             <svg viewBox="0 0 48 48" fill="none"><rect x="8" y="8" width="32" height="32" rx="4" stroke="currentColor" stroke-width="1.5"/><path d="M16 20h16M16 28h10" stroke="currentColor" stroke-width="1.5"/></svg>
           </div>
           <h3>Any Model</h3>
           <p>OpenRouter, DeepSeek, or your own OpenAI-compatible provider. Swap models with env vars — zero code changes.</p>
         </div>
-        <div class="prop-card reveal" data-delay="200">
+        <div class="prop-card reveal-up" data-delay="200">
           <div class="prop-icon">
             <svg viewBox="0 0 48 48" fill="none"><path d="M24 8L8 16v16l16 8 16-8V16L24 8z" stroke="currentColor" stroke-width="1.5"/><circle cx="24" cy="24" r="6" stroke="currentColor" stroke-width="1.5"/></svg>
           </div>
@@ -126,155 +138,143 @@
       </div>
     </section>
 
-    <!-- Architecture -->
-    <section class="architecture" id="architecture">
-      <div class="container">
-        <div class="section-header reveal">
-          <span class="section-tag">// architecture</span>
-          <h2>The brain / hands split</h2>
-          <p>Relay separates thinking from doing. Two models, one seam, bounded loops.</p>
-        </div>
-        <div class="arch-diagram reveal">
-          <div class="arch-node brain-node">
-            <div class="node-header">
-              <span class="node-icon">🧠</span>
-              <span class="node-label">BRAIN</span>
-              <span class="node-role">planner</span>
-            </div>
-            <ul class="node-capabilities">
-              <li>Assess scope</li>
-              <li>Converse & plan</li>
-              <li>Supervise execution</li>
-              <li>Replan on failure</li>
-            </ul>
-            <div class="node-tags">
-              <span class="tag read-only">read-only</span>
-              <span class="tag">&lt;plan&gt;</span>
-              <span class="tag">&lt;abort&gt;</span>
-            </div>
+    <!-- Architecture — scroll-pinned -->
+    <section class="pin-section" id="architecture" data-pin-height="2.5">
+      <div class="pin-sticky">
+        <div class="container">
+          <div class="section-header pin-header">
+            <span class="section-tag">// architecture</span>
+            <h2 class="split-heading">The brain / hands split</h2>
+            <p>Relay separates thinking from doing. Two models, one seam, bounded loops.</p>
           </div>
-          <div class="arch-flow">
-            <div class="flow-line">
-              <div class="flow-pulse"></div>
+          <div class="arch-diagram">
+            <div class="arch-node brain-node" data-pin-item="left">
+              <div class="node-header">
+                <span class="node-label">BRAIN</span>
+                <span class="node-role">planner</span>
+              </div>
+              <ul class="node-capabilities">
+                <li>Assess scope</li>
+                <li>Converse & plan</li>
+                <li>Supervise execution</li>
+                <li>Replan on failure</li>
+              </ul>
+              <div class="node-tags">
+                <span class="tag read-only">read-only</span>
+                <span class="tag">&lt;plan&gt;</span>
+                <span class="tag">&lt;abort&gt;</span>
+              </div>
             </div>
-            <div class="flow-labels">
-              <span class="flow-out">plan steps</span>
-              <span class="flow-back">escalate</span>
+            <div class="arch-flow" data-pin-item="center">
+              <div class="flow-line"><div class="flow-pulse" id="flow-pulse"></div></div>
+              <div class="flow-labels">
+                <span class="flow-out">plan steps</span>
+                <span class="flow-back">escalate</span>
+              </div>
             </div>
-          </div>
-          <div class="arch-node hands-node">
-            <div class="node-header">
-              <span class="node-icon">🤲</span>
-              <span class="node-label">HANDS</span>
-              <span class="node-role">executor</span>
-            </div>
-            <ul class="node-capabilities">
-              <li>One step at a time</li>
-              <li>Narrow context window</li>
-              <li>Read, edit, patch, bash</li>
-              <li>Report done or blocked</li>
-            </ul>
-            <div class="node-tags">
-              <span class="tag">&lt;done&gt;</span>
-              <span class="tag">&lt;blocked&gt;</span>
-              <span class="tag">&lt;question&gt;</span>
+            <div class="arch-node hands-node" data-pin-item="right">
+              <div class="node-header">
+                <span class="node-label">HANDS</span>
+                <span class="node-role">executor</span>
+              </div>
+              <ul class="node-capabilities">
+                <li>One step at a time</li>
+                <li>Narrow context window</li>
+                <li>Read, edit, patch, bash</li>
+                <li>Report done or blocked</li>
+              </ul>
+              <div class="node-tags">
+                <span class="tag">&lt;done&gt;</span>
+                <span class="tag">&lt;blocked&gt;</span>
+                <span class="tag">&lt;question&gt;</span>
+              </div>
             </div>
           </div>
-        </div>
-        <div class="arch-loop reveal">
-          <div class="loop-step">
-            <span class="loop-num">01</span>
-            <span>Describe your goal</span>
-          </div>
-          <div class="loop-arrow">→</div>
-          <div class="loop-step">
-            <span class="loop-num">02</span>
-            <span>Plan together</span>
-          </div>
-          <div class="loop-arrow">→</div>
-          <div class="loop-step">
-            <span class="loop-num">03</span>
-            <span>Hands execute</span>
-          </div>
-          <div class="loop-arrow">→</div>
-          <div class="loop-step">
-            <span class="loop-num">04</span>
-            <span>Steer anytime</span>
+          <div class="arch-loop" data-pin-item="bottom">
+            <div class="loop-step"><span class="loop-num">01</span><span>Describe your goal</span></div>
+            <div class="loop-arrow">→</div>
+            <div class="loop-step"><span class="loop-num">02</span><span>Plan together</span></div>
+            <div class="loop-arrow">→</div>
+            <div class="loop-step"><span class="loop-num">03</span><span>Hands execute</span></div>
+            <div class="loop-arrow">→</div>
+            <div class="loop-step"><span class="loop-num">04</span><span>Steer anytime</span></div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- Features -->
-    <section class="features" id="features">
-      <div class="container">
-        <div class="section-header reveal">
+    <!-- Features — horizontal scroll on vertical -->
+    <section class="hscroll-section" id="features">
+      <div class="hscroll-sticky">
+        <div class="hscroll-header container">
           <span class="section-tag">// features</span>
-          <h2>Built for developers who ship</h2>
+          <h2 class="split-heading">Built for developers who ship</h2>
           <p>Every feature earns its place. No sparkle, no lock-in.</p>
         </div>
-        <div class="features-grid">
-          <article class="feature-card reveal" data-delay="0">
-            <div class="feature-num">01</div>
-            <h3>Conversational Planning</h3>
-            <p>Not a one-shot prompt dump. Approve, revise, or tweak the plan in plain language before anything runs.</p>
-            <div class="feature-detail">
-              <span class="detail-tag">assumption dial</span>
-              <span class="detail-tag">scope assessment</span>
-              <span class="detail-tag">dual-fidelity plans</span>
-            </div>
-          </article>
-          <article class="feature-card reveal" data-delay="50">
-            <div class="feature-num">02</div>
-            <h3>Text Protocol</h3>
-            <p>XML-like tags parsed by Relay — not native function calling. Works with any model. Built for transparency and comparison.</p>
-            <div class="feature-detail">
-              <code class="inline-code">&lt;read&gt;</code>
-              <code class="inline-code">&lt;edit&gt;</code>
-              <code class="inline-code">&lt;apply_patch&gt;</code>
-              <code class="inline-code">&lt;bash&gt;</code>
-            </div>
-          </article>
-          <article class="feature-card reveal" data-delay="100">
-            <div class="feature-num">03</div>
-            <h3>Multi-Provider</h3>
-            <p>Pair a smart brain on Claude with fast hands on Haiku or DeepSeek Flash. Independent provider and model per role.</p>
-            <div class="feature-detail">
-              <span class="detail-tag">OpenRouter</span>
-              <span class="detail-tag">DeepSeek</span>
-              <span class="detail-tag">custom endpoints</span>
-            </div>
-          </article>
-          <article class="feature-card reveal" data-delay="150">
-            <div class="feature-num">04</div>
-            <h3>Interrupt & Steer</h3>
-            <p>Esc interrupts mid-run without destroying your session. Type to steer, queue the next task, or stop and start fresh planning.</p>
-            <div class="feature-detail">
-              <span class="detail-tag">/queue</span>
-              <span class="detail-tag">/redirect</span>
-              <span class="detail-tag">up-arrow recall</span>
-            </div>
-          </article>
-          <article class="feature-card reveal" data-delay="200">
-            <div class="feature-num">05</div>
-            <h3>Safety Rails</h3>
-            <p>Read-before-edit guard, command policy for bash, loop breakers, bounded budgets, and agentic step review.</p>
-            <div class="feature-detail">
-              <span class="detail-tag detail-blocked">BLOCKED</span>
-              <span class="detail-tag detail-confirm">CONFIRM</span>
-              <span class="detail-tag detail-allow">ALLOW</span>
-            </div>
-          </article>
-          <article class="feature-card reveal" data-delay="250">
-            <div class="feature-num">06</div>
-            <h3>Live Telemetry</h3>
-            <p>Per-role token counts, cost, and latency. Session-cumulative cost counter. Run history in <code class="inline-code">.relay/runs.jsonl</code>.</p>
-            <div class="feature-detail">
-              <span class="detail-tag">/cost</span>
-              <span class="detail-tag">/log</span>
-              <span class="detail-tag">relay doctor</span>
-            </div>
-          </article>
+        <div class="hscroll-track-wrap">
+          <div class="hscroll-track" id="hscroll-track">
+            <article class="feature-card hscroll-card">
+              <div class="feature-num">01</div>
+              <h3>Conversational Planning</h3>
+              <p>Not a one-shot prompt dump. Approve, revise, or tweak the plan in plain language before anything runs.</p>
+              <div class="feature-detail">
+                <span class="detail-tag">assumption dial</span>
+                <span class="detail-tag">scope assessment</span>
+                <span class="detail-tag">dual-fidelity plans</span>
+              </div>
+            </article>
+            <article class="feature-card hscroll-card">
+              <div class="feature-num">02</div>
+              <h3>Text Protocol</h3>
+              <p>XML-like tags parsed by Relay — not native function calling. Works with any model. Built for transparency.</p>
+              <div class="feature-detail">
+                <code class="inline-code">&lt;read&gt;</code>
+                <code class="inline-code">&lt;edit&gt;</code>
+                <code class="inline-code">&lt;apply_patch&gt;</code>
+                <code class="inline-code">&lt;bash&gt;</code>
+              </div>
+            </article>
+            <article class="feature-card hscroll-card">
+              <div class="feature-num">03</div>
+              <h3>Multi-Provider</h3>
+              <p>Pair a smart brain on Claude with fast hands on Haiku or DeepSeek Flash. Independent provider per role.</p>
+              <div class="feature-detail">
+                <span class="detail-tag">OpenRouter</span>
+                <span class="detail-tag">DeepSeek</span>
+                <span class="detail-tag">custom endpoints</span>
+              </div>
+            </article>
+            <article class="feature-card hscroll-card">
+              <div class="feature-num">04</div>
+              <h3>Interrupt & Steer</h3>
+              <p>Esc interrupts mid-run without destroying your session. Type to steer, queue the next task, or stop.</p>
+              <div class="feature-detail">
+                <span class="detail-tag">/queue</span>
+                <span class="detail-tag">/redirect</span>
+                <span class="detail-tag">up-arrow recall</span>
+              </div>
+            </article>
+            <article class="feature-card hscroll-card">
+              <div class="feature-num">05</div>
+              <h3>Safety Rails</h3>
+              <p>Read-before-edit guard, command policy for bash, loop breakers, bounded budgets, and step review.</p>
+              <div class="feature-detail">
+                <span class="detail-tag detail-blocked">BLOCKED</span>
+                <span class="detail-tag detail-confirm">CONFIRM</span>
+                <span class="detail-tag detail-allow">ALLOW</span>
+              </div>
+            </article>
+            <article class="feature-card hscroll-card">
+              <div class="feature-num">06</div>
+              <h3>Live Telemetry</h3>
+              <p>Per-role token counts, cost, and latency. Session-cumulative cost counter. Run history in <code class="inline-code">.relay/runs.jsonl</code>.</p>
+              <div class="feature-detail">
+                <span class="detail-tag">/cost</span>
+                <span class="detail-tag">/log</span>
+                <span class="detail-tag">relay doctor</span>
+              </div>
+            </article>
+          </div>
         </div>
       </div>
     </section>
@@ -282,12 +282,12 @@
     <!-- Tools -->
     <section class="tools-section">
       <div class="container">
-        <div class="section-header reveal">
+        <div class="section-header reveal-up">
           <span class="section-tag">// executor tools</span>
-          <h2>First-class tool protocol</h2>
+          <h2 class="split-heading">First-class tool protocol</h2>
           <p>Every tool is a text tag. Parsed by Relay, never provider tool-calling.</p>
         </div>
-        <div class="tools-grid reveal">
+        <div class="tools-grid reveal-up">
           <div class="tool-item"><code>&lt;read&gt;</code><span>Explore files</span></div>
           <div class="tool-item"><code>&lt;list&gt;</code><span>Directory listing</span></div>
           <div class="tool-item"><code>&lt;grep&gt;</code><span>Search codebase</span></div>
@@ -302,18 +302,18 @@
       </div>
     </section>
 
-    <!-- TUI Showcase -->
+    <!-- TUI — scale reveal -->
     <section class="tui-section" id="tui">
       <div class="container">
         <div class="tui-layout">
-          <div class="tui-copy reveal">
+          <div class="tui-copy reveal-up">
             <span class="section-tag">// terminal ui</span>
-            <h2>Cyberpunk TUI</h2>
+            <h2 class="split-heading">Cyberpunk TUI</h2>
             <p>Two-pane chat: conversation transcript and live activity feed. Glitch boot animation, slash commands, and a setup wizard on first run.</p>
             <ul class="tui-features">
               <li><span class="check">▸</span> Welcome screen with block wordmark</li>
               <li><span class="check">▸</span> Live cost counter per goal & session</li>
-              <li><span class="check">▸</span> Slash command plane: /model, /config, /doctor</li>
+              <li><span class="check">▸</span> Slash commands: /model, /config, /doctor</li>
               <li><span class="check">▸</span> Session-sticky working directory</li>
               <li><span class="check">▸</span> First-run guided setup (Ctrl+S)</li>
             </ul>
@@ -322,7 +322,7 @@
               <button class="copy-btn" aria-label="Copy command">copy</button>
             </div>
           </div>
-          <div class="tui-mockup reveal" data-delay="150">
+          <div class="tui-mockup scale-reveal" data-scale-reveal>
             <div class="mockup-frame">
               <div class="mockup-header">
                 <span></span><span></span><span></span>
@@ -373,11 +373,11 @@
     <!-- Comparison -->
     <section class="comparison">
       <div class="container">
-        <div class="section-header reveal">
+        <div class="section-header reveal-up">
           <span class="section-tag">// why relay</span>
-          <h2>Not another single-agent loop</h2>
+          <h2 class="split-heading">Not another single-agent loop</h2>
         </div>
-        <div class="compare-table reveal">
+        <div class="compare-table reveal-up">
           <div class="compare-header">
             <span></span>
             <span>Typical agent</span>
@@ -410,11 +410,11 @@
     <!-- Install -->
     <section class="install-section" id="install">
       <div class="container">
-        <div class="section-header reveal">
+        <div class="section-header reveal-up">
           <span class="section-tag">// quickstart</span>
-          <h2>Up and running in 60 seconds</h2>
+          <h2 class="split-heading">Up and running in 60 seconds</h2>
         </div>
-        <div class="install-steps reveal">
+        <div class="install-steps reveal-up">
           <div class="install-step">
             <span class="step-num">1</span>
             <div class="step-content">
@@ -448,7 +448,7 @@
             </div>
           </div>
         </div>
-        <div class="install-alt reveal">
+        <div class="install-alt reveal-up">
           <p>From source:</p>
           <div class="install-cmd" data-copy="git clone https://github.com/HardCoreGamer969/Relay.git && cd Relay && pip install -e .">
             <code>git clone https://github.com/HardCoreGamer969/Relay.git && cd Relay && pip install -e .</code>
@@ -460,7 +460,8 @@
 
     <!-- CTA -->
     <section class="final-cta">
-      <div class="container reveal">
+      <div class="container reveal-up">
+        <img src="assets/logo-icon.svg" alt="" class="cta-logo" width="64" height="77">
         <h2>Point me at something.</h2>
         <p>Relay shows cost live and never auto-answers product decisions. Use git as your undo net.</p>
         <div class="cta-buttons">
@@ -475,7 +476,7 @@
     <div class="container">
       <div class="footer-inner">
         <div class="footer-brand">
-          <span class="footer-logo">[RELAY]</span>
+          <img src="assets/logo.svg" alt="Relay" class="footer-logo-img" width="140" height="88">
           <p>Apache 2.0 · Built with Python, Textual, and any model you choose.</p>
         </div>
         <div class="footer-links">

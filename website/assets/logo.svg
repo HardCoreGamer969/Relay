@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 220" fill="none" role="img" aria-label="Relay">
+  <!-- Circuit-style R — thick continuous pathway with rounded joins -->
+  <g fill="#FF0000">
+    <!-- Left vertical stem -->
+    <rect x="36" y="28" width="22" height="140" rx="4"/>
+    <!-- Top horizontal -->
+    <rect x="36" y="28" width="82" height="22" rx="4"/>
+    <!-- Upper right vertical -->
+    <rect x="96" y="28" width="22" height="54" rx="4"/>
+    <!-- Bowl mid horizontal -->
+    <rect x="58" y="72" width="60" height="22" rx="4"/>
+    <!-- Bowl inner vertical -->
+    <rect x="58" y="72" width="22" height="40" rx="4"/>
+    <!-- Mid horizontal bar -->
+    <rect x="58" y="110" width="64" height="22" rx="4"/>
+    <!-- Leg diagonal (thick parallelogram) -->
+    <path d="M58 132 L58 154 L118 168 L118 146 Z" />
+    <!-- Circuit fold — top hook -->
+    <rect x="96" y="38" width="44" height="14" rx="3"/>
+    <rect x="126" y="38" width="14" height="28" rx="3"/>
+  </g>
+  <!-- RELAY wordmark -->
+  <text x="180" y="198" fill="#FF0000" font-family="'Chakra Petch', 'Rajdhani', sans-serif" font-size="48" font-weight="700" letter-spacing="14" text-anchor="middle">RELAY</text>
+</svg>

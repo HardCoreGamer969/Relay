@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 168" fill="none" role="img" aria-label="Relay">
+  <g fill="#FF0000">
+    <rect x="36" y="24" width="20" height="120" rx="4"/>
+    <rect x="36" y="24" width="72" height="20" rx="4"/>
+    <rect x="88" y="24" width="20" height="48" rx="4"/>
+    <rect x="54" y="64" width="54" height="20" rx="4"/>
+    <rect x="54" y="64" width="20" height="36" rx="4"/>
+    <rect x="54" y="98" width="56" height="20" rx="4"/>
+    <path d="M54 118 L54 138 L104 148 L104 128 Z"/>
+    <rect x="88" y="32" width="38" height="12" rx="3"/>
+    <rect x="114" y="32" width="12" height="24" rx="3"/>
+  </g>
+</svg>

@@ -661,6 +661,19 @@ def _run_active(app) -> bool:
     return runner is not None and getattr(runner, "is_running", False)
 
 
+def _parse_inline_command(text: str) -> tuple[str, str] | None:
+    """Parse ``/name arg...`` into ``(name, arg)``; ``None`` if not a slash command.
+
+    Only the v0.0.28 inline-arg commands (``/queue`` / ``/redirect``) use this; every
+    other slash command stays argument-free and runs via the popover."""
+    if not text.startswith("/"):
+        return None
+    parts = text[1:].split(None, 1)
+    if not parts:
+        return None
+    return parts[0], (parts[1].strip() if len(parts) > 1 else "")
+
+
 def visible_commands(app) -> list[Command]:
     """Commands available in the app's current state (``enabled`` honored)."""
     return [c for c in COMMANDS if c.enabled is None or c.enabled(app)]
@@ -707,14 +720,29 @@ class PromptInput(Input):
 
     def on_key(self, event) -> None:
         app = self.app
-        if not getattr(app, "_popover_open", False):
+        # While the slash popover is open, up/down move the highlight and esc closes it.
+        if getattr(app, "_popover_open", False):
+            if event.key == "down":
+                app._popover_move(1); event.prevent_default(); event.stop()
+            elif event.key == "up":
+                app._popover_move(-1); event.prevent_default(); event.stop()
+            elif event.key == "escape":
+                app._popover_close(); event.prevent_default(); event.stop()
             return
-        if event.key == "down":
-            app._popover_move(1); event.prevent_default(); event.stop()
-        elif event.key == "up":
-            app._popover_move(-1); event.prevent_default(); event.stop()
-        elif event.key == "escape":
-            app._popover_close(); event.prevent_default(); event.stop()
+        # Otherwise up/down are the ONE unified recall-and-edit affordance: walk the
+        # input history (goals, steers, queued items) into the field for editing.
+        if event.key == "up":
+            recalled = app._recall_older()
+            if recalled is not None:
+                self.value = recalled
+                self.cursor_position = len(self.value)
+            event.prevent_default(); event.stop()
+        elif event.key == "down":
+            recalled = app._recall_newer()
+            if recalled is not None:
+                self.value = recalled
+                self.cursor_position = len(self.value)
+            event.prevent_default(); event.stop()
 
 
 class FilterInput(Input):
@@ -1066,6 +1094,10 @@ COMMANDS: list[Command] = [
             run=lambda app: app._cmd_assume()),
     Command("cwd", "Working dir", "Show / set the session working directory", "ops",
             run=lambda app: app._cmd_cwd(), enabled=lambda app: not _run_active(app)),
+    Command("redirect", "Redirect", "Steer now: redirect the work (or /redirect <input>)", "ops",
+            run=lambda app: app._open_inline_dialog("redirect")),
+    Command("queue", "Queue", "Do this next: queue input (or /queue <input>)", "ops",
+            run=lambda app: app._open_inline_dialog("queue")),
     Command("cost", "Cost", "Session + per-goal spend; toggle / reset the counter", "ops",
             run=lambda app: app._cmd_cost()),
     Command("log", "Log", "Export a debug log (.md) to share when reporting an issue", "ops",
@@ -1156,6 +1188,9 @@ class RelayTuiApp(App):
         # esc set this while a run is in flight, so _handle_finished knows the clean
         # cancel was a user INTERRUPT (-> the interrupt prompt) vs. some other stop.
         self._interrupting = False
+        # A steer requested via /redirect while a run was still executing: halt now,
+        # then steer with this text the moment the run lands at the clean boundary.
+        self._pending_steer: str | None = None
         self._models = models if models is not None else load_models()
         self._client = client
         # Setup-flow seams (injected by tests; default to the real provider funcs).
@@ -1365,6 +1400,16 @@ class RelayTuiApp(App):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "prompt":
             return  # a dialog's own field; its screen handles submit
+        # Inline-arg commands (/queue <input>, /redirect <input>) take precedence over
+        # the popover -- they carry an argument the popover can't. They also work mid-run
+        # (the popover is suppressed while executing, but Enter still routes here).
+        inline = _parse_inline_command(event.value)
+        if inline is not None and inline[0] in ("queue", "redirect") and inline[1]:
+            event.input.value = ""
+            self._popover_close()
+            (self._do_queue if inline[0] == "queue" else self._do_redirect)(inline[1])
+            self._update_status()
+            return
         # Enter while the popover is open runs the highlighted command, never a goal.
         if self._popover_open:
             event.input.value = ""
@@ -1631,6 +1676,13 @@ class RelayTuiApp(App):
             self._interrupting = False
             self._stopping = False
             self._session.last_plan = outcome.result.plan if outcome.result is not None else None
+            # A /redirect issued mid-run queued a pending steer: apply it now (the run
+            # has reached the clean boundary), instead of waiting at the interrupt prompt.
+            pending = self._pending_steer
+            self._pending_steer = None
+            if pending is not None:
+                self._start_steer(pending)
+                return
             self._router.interrupt()
             self._write_activity("[interrupted] type to redirect, or esc again to stop")
             self._update_status()
@@ -1657,6 +1709,39 @@ class RelayTuiApp(App):
             return
         self._update_status()
 
+    def _do_queue(self, text: str) -> None:
+        """`/queue <input>`: hold the input; the current step is NOT interrupted. When
+        the current run completes it is consumed next (FIFO), as a new direction within
+        the same session."""
+        text = text.strip()
+        if not text:
+            return
+        self._session.queue.enqueue(text)
+        self._session.history.add(text)  # recallable via up-arrow
+        self._write_activity(f"[queued] {text}  (queued: {len(self._session.queue)})")
+        # An idle queue with no run in flight should start consuming immediately.
+        if not self._run_in_flight():
+            self._consume_queue()
+
+    def _do_redirect(self, text: str) -> None:
+        """`/redirect <input>`: steer NOW (the explicit form of bare-interrupt-then-type).
+
+        Interrupted -> steer immediately. Running -> interrupt, then steer the moment
+        the run halts at the clean boundary (a pending steer). Idle -> a fresh run."""
+        text = text.strip()
+        if not text:
+            return
+        if self._router.state is InputState.INTERRUPTED:
+            self._start_steer(text)
+        elif self._runner is not None and self._runner.is_running:
+            self._pending_steer = text
+            self._interrupting = True
+            self._stopping = True
+            self._runner.cancel()
+            self._write_activity(f"[redirect] halting to steer: {text}")
+        else:
+            self._start_run(text)
+
     def _consume_queue(self) -> bool:
         """If the queue is non-empty, dequeue the next input and start it as the next
         run within the same session. Returns True when a queued item was started."""
@@ -1666,6 +1751,16 @@ class RelayTuiApp(App):
         self._write_activity(f"[queue] starting next queued input ({len(self._session.queue)} left)")
         self._start_run(nxt)
         return True
+
+    # -- up-arrow recall: ONE unified recall-and-edit affordance ----------------
+
+    def _recall_older(self) -> str | None:
+        """Recall the previous input (goal/steer/queued) into the prompt for editing."""
+        return self._session.history.recall_older()
+
+    def _recall_newer(self) -> str | None:
+        """Recall the next (newer) input; '' once stepped past the newest."""
+        return self._session.history.recall_newer()
 
     # -- conversation pane: rendered from the Transcript ------------------------
 
@@ -1726,6 +1821,8 @@ class RelayTuiApp(App):
         cwd = self._cwd_segment()
         if cwd:
             base = f"{base}  |  {cwd}"
+        if self._session.queue:  # minimal interim queue affordance (overhaul deferred)
+            base = f"{base}  |  queued: {len(self._session.queue)}"
         cost = self._cost_segment()
         # The plain buffer is what headless tests assert on; the widget gets a styled
         # render so the cost segment can stand out (and pulse on a change in v0.0.20).
@@ -2055,6 +2152,25 @@ class RelayTuiApp(App):
         secrets_set_key(provider, key)  # the same v0.0.16 secrets path; value never echoed
         self._on_setup_saved()
         return True, f"stored a key for {provider}"
+
+    def _open_inline_dialog(self, kind: str) -> None:
+        """The popover entry for /redirect and /queue: a minimal single-field dialog
+        (the inline `/redirect <input>` / `/queue <input>` form is the primary path;
+        rich queue UI is deferred to the UI-overhaul milestone)."""
+        title = "Redirect (steer now)" if kind == "redirect" else "Queue (do this next)"
+        handler = self._do_redirect if kind == "redirect" else self._do_queue
+
+        def on_submit(value: str) -> tuple[bool, str]:
+            value = (value or "").strip()
+            if not value:
+                return False, "enter some input"
+            handler(value)
+            self._update_status()
+            return True, "ok"
+
+        self.push_screen(TextEntryDialog(
+            title=title, label=f"Input to {kind}:", placeholder="...", on_submit=on_submit,
+        ))
 
     def _cmd_config(self) -> None:
         """Show the resolved config (provider/model/thinking + source; key present/

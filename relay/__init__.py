@@ -209,6 +209,12 @@ from relay.conversation import ConversationResult, ScopeAssessment, plan_convers
 from relay.investigation import investigate
 from relay.loop import StepResult, TaskResult, run_task
 from relay.memory import (
+    POOL_BRAIN,
+    POOL_HANDS,
+    POOL_SHARED,
+    POOLS,
+    SHARED_READ_FRACTION,
+    MemoryBus,
     MemoryEntry,
     PlanMemory,
     estimate_tokens,
@@ -305,6 +311,12 @@ __all__ = [
     # v0.06 (1 of 2) -- plan memory + context-window awareness
     "PlanMemory",
     "MemoryEntry",
+    "MemoryBus",
+    "POOL_BRAIN",
+    "POOL_HANDS",
+    "POOL_SHARED",
+    "POOLS",
+    "SHARED_READ_FRACTION",
     "memory_budget",
     "small_window_warning",
     "estimate_tokens",

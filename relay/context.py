@@ -52,6 +52,7 @@ def resolve_context_window(
     client=None,
     override: int | None = None,
     catalog=None,
+    env_override: str | None = "RELAY_BRAIN_CONTEXT",
 ) -> tuple[int, str]:
     """Resolve a model's context window and how it was determined.
 
@@ -60,14 +61,19 @@ def resolve_context_window(
 
     When ``catalog`` and ``provider`` are supplied, the catalog's ``limit.context``
     is consulted *ahead* of the OpenRouter probe (it's the better source); the probe
-    remains a fallback rung. Omit them (the autonomous loop does) for the prior
-    override -> probe -> default behavior, unchanged.
+    remains a fallback rung. Omit them (the autonomous loop did pre-v0.0.29) for the
+    prior override -> probe -> default behavior, unchanged.
+
+    ``env_override`` names the environment variable consulted as the manual override
+    (default ``RELAY_BRAIN_CONTEXT``). The HANDS pool resolves with
+    ``env_override="RELAY_HANDS_CONTEXT"`` so it gets its OWN manual override and
+    never silently inherits the brain's; pass ``None`` to skip the env rung entirely.
     """
     # 1. explicit override (param beats env; both are "override")
     declared = _coerce_int(override)
     if declared is not None:
         return (declared, "override")
-    env_declared = _coerce_int(os.environ.get("RELAY_BRAIN_CONTEXT"))
+    env_declared = _coerce_int(os.environ.get(env_override)) if env_override else None
     if env_declared is not None:
         return (env_declared, "override")
 

@@ -46,7 +46,37 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.28 (esc = interrupt with steer + queue; the session lives on)
+## Status — v0.0.29 (three-pool memory: brain / hands / shared — Stage 1)
+
+Relay's within-run memory was a **single pool, budgeted to the brain's context window, that
+only the brain read** — the hands saw no memory at all. v0.0.29 splits it into **three pools**,
+each budgeted to its **own** actor's window:
+
+- **brain** — the brain's planning/reasoning memory; the hands never sees it; budgeted to the
+  brain window.
+- **hands** — the hands' private scratch; the brain never sees it. Written now; **read** by the
+  hands only in Stage 2 (deferred).
+- **shared** — the bidirectional, curated coordination channel both actors see: brain→hands
+  **directives** (authoritative decisions/confirmations the hands must honor) and hands→brain
+  **findings**. Budgeted to `min(brain, hands)` so it fits the smaller window.
+
+A `MemoryBus` composes three **unmodified** `PlanMemory` stores, so per-pool dedup, counters,
+and the snapshot shape carry over. Each actor's window is resolved independently
+(`RELAY_HANDS_CONTEXT` for the hands; provider + catalog are passed so a known model gets its
+real window, not the 8192 default). The brain reads **brain ∪ shared** with a **mechanized
+union cap** — the rendered union is held within the brain-window budget, not merely asserted.
+
+This is **Stage 1**: the user confirmation and the brain's self-answers **graduate to shared**
+(so the hands finally sees authoritative decisions), and a new non-blocking **`<finding>`**
+text tag lets the hands surface a bug / security issue / wrong assumption to shared without
+ending its step. The hands reads **shared only** — never the brain pool, and not yet its own
+pool (Stage 2 deferred) — so the narrow-context principle holds while the curated directives
+reach it. The working directory stays separate session state (untouched). Text-protocol
+throughout (`<finding>` is a tag; no native tool-calling); all covered by network-free headless
+tests. The live feel — the hands acting on a shared directive, a `<finding>` reaching the
+brain — is the maintainer's to verify; it is not simulated here.
+
+Under that, **v0.0.28** (esc = interrupt with steer + queue; the session lives on) still stands.
 
 **esc** is no longer "stop the run" — it is a full **interrupt**, and the **session is
 never torn down** by it. esc halts the *run* at the clean executor-call boundary (the

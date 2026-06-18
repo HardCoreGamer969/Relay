@@ -261,7 +261,7 @@ from relay.transcript import (
     render_for_brain,
 )
 
-__version__ = "0.0.28"
+__version__ = "0.0.29"
 
 __all__ = [
     # v0.01 -- model layer
@@ -311,6 +311,7 @@ __all__ = [
     # v0.06 (1 of 2) -- plan memory + context-window awareness
     "PlanMemory",
     "MemoryEntry",
+    # v0.0.29 -- three-pool memory: brain / hands / shared (MemoryBus, Stage 1)
     "MemoryBus",
     "POOL_BRAIN",
     "POOL_HANDS",

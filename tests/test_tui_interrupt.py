@@ -118,3 +118,36 @@ def test_empty_submit_at_interrupt_is_stop(tmp_path):
             assert app._router.state is InputState.IDLE
 
     asyncio.run(main())
+
+
+def test_stop_preserves_session_but_clear_resets_it(tmp_path):
+    """The Part-4 distinction: STOP (esc) abandons the plan but keeps the session;
+    /clear is the deliberate full-session reset. The two are different."""
+    async def main():
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await _submit(pilot, app, "build a thing")
+            assert await _until(pilot, lambda: app._runner is not None and app._runner.is_running)
+            app._session.queue.enqueue("a queued task")  # session state
+
+            # Interrupt, then STOP.
+            app.action_cancel_run()
+            assert await _until(pilot, lambda: app._router.state is InputState.INTERRUPTED)
+            app.action_cancel_run()  # esc again -> stop
+            assert app._router.state is InputState.IDLE
+
+            # STOP preserved the session: transcript turns + queue + conversation remain.
+            assert app._session.transcript.turns          # planning turns survived
+            assert app._session.queue.pending() == ["a queued task"]
+            assert app._conversation_lines
+
+            # /clear is the DISTINCT full reset: everything wiped.
+            app._cmd_clear()
+            assert app._session.transcript.turns == []
+            assert app._session.goal is None
+            assert len(app._session.queue) == 0
+            assert app._session.history.items() == []
+            assert app._conversation_lines == []
+            assert app._session_cost == 0.0
+
+    asyncio.run(main())

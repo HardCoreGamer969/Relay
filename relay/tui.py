@@ -2345,10 +2345,21 @@ class RelayTuiApp(App):
         self._update_status()
 
     def _cmd_clear(self) -> None:
-        """Clear the visible panes for a fresh session. Guarded: never while a run
-        is in flight (also gated by the command's ``enabled`` predicate)."""
+        """The DISTINCT full-session reset (like OpenCode's session_new): wipe the
+        conversation, memory, plan, queue, and recall history and start fresh. This is
+        deliberately DIFFERENT from STOP (esc), which abandons only the current PLAN and
+        preserves the session. Guarded: never while a run is in flight (also gated by the
+        command's ``enabled`` predicate)."""
         if _run_active(self):
             return
+        # Reset the durable session state (transcript, memory, plan, queue, history,
+        # goal, revisions). The working DIR is intentionally kept -- it is a workspace
+        # location, not conversation. The cost counters zero too: a fresh session.
+        self._session.reset()
+        self._seen_turn_ids.clear()
+        self._router.finish_run()  # ensure a clean IDLE (never leave an interrupt state)
+        self._goal_cost = 0.0
+        self._session_cost = 0.0
         self._conversation_lines = []
         self._activity_lines = []
         try:
@@ -2356,6 +2367,7 @@ class RelayTuiApp(App):
             self.query_one("#activity", RichLog).clear()
         except Exception:  # noqa: BLE001 -- panes not mounted (welcome view)
             pass
+        self._update_status()
 
     # -- /log: a shareable, redacted debug export -------------------------------
     #

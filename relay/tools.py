@@ -94,10 +94,35 @@ def _short_fetch_reason(exc: Exception) -> str:
     return reason[:120]
 
 
-def _wrote_observation(path: str, content: str) -> str:
-    """The shared ``wrote <path> (<bytes> bytes, <lines> lines)`` line for edit/write."""
+def _existing_file_metrics(target: Path) -> tuple[int, int] | None:
+    """``(byte size, line count)`` of ``target`` if it is an existing regular file, else
+    ``None`` (a NEW file -- nothing is being replaced). Read BEFORE an overwrite so the
+    observation can reveal a whole-file replacement (v0.0.31). Never raises."""
+    try:
+        if not target.is_file():
+            return None
+        raw = target.read_bytes()
+    except OSError:
+        return None
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+    return len(raw), lines
+
+
+def _wrote_observation(path: str, content: str, *, before: tuple[int, int] | None = None) -> str:
+    """The shared ``wrote <path> (<bytes> bytes, <lines> lines)`` line for edit/write.
+
+    ``before`` is the prior ``(bytes, lines)`` when an EXISTING file was overwritten --
+    edit/write replace the WHOLE file, so the observation says it replaced the file and
+    by how much. This makes a fragment that just clobbered a large file VISIBLE to the
+    hands and the reviewer (v0.0.31) instead of looking like a normal small write. A new
+    file (``before is None``) keeps the plain observation -- nothing was destroyed."""
     lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
-    return f"wrote {path} ({len(content)} bytes, {lines} lines)"
+    base = f"wrote {path} ({len(content)} bytes, {lines} lines)"
+    if before is not None:
+        before_bytes, before_lines = before
+        base += f" -- replaced entire file (was {before_bytes} bytes, {before_lines} lines)"
+    return base
 
 
 # --- apply_patch: OpenCode's exact envelope (v0.0.26) ------------------------
@@ -473,8 +498,9 @@ class Tools:
         """
         target = self._resolve(path)
         target.parent.mkdir(parents=True, exist_ok=True)
+        before = _existing_file_metrics(target)  # measured BEFORE the overwrite
         target.write_text(content, encoding="utf-8")
-        return _wrote_observation(path, content)
+        return _wrote_observation(path, content, before=before)
 
     def write(self, path: str, content: str) -> str:
         """Write ``content`` as the WHOLE contents of ``path`` (create or overwrite).
@@ -487,8 +513,9 @@ class Tools:
         """
         target = self._resolve(path)
         target.parent.mkdir(parents=True, exist_ok=True)
+        before = _existing_file_metrics(target)  # measured BEFORE the overwrite
         target.write_text(content, encoding="utf-8")
-        return _wrote_observation(path, content)
+        return _wrote_observation(path, content, before=before)
 
     def apply_patch(self, patch_text: str) -> str:
         """Apply an OpenCode patch envelope ATOMICALLY (all-or-nothing).

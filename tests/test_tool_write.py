@@ -52,6 +52,42 @@ def test_write_overwrites_existing(tmp_path):
     assert (tmp_path / "f.txt").read_text(encoding="utf-8") == "NEW"
 
 
+# --- v0.0.31: a whole-file replacement is VISIBLE (so a fragment-clobber isn't silent) ---
+
+
+def test_overwriting_existing_file_reveals_the_replacement(tmp_path):
+    """Overwriting an existing file reveals the whole-file replacement + the prior size,
+    so a tiny fragment that just clobbered a large file is VISIBLE (not a normal write)."""
+    big = "\n".join(f"line {i}" for i in range(100)) + "\n"  # a sizeable existing file
+    f = tmp_path / "page.html"
+    f.write_text(big, encoding="utf-8")
+    prior_bytes = len(f.read_bytes())  # whatever the FS stored (CRLF-agnostic)
+    obs = Tools(tmp_path).write("page.html", "fragment")  # a tiny fragment clobbers it
+    assert obs.startswith("wrote page.html (8 bytes, 1 lines)")
+    assert "replaced entire file" in obs
+    assert f"was {prior_bytes} bytes" in obs
+    assert "100 lines" in obs
+    assert f.read_text(encoding="utf-8") == "fragment"
+
+
+def test_new_file_write_has_no_replaced_note(tmp_path):
+    """A brand-new file destroyed nothing -- the observation stays plain (no note)."""
+    obs = Tools(tmp_path).write("fresh.txt", "hi")
+    assert obs == "wrote fresh.txt (2 bytes, 1 lines)"
+    assert "replaced" not in obs
+
+
+def test_edit_overwriting_existing_file_reveals_the_replacement(tmp_path):
+    """edit has the same whole-file semantics as write -- it reveals the replacement too."""
+    f = tmp_path / "f.txt"
+    f.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    prior_bytes = len(f.read_bytes())
+    obs = Tools(tmp_path).edit("f.txt", "x")
+    assert "replaced entire file" in obs
+    assert f"was {prior_bytes} bytes" in obs
+    assert "3 lines" in obs
+
+
 # --- the read-before-edit guard extends to write ----------------------------
 
 

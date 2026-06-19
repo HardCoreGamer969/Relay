@@ -46,7 +46,37 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.30 (TUI: one live stream, cyberpunk)
+## Status — v0.0.31 (fix the read→edit/write loop: Relay's tools were sabotaging capable models)
+
+A real task ("add `generateTerrain()` to `lunar-lander.html`") **looped and failed at 5/17 steps**:
+the hands read the file, tried to edit/write/apply_patch, made no real progress, re-read, and looped
+until the per-step budget (~12 model calls) was exhausted — then the brain replanned the same step and
+Relay stopped (`repeated_step`). The **same models work fine in a bare harness**. A read-only
+investigation (with an empirical CRLF repro) proved Relay's own **tools** were at fault — and **ruled
+out** CRLF/hash and path-canonicalization: the read-before-edit guard hashes raw bytes on both sides and
+canonicalizes paths consistently, so it is correct and CRLF-robust and was **left untouched**. Three safe,
+platform-agnostic fixes:
+
+- **`apply_patch` no-op honesty.** It reported `applied patch` without checking the file changed, so a
+  hunk that *located* but produced identical content (context-only, or a `-`/`+` pair whose lines are
+  equal) round-tripped unchanged yet reported success — the hands believed the edit took, re-read, and
+  retried forever. `apply_patch` now reports `no change` (success prefix withheld) for a wholly-no-op
+  patch and flags no-op sections in a mixed patch; a real patch is byte-for-byte unaffected, and a
+  non-matching hunk still fails loudly.
+- **A whole-file replacement is now visible.** `write`/`edit` overwrite the WHOLE file, so a model
+  emitting a fragment silently replaced a multi-KB file with a few bytes. Overwriting an existing file
+  now appends `— replaced entire file (was N bytes, M lines)`, so a fragment-clobber is visible to the
+  hands and the reviewer; a new-file write is unchanged.
+- **Executor steering.** The hands is told plainly that `write`/`edit` replace the whole file (a fragment
+  destroys it) and to use `apply_patch` to modify part of an existing file.
+
+The read-before-edit guard (`read_is_current`/`record_read`/`invalidate`/`content_hash`/`canonical`) is
+**byte-for-byte unchanged**; the risky auto-refuse-on-small-fraction variant and the fuzzy-matcher
+first-match bug are held for the backlog. All covered by network-free headless tests. Re-running the
+lunar-lander task to confirm the loop is gone and the step completes is the maintainer's to verify; it is
+not simulated here.
+
+Under that, **v0.0.30** (TUI: one live stream, cyberpunk) still stands.
 
 The two-pane TUI (a Conversation pane over an Activity pane — cramped and busy) is replaced by
 **one live scrolling stream**, modeled on OpenCode's single-stream layout and improved with

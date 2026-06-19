@@ -510,6 +510,7 @@ class Tools:
 
         # --- validate the WHOLE patch (compute Update results in memory) ---
         updated_text: dict[int, str] = {}
+        original_text: dict[int, str] = {}  # to detect no-op Updates (v0.0.31)
         try:
             for idx, sec in enumerate(sections):
                 if sec.op == "add":
@@ -521,14 +522,22 @@ class Tools:
                 elif sec.op == "update":
                     if not self.exists(sec.path):
                         raise PatchError(f'Update File "{sec.path}" does not exist')
-                    updated_text[idx] = _apply_hunks(self.read(sec.path), sec.hunks, sec.path)
+                    current = self.read(sec.path)
+                    original_text[idx] = current
+                    updated_text[idx] = _apply_hunks(current, sec.hunks, sec.path)
                     if sec.move_to and sec.move_to != sec.path and self.exists(sec.move_to):
                         raise PatchError(f'Move to "{sec.move_to}" already exists')
         except PatchError as exc:
             return f"apply_patch failed: {exc}"
 
         # --- apply (every check passed; no half-application possible now) ---
+        # A no-op Update -- the hunk LOCATED but produced content identical to the
+        # original, with no rename -- is NOT a real change. Writing it back and
+        # reporting "applied" would tell the hands the edit took when it did not,
+        # sending a capable model into a read->patch->re-read loop (v0.0.31). Skip
+        # such sections and report them honestly as "no change" instead.
         summary: list[str] = []
+        no_change: list[str] = []
         for idx, sec in enumerate(sections):
             if sec.op == "add":
                 target = self._resolve(sec.path)
@@ -540,16 +549,29 @@ class Tools:
                 self._resolve(sec.path).unlink()
                 summary.append(f"-{sec.path}")
             else:  # update (with optional rename)
+                is_move = bool(sec.move_to and sec.move_to != sec.path)
+                if updated_text[idx] == original_text[idx] and not is_move:
+                    no_change.append(sec.path)  # located, but changed nothing
+                    continue
                 dest = sec.move_to or sec.path
                 dest_target = self._resolve(dest)
                 dest_target.parent.mkdir(parents=True, exist_ok=True)
                 dest_target.write_text(updated_text[idx], encoding="utf-8")
-                if sec.move_to and sec.move_to != sec.path:
+                if is_move:
                     self._resolve(sec.path).unlink()
                     summary.append(f"~{dest} (renamed from {sec.path})")
                 else:
                     summary.append(f"~{sec.path}")
-        return "applied patch: " + ", ".join(summary)
+        if not summary:
+            # The WHOLE patch was a no-op: nothing on disk changed. Report a clear
+            # NON-success ("applied patch" prefix withheld) so the hands does not treat
+            # it as done and re-loop -- it must do something different.
+            targets = ", ".join(no_change) or "the target file(s)"
+            return f"apply_patch: no change -- {targets} already matches the patch"
+        out = "applied patch: " + ", ".join(summary)
+        if no_change:
+            out += " (no change: " + ", ".join(no_change) + ")"
+        return out
 
     def mkdir(self, path: str) -> str:
         """Create directory ``path`` and any parents, idempotently (cross-platform).

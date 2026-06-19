@@ -201,6 +201,87 @@ def test_apply_patch_invalidates_reads_so_a_second_blind_patch_refuses(tmp_path)
     assert "Refused: you must read" in guarded_execute_action(tools, second, reads)
 
 
+# --- v0.0.31: apply_patch no-op honesty (don't report "applied" for no change) ---
+
+
+def test_noop_patch_reports_no_change_not_applied(tmp_path):
+    """A context-only hunk LOCATES but changes nothing -- it must NOT report 'applied'
+    (which would send the hands into a read->patch->re-read loop), but 'no change'."""
+    (tmp_path / "app.py").write_text("alpha\n", encoding="utf-8")
+    tools = Tools(tmp_path)
+    reads: dict[str, str] = {}
+    record_read(tools, "app.py", reads)
+    action = Action(kind="apply_patch", content=_envelope(
+        "*** Update File: app.py",
+        "@@ alpha",
+        " alpha",          # leading space = context-only: no -/+ so nothing changes
+    ))
+    obs = guarded_execute_action(tools, action, reads)
+    assert not obs.startswith("applied patch")          # NOT treated as success
+    assert "no change" in obs
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "alpha\n"  # untouched
+
+
+def test_before_equals_after_hunk_is_a_noop(tmp_path):
+    """A -/+ pair whose removed line equals the added line is also a no-op."""
+    (tmp_path / "app.py").write_text("alpha\n", encoding="utf-8")
+    obs = Tools(tmp_path).apply_patch(_envelope(
+        "*** Update File: app.py", "@@ alpha", "-alpha", "+alpha",
+    ))
+    assert not obs.startswith("applied patch")
+    assert "no change" in obs
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "alpha\n"
+
+
+def test_real_patch_still_applies_after_the_noop_check(tmp_path):
+    """The no-op check must NOT alter a patch that genuinely changes the file."""
+    (tmp_path / "app.py").write_text("alpha\n", encoding="utf-8")
+    obs = Tools(tmp_path).apply_patch(_envelope(
+        "*** Update File: app.py", "@@ alpha", "-alpha", "+beta",
+    ))
+    assert obs == "applied patch: ~app.py"
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "beta\n"
+
+
+def test_mixed_patch_applies_the_real_section_and_flags_the_noop(tmp_path):
+    """A patch with one real Update and one no-op Update: report the real change as
+    applied AND be honest that the other section changed nothing."""
+    (tmp_path / "a.py").write_text("alpha\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("beta\n", encoding="utf-8")
+    obs = Tools(tmp_path).apply_patch(_envelope(
+        "*** Update File: a.py",
+        "@@ alpha",
+        "-alpha",
+        "+ALPHA",
+        "*** Update File: b.py",
+        "@@ beta",
+        " beta",            # context-only: no change to b.py
+    ))
+    assert obs.startswith("applied patch")
+    assert "~a.py" in obs
+    assert "no change" in obs and "b.py" in obs
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "ALPHA\n"
+    assert (tmp_path / "b.py").read_text(encoding="utf-8") == "beta\n"  # untouched
+
+
+def test_noop_patch_leaves_the_recorded_read_valid(tmp_path):
+    """A no-op changed nothing, so the recorded read stays current -- a real follow-up
+    patch applies without a needless re-read (the guard was not invalidated)."""
+    (tmp_path / "app.py").write_text("alpha\n", encoding="utf-8")
+    tools = Tools(tmp_path)
+    reads: dict[str, str] = {}
+    record_read(tools, "app.py", reads)
+    noop = Action(kind="apply_patch", content=_envelope(
+        "*** Update File: app.py", "@@ alpha", " alpha",
+    ))
+    guarded_execute_action(tools, noop, reads)
+    real = Action(kind="apply_patch", content=_envelope(
+        "*** Update File: app.py", "@@ alpha", "-alpha", "+omega",
+    ))
+    assert guarded_execute_action(tools, real, reads).startswith("applied patch")
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "omega\n"
+
+
 # --- end-to-end through run_planned -----------------------------------------
 
 

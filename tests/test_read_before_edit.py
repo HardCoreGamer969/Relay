@@ -249,6 +249,15 @@ def test_executor_prompt_has_read_before_edit_guidance():
     assert "Before editing an existing file" in text
 
 
+def test_executor_prompt_steers_whole_file_write_vs_apply_patch():
+    """v0.0.31: the hands is told write/edit replace the WHOLE file (a fragment destroys
+    it) and to use apply_patch to MODIFY part of an existing file."""
+    text = " ".join(EXECUTOR_SYSTEM_PROMPT.split())
+    assert "REPLACE THE WHOLE FILE" in text
+    assert "DELETES the rest of the file" in text
+    assert "To MODIFY part of an existing file" in text and "apply_patch" in text
+
+
 def test_executor_prompt_advertises_the_new_tools():
     """The hands must be told about write/glob/apply_patch/webfetch and that the
     read-first rule extends to existing-file write + apply_patch Update sections."""

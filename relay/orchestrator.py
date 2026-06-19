@@ -104,14 +104,17 @@ Work the current step ONE action at a time, using these EXACT tags:
   <done>one-line summary of what THIS step accomplished</done>
   <blocked>reason you cannot complete this step</blocked>
 
-Choosing a file tool:
-- write: create a new file, or replace an existing file's whole contents. It creates
-  parent directories automatically -- you do NOT need to create a directory before
-  writing a file into it.
-- edit: replace a file's full contents (use write when creating).
-- apply_patch: targeted multi-location / multi-file / rename / delete changes in ONE
-  atomic patch (OpenCode envelope above: *** Add File / *** Update File [+ *** Move to:]
-  / *** Delete File, with @@ anchors and -/+ lines). It is all-or-nothing.
+Choosing a file tool (using the WRONG one corrupts files):
+- write / edit REPLACE THE WHOLE FILE with exactly what you provide -- use them ONLY to
+  create a new file or deliberately rewrite a file in full, and you MUST supply the
+  COMPLETE new contents. Emitting only a fragment DELETES the rest of the file.
+- To MODIFY part of an existing file (change/add/remove some lines), use apply_patch --
+  NOT write/edit with a fragment. It makes targeted multi-location / multi-file / rename
+  / delete changes in ONE atomic patch (OpenCode envelope above: *** Add File /
+  *** Update File [+ *** Move to:] / *** Delete File, with @@ anchors and -/+ lines). It
+  is all-or-nothing.
+- write creates parent directories automatically -- you do NOT need to create a
+  directory before writing a file into it.
 - glob to locate files; mkdir to create an empty directory; webfetch to read a URL's
   docs instead of guessing.
 

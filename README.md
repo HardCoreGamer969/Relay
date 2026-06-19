@@ -46,7 +46,28 @@ separately — the seed of the later model bake-off. Run the single-model loop
 instead with `relay run --solo hands`, or preview a plan before any writes with
 `--confirm-plan`.
 
-## Status — v0.0.29 (three-pool memory: brain / hands / shared — Stage 1)
+## Status — v0.0.30 (TUI: one live stream, cyberpunk)
+
+The two-pane TUI (a Conversation pane over an Activity pane — cramped and busy) is replaced by
+**one live scrolling stream**, modeled on OpenCode's single-stream layout and improved with
+Relay's brain/hands/findings distinction. Everything interleaves in the order it happens:
+conversation (**you** / **brain**), the **plan rendered inline and live** (steps update **in
+place** — ◉ done / ◍ active with a spinner / ○ pending), **tool calls** as compact `▸` lines,
+**findings** (the v0.0.29 `<finding>` channel) as green lines, and review **verdicts**.
+**brain = magenta, hands = cyan, findings = green, you = bright magenta.** The status line shows
+a breathing mode LED (WORKING / AWAITING YOU) · step N/M · cost · cwd · queue — and the v0.0.28
+**queue** is now visible (a queued count surfaced inline as items are added / consumed).
+Cyberpunk is the **palette + activity-only spinners / LED only** — no CRT, scanlines, glow, or
+ambient motion (it's a tool; motion happens only where there is activity). The splash screen and
+the de-robotified voice ("what's next?") stay.
+
+This is a **display-only** overhaul: **no engine / orchestrator / bridge behavior changed** — it
+only surfaces state Relay already emits (including the v0.0.28 queue), and the brain↔hands split
+is still recorded for tests + the `/log` bundle. The live feel (watching the stream flow, the
+plan update in place, the spinner on active work) is the maintainer's to verify; the headless
+tests pin the deterministic render path.
+
+Under that, **v0.0.29** (three-pool memory: brain / hands / shared — Stage 1) still stands.
 
 Relay's within-run memory was a **single pool, budgeted to the brain's context window, that
 only the brain read** — the hands saw no memory at all. v0.0.29 splits it into **three pools**,

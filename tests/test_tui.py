@@ -145,7 +145,7 @@ def test_launch_goes_straight_to_an_empty_chat_with_the_model_indicator(tmp_path
             # Model indicator visible from launch, BEFORE any message.
             assert "vendor/brain" in app._status_text
             assert "vendor/hands" in app._status_text
-            assert "[idle]" in app._status_text
+            assert "AWAITING YOU" in app._status_text  # idle mode word (v0.0.30 status line)
             assert app._router.state is InputState.IDLE
             assert app._runner is None  # no landing screen, no auto-started run
             assert app._conversation_lines == []
@@ -201,7 +201,7 @@ def test_full_loop_in_the_tui_one_box_one_thread(tmp_path):
                 line.startswith("brain | ") or line.startswith("hands | ")
                 for line in app._conversation_lines
             )
-            assert "[idle]" in app._status_text
+            assert "AWAITING YOU" in app._status_text  # idle mode word (v0.0.30 status line)
 
     asyncio.run(main())
 

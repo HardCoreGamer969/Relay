@@ -1,4 +1,4 @@
-"""The Relay TUI: a welcome screen + a two-pane chat over the v0.0.11 bridge.
+"""The Relay TUI: a welcome screen + a single live stream over the v0.0.11 bridge.
 
 The TUI is JUST ANOTHER RENDERER. The engine already emits events
 (``on_event``) and asks through blocking callbacks (``user_turn``,
@@ -16,11 +16,15 @@ Two states:
 
 - **Welcome** (no work yet): a composed, centered screen -- the letterspaced
   ``RELAY`` wordmark hero, a rotating greeting, the brain/hands pairing promoted
-  as identity, and a dim hint. The working panes are NOT shown here.
-- **Working** (after the first goal): the Conversation pane (the transcript
-  thread -- the star) over the Activity pane (the noisy event firehose, kept
-  OUT of the conversation), a status/model line, and the input box. The first
-  submit hands off from welcome to working (see :mod:`relay.tui` animations).
+  as identity, and a dim hint. The stream is NOT shown here.
+- **Working** (after the first goal): ONE live scrolling stream (v0.0.30,
+  replacing the old two-pane Conversation/Activity split) interleaving -- in the
+  order they happen -- the conversation (you/brain), the inline live plan (steps
+  that update IN PLACE: done/active/pending with a spinner on the active one),
+  tool calls, findings (a green hands->brain channel), and review verdicts; below
+  it a status line (a breathing mode LED, step N/M, cost, cwd, queue) and the
+  input box. brain = magenta, hands = cyan, findings = green. The first submit
+  hands off from welcome to working (see :mod:`relay.tui` animations).
 
 The conversation render path is UNICODE-CLEAN: turn text is never ASCII-
 sanitized here (the recurring cp1252 hazard belongs to the legacy console, not
@@ -46,7 +50,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Container, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Input, Label, RichLog, Select, Static
+from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
 from relay.bridge import (
     ACTION_ANSWER,
@@ -94,17 +98,6 @@ _SYNC_INTERVAL_S = 0.2
 # Bounded wait when joining the worker on quit -- never hang the exit.
 _JOIN_TIMEOUT_S = 5.0
 
-# Human labels for the status line, per input state.
-_STATE_HINTS = {
-    InputState.IDLE: "type a goal to start",
-    InputState.PLANNING: "planning... (esc to cancel)",
-    InputState.EXECUTING: "executing... (esc to cancel)",
-    InputState.AWAITING_REACTION: "react to the plan (approve to build it)",
-    InputState.AWAITING_DECISION: "the agent needs your decision",
-    InputState.AWAITING_APPROVAL: "approve the command? (yes/no)",
-    InputState.INTERRUPTED: "interrupted -- type to redirect, esc again to stop",
-}
-
 # The rotating welcome greetings -- one shown per launch. Warmer than "Goal:";
 # productive, inviting, a little character. Edit freely.
 GREETINGS = (
@@ -121,11 +114,11 @@ GREETINGS = (
 # as GREETINGS, but kept DISJOINT from it so the box never echoes the greeting
 # shown right above it (a guarantee, not a coincidence -- see the test).
 INPUT_PLACEHOLDERS = (
-    "Describe the goal...",
-    "What are we making?",
-    "What needs doing?",
-    "Name the task...",
-    "What's the goal?",
+    "what's next?",
+    "what are we building?",
+    "what should we tackle?",
+    "what needs doing?",
+    "point me at something...",
 )
 
 # The states where the engine is ACTIVELY generating (the model is genuinely
@@ -342,7 +335,35 @@ ACTOR_BRAIN = "brain"
 ACTOR_HANDS = "hands"
 ACTOR_YOU = "you"
 
-_ACTOR_STYLES = {ACTOR_BRAIN: "magenta", ACTOR_HANDS: "green", ACTOR_YOU: "bold cyan"}
+# -- the cyberpunk palette (v0.0.30): the single source of truth for the stream's
+# styling, mirroring the agreed mockup. Near-black background, neon accents.
+# Relay's improvement over a single-agent stream is the brain/hands/findings split:
+#   brain = magenta, hands = cyan, findings = green, you = bright magenta;
+#   cost = amber, done = green, active = cyan. Cyberpunk == palette + activity-only
+#   spinners/LED ONLY -- no CRT/scanlines/glow/ambient motion (it's a tool).
+C_BG = "#06090e"
+C_PANEL = "#080d14"
+C_CYAN = "#34d9ee"
+C_MAGENTA = "#e879f9"
+C_GREEN = "#3ee48b"
+C_AMBER = "#ffcf4d"
+C_RED = "#ff6b6b"
+C_TXT = "#d3e3ef"
+C_MUTED = "#8aa0b3"
+C_DIM = "#5a7187"
+
+# Speaker -> gutter style for the stream (Relay's brain/hands/you distinction).
+_ACTOR_STYLES = {ACTOR_BRAIN: C_MAGENTA, ACTOR_HANDS: C_CYAN, ACTOR_YOU: f"bold {C_MAGENTA}"}
+
+# The active-step / running spinner (a clean spinner, from the mockup) + plan icons.
+# Motion happens ONLY on the active plan step + the mode LED (activity-only).
+_SPINNER_FRAMES = ("◍", "◐", "◎", "◑")  # ◍ ◐ ◎ ◑
+# Plan-step icons. The "active" step animates through _SPINNER_FRAMES while running;
+# its entry here is the RESTING icon shown when motion is off ("off" anim mode, or a
+# settled/halted run) -- keep it equal to _SPINNER_FRAMES[0] so the two never diverge.
+_PLAN_ICON = {"done": "◉", "active": "◍", "pending": "○", "failed": "✗"}
+_SPIN_INTERVAL_S = 0.15   # active-step spinner cadence
+_LED_INTERVAL_S = 0.7     # the mode LED's slow "breathing" cadence
 
 
 def describe_event_for_activity(event: Event) -> tuple[str | None, str]:
@@ -1102,18 +1123,18 @@ COMMANDS: list[Command] = [
             run=lambda app: app._cmd_cost()),
     Command("log", "Log", "Export a debug log (.md) to share when reporting an issue", "ops",
             run=lambda app: app._cmd_log()),
-    Command("clear", "Clear", "Clear the conversation + activity panes", "ops",
+    Command("clear", "Clear", "Clear the stream + start a fresh session", "ops",
             run=lambda app: app._cmd_clear(), enabled=lambda app: not _run_active(app)),
 ]
 
 
 class RelayTuiApp(App):
-    """A welcome screen that hands off to a two-pane chat over the engine."""
+    """A welcome screen that hands off to a single live stream chat over the engine."""
 
     TITLE = "Relay"
 
     CSS = """
-    Screen { layout: vertical; }
+    Screen { layout: vertical; background: #06090e; }
 
     /* -- the welcome state (shown first; hidden once work begins) -- */
     #welcome { height: 1fr; align: center middle; }
@@ -1129,20 +1150,16 @@ class RelayTuiApp(App):
     #indicator { width: auto; content-align: center middle; color: $text-muted; margin-top: 1; }
     #hint { width: auto; content-align: center middle; color: $text-muted; text-style: dim; margin-top: 1; }
 
-    /* -- the working state (hidden until the first goal) -- */
+    /* -- the working state: ONE live scrolling stream (v0.0.30) -- */
     #working { height: 1fr; layout: vertical; display: none; }
-    #conversation {
-        height: 2fr;
-        border: round $primary;
-        padding: 0 1;
-    }
-    #activity {
+    #stream {
         height: 1fr;
-        border: round $secondary;
         padding: 0 1;
-        color: $text-muted;
+        background: #06090e;
     }
-    #status { height: 1; padding: 0 1; background: $surface; }
+    #stream .plan { margin: 1 0 1 0; padding: 0 0 0 2; }
+    #stream .stream-row { width: 1fr; }
+    #status { height: 1; padding: 0 1; background: #080d14; }
 
     /* -- the slash-command popover (shown only while typing a /command) -- */
     #command-popover {
@@ -1241,6 +1258,21 @@ class RelayTuiApp(App):
         self._activity_lines: list[str] = []
         self._status_text = ""
         self._seen_turn_ids: set[str] = set()
+        # v0.0.30 single-stream presentation state (pure render layer -- no engine
+        # change). The live plan renders as ONE mounted block updated IN PLACE; the
+        # active step + mode LED are the ONLY motion (activity-only, gated off in
+        # "off" anim mode).
+        self._plan_steps: list[dict] = []   # [{"instruction", "status"}], the live plan
+        self._plan_block = None             # the mounted plan widget (updated in place)
+        # The rendered stream rows (Rich Text / str), in order -- the headless mirror
+        # of what the single stream shows (so tests can pin speaker/finding styling
+        # without depending on Textual widget internals). The live plan block updates
+        # in place and is NOT in here (its state is _plan_steps).
+        self._stream_rendered: list = []
+        self._spin_frame = 0                # active-step spinner frame
+        self._spin_timer = None             # active while a step is executing
+        self._led_on = True                 # the mode LED's breathing phase
+        self._led_timer = None
 
     # -- layout ---------------------------------------------------------------
 
@@ -1252,12 +1284,10 @@ class RelayTuiApp(App):
                 yield Static(self._indicator_text, id="indicator")
                 yield Static("esc to cancel  ·  ctrl+q to quit", id="hint")
         with Container(id="working"):
-            conversation = RichLog(id="conversation", wrap=True, markup=False, highlight=False)
-            conversation.border_title = "Conversation"
-            yield conversation
-            activity = RichLog(id="activity", wrap=True, markup=False, highlight=False)
-            activity.border_title = "Activity"
-            yield activity
+            # ONE live scrolling stream: conversation, the inline live plan, tool
+            # calls, findings, and verdicts all interleaved in the order they happen
+            # (the v0.0.30 replacement for the old Conversation/Activity two-pane).
+            yield VerticalScroll(id="stream")
             yield Static(id="status")
         yield Static(id="command-popover")
         yield PromptInput(id="prompt", placeholder=self._placeholder)
@@ -1268,6 +1298,10 @@ class RelayTuiApp(App):
         self._update_status()
         self.query_one("#prompt", Input).focus()
         self.set_interval(_SYNC_INTERVAL_S, self._sync_transcript)
+        # The mode LED breathes (the ONE sanctioned always-on motion); "off" mode is
+        # fully motionless (no timer), consistent with the glitch animator's "off".
+        if self._anim_mode != "off":
+            self._led_timer = self.set_interval(_LED_INTERVAL_S, self._led_tick)
         self._play_startup()
         # Graceful first-run: if there's no usable config (no working role+key from
         # env OR config/auth), guide the user into setup rather than letting them
@@ -1512,6 +1546,7 @@ class RelayTuiApp(App):
         self._cost_pulse = False
         self._stopping = False
         self._interrupting = False
+        self._reset_plan()  # a new goal -> a fresh live plan (prior plan stays in scroll-back)
         # The transcript is SESSION-owned and accumulates across runs (its turn ids are
         # unique forever), so we do NOT clear _seen_turn_ids here -- only /clear does.
         self._session.goal = goal
@@ -1561,6 +1596,7 @@ class RelayTuiApp(App):
         self._cost_pulse = False
         self._stopping = False
         self._interrupting = False
+        self._reset_plan()  # the continuation replan emits a fresh plan to render
         self._session.history.add(steer)
         self._write_conversation(f"you (steer): {steer}")
         self._router.begin_run()
@@ -1599,11 +1635,11 @@ class RelayTuiApp(App):
         self._router.on_request(request)
         self._sync_transcript()
         # A REACTION ask is the proposal: its full numbered plan is NOT dumped into
-        # the conversation -- that pane keeps only the human story (the headline
-        # turn + the surfaced assumptions, both rendered from the plan_proposed
-        # event via _render_plan_split); the full steps live in Activity. Other
-        # asks (decision/approval) still surface their prompt when it adds detail
-        # beyond the last transcript turn (e.g. the approval command).
+        # the conversation -- the stream keeps the human story (the headline turn +
+        # the surfaced assumptions, from the plan_proposed event via
+        # _render_plan_split_buffer) while the numbered steps render as the inline
+        # live PLAN block. Other asks (decision/approval) still surface their prompt
+        # when it adds detail beyond the last transcript turn (e.g. the approval command).
         if request.kind != REQUEST_REACTION:
             last_turn_text = self._last_synced_turn_text()
             if request.prompt.strip() != (last_turn_text or "").strip():
@@ -1612,47 +1648,81 @@ class RelayTuiApp(App):
         self._update_status()
 
     def _handle_event(self, event: Event) -> None:
-        """One engine event: phase changes steer the router; the rest stream into
-        the Activity pane as an attributed brain<->hands feed.
+        """One engine event: phase changes steer the router; everything else renders
+        INLINE in the single live stream (conversation, the live plan, tool calls,
+        findings, verdicts), interleaved in the order it happens.
 
         Everything shown here is read from the event the engine ALREADY emitted --
         the render path makes no model call (proven by the zero-new-tokens guard).
         """
         if event.kind == EVENT_PHASE:
-            # Internal routing only -- not surfaced as a feed line.
+            # Internal routing only -- not surfaced as a stream line.
             self._router.set_phase(event.payload.get("phase", ""))
         else:
-            actor, line = describe_event_for_activity(event)
-            if line:
-                self._write_activity(line, actor=actor)
-            # The hands' raw output is already captured on exec_action -- show a
-            # snippet so the gears are visible (no generation to obtain it).
-            if event.kind == "exec_action":
-                observation = " ".join((event.payload.get("observation") or "").split())
-                if observation:
-                    self._write_activity(f"    {observation[:200]}", dim=True)
-            self._render_plan_split(event)
+            self._render_event(event)
         self._sync_transcript()
         self._refresh_cost()  # live per-goal cost off the run's ledger (no model call)
         self._update_status()
 
-    def _render_plan_split(self, event: Event) -> None:
-        """Dual-fidelity split, rendered from data the engine ALREADY emitted:
+    # Event kinds that get a BESPOKE inline form in the stream (the live plan, tool
+    # calls, findings, verdicts), so they are NOT also rendered as a generic speaker
+    # row. Their attributed buffer line is still recorded (tests/debug-log contract).
+    _SPECIAL_EVENTS = frozenset({
+        "plan_proposed", "plan_created", "plan_revised", "replanned",
+        "step_start", "step_done", "step_failed", "step_reviewed",
+        "exec_action", "hands_finding",
+    })
 
-        - numbered executor **steps** -> Activity (the "what's actually being
-          built" detail);
-        - surfaced **assumptions** (the ``<assume>`` items) -> Conversation (what a
-          human reacts to and can judge).
-
-        The headline is the transcript proposal turn (rendered by the sync pass).
-        Nothing is regenerated or re-summarized -- both lists come straight off the
-        plan_proposed / plan_revised event payload.
-        """
+    def _render_event(self, event: Event) -> None:
+        """Record the event into the activity/conversation BUFFERS (unchanged
+        strings -- the test/debug contract) AND render its inline stream FORM."""
+        kind = event.kind
         payload = event.payload or {}
+        actor, line = describe_event_for_activity(event)
+
+        # 1) Buffers: the attributed feed line. Special kinds record buffer-only (their
+        #    visual is the bespoke inline form below); the rest get a generic stream row.
+        if line:
+            if kind in self._SPECIAL_EVENTS:
+                self._record_activity(actor, line)
+            else:
+                self._write_activity(line, actor=actor)
+        if kind == "exec_action":
+            observation = " ".join((payload.get("observation") or "").split())
+            if observation:
+                self._record_activity(None, f"    {observation[:200]}")
+        self._render_plan_split_buffer(payload)
+
+        # 2) The inline stream forms (the v0.0.30 visual): the live plan updates IN
+        #    PLACE; tool calls / findings / verdicts render as compact stream lines.
+        if kind in ("plan_proposed", "plan_created", "plan_revised", "replanned"):
+            steps = payload.get("steps")
+            if isinstance(steps, list) and steps:
+                self._plan_set([str(s) for s in steps],
+                               revised=kind in ("plan_revised", "replanned"))
+        elif kind == "step_start":
+            self._plan_mark(payload.get("index"), "active")
+        elif kind == "step_done":
+            self._plan_mark(payload.get("index"), "done")
+        elif kind == "step_failed":
+            self._plan_mark(payload.get("index"), "failed")
+        elif kind == "step_reviewed":
+            self._stream_verdict(payload.get("index"), str(payload.get("verdict", "")))
+        elif kind == "exec_action":
+            self._stream_tool(line, " ".join((payload.get("observation") or "").split()))
+        elif kind == "hands_finding":
+            self._stream_finding(str(payload.get("finding", line)))
+
+    def _render_plan_split_buffer(self, payload: dict) -> None:
+        """The dual-fidelity split, BUFFER side (unchanged from v0.0.15): numbered
+        executor **steps** -> the activity buffer; surfaced **assumptions** (the
+        ``<assume>`` items) -> the conversation (buffer + a brain stream row). The
+        live plan WIDGET is built separately (``_plan_set``); this only keeps the
+        record the tests + the /log debug bundle assert on. Nothing is regenerated."""
         steps = payload.get("steps")
         if isinstance(steps, list) and steps:
             for i, step in enumerate(steps, 1):
-                self._write_activity(f"    {i}. {step}", dim=True)
+                self._record_activity(None, f"    {i}. {step}")
         assumptions = payload.get("assumptions")
         if isinstance(assumptions, list) and assumptions:
             for assumption in assumptions:
@@ -1660,6 +1730,12 @@ class RelayTuiApp(App):
 
     def _handle_finished(self, outcome: RunOutcome) -> None:
         self._sync_transcript()  # the result turn is in the transcript by now
+        # The run has ended: settle the live plan so NO motion continues while the
+        # engine is idle/awaiting you. A run that halted mid-step (esc-interrupt,
+        # error, escalation limit, ...) leaves a step "active"; stop its spinner and
+        # demote it to pending so the block shows a static resting state (every
+        # terminal branch below flows through here, incl. the interrupt fork).
+        self._settle_plan()
         cost = self._runner.ledger.total_cost() if self._runner is not None else None
         cost_note = "" if cost is None else f" (cost ${cost:.4f})"
         self._write_activity(f"[finished] {outcome.status}{cost_note}")
@@ -1791,51 +1867,294 @@ class RelayTuiApp(App):
 
     # -- widget writes (the render path; buffers mirror the widgets for tests) --
 
+    # The two logical buffers (_conversation_lines / _activity_lines) stay DISTINCT
+    # -- the engine's brain<->hands split is still recorded for tests + the /log
+    # bundle -- but both feed the ONE stream widget (interleaved in call order), so
+    # there is no second pane. Untrusted content (tool output, model text) is built
+    # via ``Text.append`` so it is never parsed as console markup.
+
+    def _stream(self):
+        """The stream container (None when not mounted -- logic-only construction)."""
+        try:
+            return self.query_one("#stream", VerticalScroll)
+        except Exception:  # noqa: BLE001 -- not mounted
+            return None
+
+    def _mount_stream(self, widget) -> None:
+        """Mount one row/widget into the stream and keep it pinned to the live edge."""
+        stream = self._stream()
+        if stream is None:
+            return
+        try:
+            stream.mount(widget)
+            stream.scroll_end(animate=False)
+        except Exception:  # noqa: BLE001 -- teardown race; the buffer already has it
+            pass
+
+    def _push_row(self, renderable, *, classes: str = "stream-row") -> None:
+        """Record a stream row (the headless mirror) and mount it into the stream."""
+        self._stream_rendered.append(renderable)
+        self._mount_stream(Static(renderable, classes=classes))
+
+    def _row(self, gutter: str, body: str, *, gutter_style: str = "", body_style: str = "") -> None:
+        """Build + push one labeled stream row (the mockup's gutter + body line)."""
+        text = Text()
+        text.append(f"{gutter:<6}" if gutter else " " * 6, style=gutter_style or C_DIM)
+        text.append(body, style=body_style or C_TXT)
+        self._push_row(text)
+
+    def _record_activity(self, actor: str | None, line: str) -> None:
+        """Append to the activity BUFFER only (the test/debug record) -- no stream row.
+        Used for the bespoke-form events + the dim detail lines, so the stream shows
+        their inline form (or nothing) rather than a duplicate generic row."""
+        self._activity_lines.append(f"{actor} | {line}" if actor else line)
+
     def _write_conversation(self, line: str) -> None:
+        """Record a conversation line (buffer) and render it as a stream row, colored
+        by speaker (you = bright magenta, brain = magenta, system = muted)."""
         self._conversation_lines.append(line)
-        self.query_one("#conversation", RichLog).write(line)
+        if not line.strip():
+            self._push_row("")  # a blank spacer between runs
+            return
+        head = line.split(None, 1)[0]
+        rest = line.split(None, 1)[1] if " " in line else ""
+        if head == "you":
+            self._row("you", rest, gutter_style=f"bold {C_MAGENTA}", body_style=C_TXT)
+        elif head == "brain":
+            self._row("brain", rest, gutter_style=C_MAGENTA, body_style=C_TXT)
+        else:
+            self._row("", line, body_style=C_MUTED)  # system / result / notice lines
 
     def _write_activity(self, line: str, *, actor: str | None = None, dim: bool = False) -> None:
-        """Append one activity line. ``actor`` (brain/hands/you) prefixes a colored
-        tag so the feed reads as a dialogue; ``dim`` styles detail lines.
+        """Record an activity line (buffer) and render it inline in the stream.
 
-        The buffer keeps a plain tagged string (what tests assert on); the widget
-        gets a pre-styled ``Text`` -- built via ``Text.append`` so untrusted content
-        (tool output, model text) is never parsed as console markup.
-        """
-        self._activity_lines.append(f"{actor} | {line}" if actor else line)
-        text = Text()
+        ``actor`` (brain/hands/you) renders a colored speaker row; an actor-less line
+        is a muted (or dim) system note. Event-driven detail lines are recorded via
+        :meth:`_record_activity` instead, so they never double-render in the stream."""
+        self._record_activity(actor, line)
         if actor:
-            text.append(actor, style=_ACTOR_STYLES.get(actor, ""))
-            text.append(" | ", style="dim")
-        text.append(line, style="dim" if dim else "")
-        self.query_one("#activity", RichLog).write(text)
+            self._row(actor, line, gutter_style=_ACTOR_STYLES.get(actor, ""),
+                      body_style=C_MUTED if actor == ACTOR_HANDS else C_TXT)
+        else:
+            self._row("", line, body_style=C_DIM if dim else C_MUTED)
+
+    # -- the inline forms: tool calls, findings, verdicts (hands acting) --------
+
+    def _stream_tool(self, label: str, result: str = "") -> None:
+        """A compact tool-call stream line: ``▸ read cli.py · 78 lines``."""
+        text = Text()
+        text.append("  ▸ ", style=C_CYAN)
+        text.append(label, style=C_MUTED)
+        if result:
+            text.append(f"  · {result[:60]}", style=C_DIM)
+        self._push_row(text)
+
+    def _stream_finding(self, note: str) -> None:
+        """A finding (v0.0.29 hands->brain channel) renders as a distinct GREEN line."""
+        text = Text()
+        text.append("  ⚠ finding", style=f"bold {C_GREEN}")
+        text.append(f" → {note}", style=C_MUTED)
+        self._push_row(text)
+
+    def _stream_verdict(self, index, verdict: str) -> None:
+        """A compact review verdict line: ``review ✓ accept · step 04``."""
+        accepted = "accept" in (verdict or "").lower()
+        text = Text()
+        text.append("  review ", style=C_DIM)
+        text.append(f"{'✓' if accepted else '•'} {verdict}", style=C_GREEN if accepted else C_AMBER)
+        try:
+            text.append(f"  · step {int(index) + 1:02d}", style=C_DIM)
+        except (TypeError, ValueError):
+            pass
+        self._push_row(text)
+
+    # -- the inline LIVE plan: ONE block, updated IN PLACE -----------------------
+
+    def _plan_set(self, steps: list[str], *, revised: bool = False) -> None:
+        """(Re)build the live plan from an emitted step list and mount/refresh its
+        block. The initial plan starts every step pending; a revision keeps already-
+        settled steps and replaces the pending tail with the new pending steps."""
+        if revised and self._plan_steps:
+            kept = [s for s in self._plan_steps if s["status"] != "pending"]
+            self._plan_steps = kept + [{"instruction": s, "status": "pending"} for s in steps]
+        else:
+            self._plan_steps = [{"instruction": s, "status": "pending"} for s in steps]
+            self._plan_block = None  # a fresh plan -> a fresh block (prior plan stays in scroll-back)
+        if self._plan_block is None:
+            self._plan_block = Static(classes="plan")
+            self._mount_stream(self._plan_block)
+        self._plan_render()
+
+    def _plan_mark(self, index, status: str) -> None:
+        """Mark the step at ``index`` (0-based engine index == list position) in place."""
+        if index is None:
+            return
+        try:
+            self._plan_steps[int(index)]["status"] = status
+        except (IndexError, TypeError, ValueError):
+            return
+        if status == "active":
+            self._start_spin()
+        self._plan_render()
+
+    def _plan_render(self) -> None:
+        """Render the live plan block from its step states: ◉ done (dim) / ◍ active
+        (spinner, bright) / ○ pending (dimmer). Updates the SAME widget in place."""
+        block = self._plan_block
+        if block is None:
+            return
+        total = len(self._plan_steps)
+        text = Text()
+        text.append(f"plan · {total} step{'s' if total != 1 else ''}", style=C_DIM)
+        for i, step in enumerate(self._plan_steps):
+            status = step["status"]
+            icon = (_SPINNER_FRAMES[self._spin_frame % len(_SPINNER_FRAMES)]
+                    if status == "active" else _PLAN_ICON.get(status, "○"))
+            icon_style = {"done": C_GREEN, "active": C_CYAN, "failed": C_RED}.get(status, C_DIM)
+            body_style = {"active": f"bold {C_TXT}", "done": C_MUTED}.get(status, C_DIM)
+            text.append("\n")
+            text.append(f"{icon} ", style=icon_style)
+            text.append(f"{i + 1:02d} ", style=C_DIM)
+            text.append(step["instruction"], style=body_style)
+        try:
+            block.update(text)
+        except Exception:  # noqa: BLE001 -- teardown race
+            pass
+        if not any(s["status"] == "active" for s in self._plan_steps):
+            self._stop_spin()
+
+    def _reset_plan(self) -> None:
+        """Drop the live-plan state (a new goal starts a fresh plan; prior plans stay
+        frozen in scroll-back). Stops the active-step spinner."""
+        self._plan_steps = []
+        self._plan_block = None
+        self._stop_spin()
+
+    def _settle_plan(self) -> None:
+        """The run ended: stop the active-step spinner and demote any still-active step
+        to pending (it never settled), so the plan block rests on a static icon and no
+        motion continues while the engine is idle. Keeps the plan in scroll-back (unlike
+        :meth:`_reset_plan`, which is for a NEW goal)."""
+        demoted = False
+        for step in self._plan_steps:
+            if step["status"] == "active":
+                step["status"] = "pending"
+                demoted = True
+        self._stop_spin()
+        if demoted:
+            self._plan_render()
+
+    # -- activity-only motion: the active-step spinner + the mode LED ------------
+
+    def _start_spin(self) -> None:
+        """Start the active-step spinner (off entirely in "off" anim mode)."""
+        if self._anim_mode == "off" or self._spin_timer is not None:
+            return
+        try:
+            self._spin_timer = self.set_interval(_SPIN_INTERVAL_S, self._spin_tick)
+        except Exception:  # noqa: BLE001 -- not mounted (logic-only use)
+            self._spin_timer = None
+
+    def _spin_tick(self) -> None:
+        if self._quitting:
+            self._stop_spin()
+            return
+        self._spin_frame += 1
+        self._plan_render()
+
+    def _stop_spin(self) -> None:
+        timer = self._spin_timer
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:  # noqa: BLE001 -- already stopped/torn down
+                pass
+            self._spin_timer = None
+
+    def _led_tick(self) -> None:
+        """Toggle the breathing mode LED and re-render the status line."""
+        if self._quitting:
+            return
+        self._led_on = not self._led_on
+        self._update_status()
+
+    def _mode_word(self, state) -> str:
+        """The status-line MODE word: WORKING while the engine generates, INTERRUPTED
+        at the interrupt prompt, AWAITING YOU when it is the user's turn (idle or an
+        awaiting-reaction/decision/approval ask)."""
+        if state is InputState.INTERRUPTED:
+            return "INTERRUPTED"
+        if state in (InputState.PLANNING, InputState.EXECUTING):
+            return "WORKING"
+        return "AWAITING YOU"
+
+    def _step_segment(self) -> str:
+        """``step N/M`` from the live plan (active step, else settled count); '' if no plan."""
+        total = len(self._plan_steps)
+        if not total:
+            return ""
+        active = next((i for i, s in enumerate(self._plan_steps) if s["status"] == "active"), None)
+        if active is not None:
+            n = active + 1
+        else:
+            n = sum(1 for s in self._plan_steps if s["status"] in ("done", "failed"))
+        return f"step {n}/{total}"
 
     def _update_status(self) -> None:
+        """The status line: a breathing mode LED + WORKING/AWAITING YOU · step N/M ·
+        cost (amber) · cwd (cyan) · the model pairing (dim) · queue (magenta), with a
+        right hint. The plain ``_status_text`` mirror carries the same facts (what the
+        headless tests assert on); the widget gets the styled render."""
         state = self._router.state
-        hint = _STATE_HINTS.get(state, "")
-        base = (
-            f"[{state.value}] {hint}  |  "
-            f"brain={self._models.brain}  hands={self._models.hands}"
-        )
-        cwd = self._cwd_segment()
-        if cwd:
-            base = f"{base}  |  {cwd}"
-        if self._session.queue:  # minimal interim queue affordance (overhaul deferred)
-            base = f"{base}  |  queued: {len(self._session.queue)}"
+        mode = self._mode_word(state)
+        step = self._step_segment()
         cost = self._cost_segment()
-        # The plain buffer is what headless tests assert on; the widget gets a styled
-        # render so the cost segment can stand out (and pulse on a change in v0.0.20).
-        self._status_text = f"{base}  |  {cost}" if cost else base
-        text = Text(base)
+        cwd = self._cwd_segment()
+        queued = f"queued: {len(self._session.queue)}" if self._session.queue else ""
+
+        segs = [mode]
+        for seg in (step, cost, cwd):
+            if seg:
+                segs.append(seg)
+        segs.append(f"brain {self._models.brain}")
+        segs.append(f"hands {self._models.hands}")
+        if queued:
+            segs.append(queued)
+        self._status_text = "  ·  ".join(segs)
+
+        working = mode == "WORKING"
+        led_color = C_GREEN if working else C_MAGENTA
+        text = Text()
+        text.append("● " if self._led_on else "○ ", style=led_color)  # the breathing LED
+        text.append(mode, style=f"bold {led_color}")
+        if step:
+            text.append("  ·  ", style=C_DIM)
+            text.append(step, style=C_CYAN)
         if cost:
-            text.append("  |  ", style="dim")
-            text.append(cost, style="bold bright_green" if self._cost_pulse else "green")
-        self.query_one("#status", Static).update(text)
+            text.append("  ·  ", style=C_DIM)
+            text.append(cost, style=("bold " + C_AMBER) if self._cost_pulse else C_AMBER)
+        if cwd:
+            text.append("  ·  ", style=C_DIM)
+            text.append(cwd, style=C_CYAN)
+        text.append("  ·  ", style=C_DIM)
+        text.append(f"brain {self._models.brain} · hands {self._models.hands}", style=C_DIM)
+        if queued:
+            text.append("  ·  ", style=C_DIM)
+            text.append(queued, style=C_MAGENTA)
+        hint = "esc interrupt · /queue" if self._run_in_flight() else "enter send · ↑ recall · /queue"
+        text.append("    ", style=C_DIM)
+        text.append(hint, style=C_DIM)
+        try:
+            self.query_one("#status", Static).update(text)
+        except Exception:  # noqa: BLE001 -- not mounted / teardown race
+            pass
         # The input box's placeholder tracks what a submit now means (Fix 1).
-        self.query_one("#prompt", Input).placeholder = placeholder_for_state(
-            state, self._placeholder
-        )
+        try:
+            self.query_one("#prompt", Input).placeholder = placeholder_for_state(
+                state, self._placeholder
+            )
+        except Exception:  # noqa: BLE001 -- not mounted
+            pass
 
     def _cwd_segment(self) -> str:
         """The status-line working-dir segment, shown when the sticky working dir
@@ -2362,11 +2681,15 @@ class RelayTuiApp(App):
         self._session_cost = 0.0
         self._conversation_lines = []
         self._activity_lines = []
-        try:
-            self.query_one("#conversation", RichLog).clear()
-            self.query_one("#activity", RichLog).clear()
-        except Exception:  # noqa: BLE001 -- panes not mounted (welcome view)
-            pass
+        self._stream_rendered = []
+        # Wipe the single stream (history rows + the live plan block) and its plan state.
+        self._reset_plan()
+        stream = self._stream()
+        if stream is not None:
+            try:
+                stream.remove_children()
+            except Exception:  # noqa: BLE001 -- stream not mounted (welcome view)
+                pass
         self._update_status()
 
     # -- /log: a shareable, redacted debug export -------------------------------
@@ -2505,6 +2828,7 @@ class RelayTuiApp(App):
         self._session.last_plan = None
         self._stopping = False
         self._interrupting = False
+        self._stop_spin()  # no motion at the idle prompt (the plan was already settled)
         self._write_activity("[stopped] plan abandoned; session preserved (cwd/memory/cost kept)")
         self._update_status()
 
@@ -2512,6 +2836,14 @@ class RelayTuiApp(App):
         """Quit WITHOUT orphaning the worker: cancel, join (bounded), then exit."""
         self._quitting = True
         self._stop_anim()
+        self._stop_spin()
+        led = self._led_timer
+        if led is not None:
+            try:
+                led.stop()
+            except Exception:  # noqa: BLE001 -- already stopped/torn down
+                pass
+            self._led_timer = None
         runner = self._runner
         if runner is not None and runner.is_running:
             runner.cancel()

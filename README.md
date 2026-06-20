@@ -4,7 +4,7 @@
 > that plans and a "hands" model that executes — with every model reached
 > through **OpenRouter**.
 
-**Website:** [hardcoregamer969.github.io/relay](https://hardcoregamer969.github.io/relay/)
+**Website:** [hardcoregamer969.github.io/Relay](https://hardcoregamer969.github.io/Relay/)
 
 ## The brain / hands idea
 

@@ -4,6 +4,8 @@
 > that plans and a "hands" model that executes — with every model reached
 > through **OpenRouter**.
 
+**Website:** [hardcoregamer969.github.io/relay](https://hardcoregamer969.github.io/relay/)
+
 ## The brain / hands idea
 
 Relay separates *thinking* from *doing*. The **brain** (planner) decides what

@@ -282,6 +282,54 @@ def test_noop_patch_leaves_the_recorded_read_valid(tmp_path):
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "omega\n"
 
 
+# --- CRLF line-ending preservation (a no-op patch on a CRLF file must stay CRLF) ---
+
+
+def test_noop_patch_on_crlf_file_preserves_crlf(tmp_path):
+    """A context-only (no-op) patch on a CRLF file must report 'no change' AND leave
+    the file as CRLF -- not silently normalize to LF (which would change the file
+    and defeat the v0.0.31 no-op honesty fix on Windows)."""
+    (tmp_path / "app.py").write_bytes("alpha\r\nbeta\r\n".encode("utf-8"))
+    obs = Tools(tmp_path).apply_patch(_envelope(
+        "*** Update File: app.py",
+        "@@ alpha",
+        " alpha",          # context-only: no -/+ so nothing changes
+    ))
+    assert "no change" in obs
+    assert (tmp_path / "app.py").read_bytes() == b"alpha\r\nbeta\r\n"  # CRLF preserved
+
+
+def test_real_patch_on_crlf_file_preserves_crlf(tmp_path):
+    """A real patch on a CRLF file must apply the change AND keep CRLF line endings."""
+    (tmp_path / "app.py").write_bytes("alpha\r\nbeta\r\n".encode("utf-8"))
+    obs = Tools(tmp_path).apply_patch(_envelope(
+        "*** Update File: app.py",
+        "@@ alpha",
+        "-alpha",
+        "+ALPHA",
+    ))
+    assert obs.startswith("applied patch")
+    assert (tmp_path / "app.py").read_bytes() == b"ALPHA\r\nbeta\r\n"  # CRLF preserved
+
+
+def test_noop_patch_on_crlf_leaves_read_valid(tmp_path):
+    """A no-op patch on a CRLF file changed nothing, so the recorded read stays valid."""
+    (tmp_path / "app.py").write_bytes("alpha\r\n".encode("utf-8"))
+    tools = Tools(tmp_path)
+    reads: dict[str, str] = {}
+    record_read(tools, "app.py", reads)
+    noop = Action(kind="apply_patch", content=_envelope(
+        "*** Update File: app.py", "@@ alpha", " alpha",
+    ))
+    obs = guarded_execute_action(tools, noop, reads)
+    assert "no change" in obs
+    # Read is still current: a real follow-up patch applies without a re-read refusal.
+    real = Action(kind="apply_patch", content=_envelope(
+        "*** Update File: app.py", "@@ alpha", "-alpha", "+omega",
+    ))
+    assert guarded_execute_action(tools, real, reads).startswith("applied patch")
+
+
 # --- end-to-end through run_planned -----------------------------------------
 
 

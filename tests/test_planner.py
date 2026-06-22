@@ -46,6 +46,63 @@ def test_plan_parses_into_ordered_steps(tmp_path):
     assert all(s.status == "pending" for s in plan.steps)
 
 
+# --- Plan snapshot support (v0.0.32: to_state / from_state / copy) -----------
+
+
+def test_plan_to_state_from_state_roundtrip():
+    """A plan with mixed statuses round-trips through to_state/from_state."""
+    plan = Plan.from_instructions(["step A", "step B", "step C"])
+    plan.mark_done(plan.steps[0], "did A")
+    plan.mark_failed(plan.steps[1], "B failed")
+    # step 2 is still pending
+
+    state = plan.to_state()
+    restored = Plan.from_state(state)
+
+    assert len(restored.steps) == 3
+    assert [s.instruction for s in restored.steps] == ["step A", "step B", "step C"]
+    assert [s.index for s in restored.steps] == [0, 1, 2]
+    assert restored.steps[0].status == "done"
+    assert restored.steps[0].outcome == "did A"
+    assert restored.steps[1].status == "failed"
+    assert restored.steps[1].outcome == "B failed"
+    assert restored.steps[2].status == "pending"
+
+
+def test_plan_copy_is_independent():
+    """copy() produces an independent plan -- mutating the copy does not affect the
+    original (the basis for plan snapshot/fork in steer/queue continuations)."""
+    plan = Plan.from_instructions(["do A", "do B"])
+    snapshot = plan.copy()
+
+    # Mutate the original
+    plan.mark_done(plan.steps[0], "did A")
+    plan.steps[1].instruction = "do B (modified)"
+
+    # The snapshot is unaffected
+    assert snapshot.steps[0].status == "pending"  # not done
+    assert snapshot.steps[0].outcome is None
+    assert snapshot.steps[1].instruction == "do B"  # not modified
+
+
+def test_plan_step_to_state_from_state_roundtrip():
+    """A PlanStep round-trips through to_state/from_state."""
+    step = PlanStep(index=3, instruction="do X", status="done", outcome="did X")
+    state = step.to_state()
+    restored = PlanStep.from_state(state)
+    assert restored.index == 3
+    assert restored.instruction == "do X"
+    assert restored.status == "done"
+    assert restored.outcome == "did X"
+
+
+def test_plan_step_from_state_defaults():
+    """from_state fills defaults for missing keys (defensive parsing)."""
+    step = PlanStep.from_state({"index": 0, "instruction": "do Y"})
+    assert step.status == "pending"
+    assert step.outcome is None
+
+
 def test_brain_investigates_readonly_then_plans(tmp_path):
     (tmp_path / "main.py").write_text("print('hi')\n", encoding="utf-8")
     client = ScriptedClient(

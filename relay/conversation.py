@@ -39,7 +39,7 @@ from relay.context import DEFAULT_CONTEXT_WINDOW
 from relay.memory import MemoryBus, PlanMemory, memory_budget
 from relay.models import call_model
 from relay.planner import MAX_PLAN_STEPS, Plan, project_digest
-from relay.protocol import parse
+from relay.protocol import parse, tag_content, tag_contents
 from relay.telemetry import Ledger
 from relay.transcript import Transcript, record_decision
 
@@ -186,16 +186,17 @@ class ConversationResult:
     transcript: Transcript | None = None
 
 
-# --- small parse helpers ----------------------------------------------------
+# --- small parse helpers (deduplicated v0.0.32: delegate to protocol.py) -----
 
 
 def _tag(name: str, text: str) -> str | None:
-    match = re.search(rf"<{name}>(.*?)</{name}>", text or "", re.DOTALL)
-    return match.group(1).strip() if match else None
+    """Thin wrapper over :func:`relay.protocol.tag_content`."""
+    return tag_content(name, text)
 
 
 def _tags(name: str, text: str) -> list[str]:
-    return [m.group(1).strip() for m in re.finditer(rf"<{name}>(.*?)</{name}>", text or "", re.DOTALL) if m.group(1).strip()]
+    """Thin wrapper over :func:`relay.protocol.tag_contents`."""
+    return tag_contents(name, text)
 
 
 def _posture(scope: str, level: str) -> str:
@@ -532,8 +533,18 @@ def plan_conversationally(
         if category == "approve_changes":
             # The user approved the direction but asked for a tweak in the same
             # breath: fold it in, then PROCEED with the revised plan (never commit
-            # the un-modified plan and lose the change).
+            # the un-modified plan and lose the change). BUT if the revision produced
+            # an empty plan (the brain failed to generate steps), do NOT commit an
+            # empty plan -- re-present and let the user react next round instead.
             revise_plan(classification.change or reaction)
+            if not result.plan.steps:
+                emit("not_committed", "the revised plan was empty; nothing to commit", {})
+                if result.rounds >= max_rounds:
+                    return result
+                prompt = result.plain_plan or (
+                    "The revision produced no steps. Would you like to try a different approach?"
+                )
+                continue
             return commit(reaction)
 
         # revise: the user wants a new proposal -> re-plan with their feedback and

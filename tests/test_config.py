@@ -5,10 +5,12 @@ from __future__ import annotations
 from relay.config import (
     ASSUMPTION_LEVELS,
     DEFAULT_ASSUMPTION_LEVEL,
+    DEFAULT_BASH_TIMEOUT_S,
     DEFAULT_MAX_TOTAL_STEPS,
     assumption_directive,
     assumption_summary,
     resolve_assumption_level,
+    resolve_bash_timeout,
     resolve_max_total_steps,
 )
 
@@ -123,3 +125,42 @@ def test_max_total_steps_invalid_falls_through(monkeypatch):
     assert resolve_max_total_steps(config={"max_total_steps": 77}) == 77
     monkeypatch.setenv("RELAY_MAX_TOTAL_STEPS", "-5")   # negative -> next source
     assert resolve_max_total_steps(config={}) == 50
+
+
+# --- bash timeout (env > config > default 120s) ------------------------------
+
+
+def test_bash_timeout_defaults_to_120(monkeypatch):
+    monkeypatch.delenv("RELAY_BASH_TIMEOUT", raising=False)
+    assert resolve_bash_timeout(config={}) == 120
+    assert DEFAULT_BASH_TIMEOUT_S == 120
+
+
+def test_bash_timeout_env_beats_config(monkeypatch):
+    monkeypatch.setenv("RELAY_BASH_TIMEOUT", "60")
+    assert resolve_bash_timeout(config={"bash_timeout_s": 300}) == 60.0
+
+
+def test_bash_timeout_config_beats_default(monkeypatch):
+    monkeypatch.delenv("RELAY_BASH_TIMEOUT", raising=False)
+    assert resolve_bash_timeout(config={"bash_timeout_s": 300}) == 300.0
+
+
+def test_bash_timeout_override_beats_env(monkeypatch):
+    monkeypatch.setenv("RELAY_BASH_TIMEOUT", "60")
+    assert resolve_bash_timeout(override=30, config={}) == 30.0
+
+
+def test_bash_timeout_can_be_disabled(monkeypatch):
+    monkeypatch.delenv("RELAY_BASH_TIMEOUT", raising=False)
+    assert resolve_bash_timeout(override=0, config={}) is None       # 0 -> unbounded
+    assert resolve_bash_timeout(override="off", config={}) is None
+    monkeypatch.setenv("RELAY_BASH_TIMEOUT", "none")
+    assert resolve_bash_timeout(config={"bash_timeout_s": 60}) is None
+
+
+def test_bash_timeout_invalid_falls_through(monkeypatch):
+    monkeypatch.setenv("RELAY_BASH_TIMEOUT", "abc")  # unparseable -> next source
+    assert resolve_bash_timeout(config={"bash_timeout_s": 90}) == 90.0
+    monkeypatch.setenv("RELAY_BASH_TIMEOUT", "-5")   # negative -> next source
+    assert resolve_bash_timeout(config={}) == 120

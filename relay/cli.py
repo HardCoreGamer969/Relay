@@ -25,6 +25,7 @@ from relay.config import (
     describe_resolution,
     load_models,
     resolve_assumption_level,
+    resolve_bash_timeout,
     resolve_max_total_steps,
 )
 from relay.context import resolve_context_window
@@ -191,6 +192,12 @@ def run(
         help="After the run, print the (compacted) continuous conversation thread "
         "-- the plain-CLI preview of scroll-back (the scrollable view is the TUI).",
     ),
+    plan_only: bool = typer.Option(
+        False, "--plan-only",
+        help="Run the planning conversation, print the committed plan, and exit "
+        "WITHOUT executing. Useful for reviewing what the brain would do before "
+        "spending money on execution. No files are written.",
+    ),
     no_log: bool = typer.Option(
         False, "--no-log", help="Skip persisting this run to .relay/runs.jsonl."
     ),
@@ -208,17 +215,20 @@ def run(
     approver = None if auto_approve else _interactive_approver
     dial = resolve_assumption_level(override=assume or None)
     ceiling = resolve_max_total_steps(override=max_total_steps)  # 50 by default; flag/env/config can raise
+    bash_timeout = resolve_bash_timeout()
     _warn_if_dirty_git(root)
 
     mode = "solo" if solo else "planned"
     start = time.perf_counter()
     if solo:
-        result = _run_solo(goal, root, solo, max_steps, cfg, ledger, auto_approve, approver)
+        result = _run_solo(goal, root, solo, max_steps, cfg, ledger, auto_approve, approver,
+                           bash_timeout_s=bash_timeout)
     else:
         result = _run_planned(
             goal, root, cfg, ledger, auto_approve, approver, confirm_plan,
             supervise=not no_supervise, dial=dial, show_transcript=show_transcript,
-            max_total_steps=ceiling,
+            max_total_steps=ceiling, bash_timeout_s=bash_timeout,
+            plan_only=plan_only,
         )
     wall_time_s = time.perf_counter() - start
 
@@ -228,7 +238,8 @@ def run(
                   wall_time_s=wall_time_s, root=root)
 
 
-def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver):
+def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver, *,
+               bash_timeout_s=120.0):
     """The v0.02 single-model loop, kept for comparison/debugging."""
     bash_policy = "auto-approve" if auto_approve else "interactive approval"
     console.print(
@@ -243,6 +254,7 @@ def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver):
         result = run_task(
             goal, root, role=role, max_steps=max_steps, models=cfg, ledger=ledger,
             on_step=_print_step, approver=approver, auto_approve=auto_approve,
+            bash_timeout_s=bash_timeout_s,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)
@@ -264,7 +276,8 @@ def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver):
 
 
 def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, *,
-                 supervise=True, dial="auto", show_transcript=False, max_total_steps=None):
+                 supervise=True, dial="auto", show_transcript=False, max_total_steps=None,
+                 bash_timeout_s=120.0, plan_only=False):
     """Conversational planning -> commit -> the two-role autonomous loop.
 
     Both phases share ONE transcript, so a mid-run escalation appears as the next
@@ -300,9 +313,22 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
         return PlannedTaskResult(goal=goal, plan=conversation.plan, status=STATUS_DECLINED,
                                  ledger=ledger, transcript=transcript)
 
+    # --plan-only: print the committed plan and exit WITHOUT executing.
+    # Useful for reviewing what the brain would do before spending money on execution.
+    if plan_only:
+        steps = conversation.plan.steps
+        body = "\n".join(f"{i}. {s.instruction}" for i, s in enumerate(steps, 1))
+        console.print(Panel(body, title=f"Planned plan ({len(steps)} step(s), NOT executed)",
+                            border_style="magenta"))
+        console.print("[dim](--plan-only: no files were written, no executor calls made)[/dim]")
+        return PlannedTaskResult(goal=goal, plan=conversation.plan, status=STATUS_DECLINED,
+                                 ledger=ledger, transcript=transcript)
+
     # 2. Execute the committed plan on the SAME thread (the dial keeps biasing
     #    answer_or_escalate; escalations continue the conversation above).
     try:
+        from relay.catalog import get_catalog
+        catalog = get_catalog()
         result = run_planned(
             goal, root, models=cfg, ledger=ledger, client=None,
             approver=approver, auto_approve=auto_approve,
@@ -310,6 +336,8 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
             assumption_level=dial, committed_plan=conversation.plan,
             on_event=_print_event, transcript=transcript,
             max_total_steps=max_total_steps,
+            catalog=catalog,
+            bash_timeout_s=bash_timeout_s,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)
@@ -792,8 +820,12 @@ def tui(
     cfg = load_models()
     dial = resolve_assumption_level(override=assume or None)
     _warn_if_dirty_git(root)
+    # Load the catalog so run_planned can resolve each actor's real context window
+    # (without it the window always falls to 8192 and memory budgets are stunted).
+    catalog = _safe_load_catalog()
     RelayTuiApp(
-        root=root, models=cfg, assumption_level=dial, auto_approve=auto_approve
+        root=root, models=cfg, assumption_level=dial, auto_approve=auto_approve,
+        catalog=catalog,
     ).run()
 
 

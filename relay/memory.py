@@ -28,6 +28,11 @@ from relay.config import ModelConfig
 from relay.context import DEFAULT_CONTEXT_WINDOW
 from relay.models import call_model
 from relay.telemetry import Ledger
+from relay._utils import estimate_tokens, fit_to_budget
+
+# ``estimate_tokens`` is re-exported here (imported from relay._utils) so existing
+# ``from relay.memory import estimate_tokens`` callers keep working after the
+# v0.0.32 dedup that moved the implementation to relay._utils.
 
 # --- entry kinds + ranking weights -----------------------------------------
 
@@ -265,7 +270,7 @@ class PlanMemory:
         # If the whole working set fits verbatim in the full budget, just use it.
         full = _pack(ranked, budget_tokens, contiguous=False)
         if len(full) == len(ranked):
-            return _fit("\n".join(_render_entry(e) for e in full), budget_tokens)
+            return fit_to_budget("\n".join(_render_entry(e) for e in full), budget_tokens)
 
         # Overflow exists: verbatim top share + a summary of the remainder.
         verbatim_cap = int(budget_tokens * VERBATIM_SHARE)
@@ -279,7 +284,7 @@ class PlanMemory:
             overflow, query, summary_budget, client=client, models=models, ledger=ledger
         )
         out = f"{verbatim_text}\n\n{summary_block}" if verbatim_text else summary_block
-        return _fit(out, budget_tokens)
+        return fit_to_budget(out, budget_tokens)
 
     def _summarize_overflow(
         self, overflow, query, summary_budget, *, client, models, ledger
@@ -308,19 +313,13 @@ class PlanMemory:
             if not summary:
                 raise ValueError("empty summary")
             block = f"[compacted memory: {n} older entr{plural} summarized]\n{summary}"
-            return _fit(block, summary_budget)
+            return fit_to_budget(block, summary_budget)
         except Exception as exc:  # noqa: BLE001 -- degrade gracefully, never crash
             # Hard-trim fallback with a visible (non-silent) note about the loss.
             return f"[compacted memory unavailable: {n} older entr{plural} omitted ({exc.__class__.__name__})]"
 
 
 # --- module-level helpers ---------------------------------------------------
-
-
-def estimate_tokens(text: str) -> int:
-    """Model-agnostic token estimate (~chars/4). Exactness isn't required;
-    staying under the cap is, and this never under-counts to zero."""
-    return max(1, (len(text) + 3) // 4)
 
 
 def _render_entry(entry: MemoryEntry) -> str:
@@ -430,13 +429,6 @@ def _pack(entries, cap: int, *, contiguous: bool) -> list[MemoryEntry]:
         out.append(entry)
         used += cost
     return out
-
-
-def _fit(text: str, budget: int) -> str:
-    """Final guard: guarantee the string fits the token budget (char-trim)."""
-    if estimate_tokens(text) <= budget:
-        return text
-    return text[: max(0, budget * 4)]
 
 
 # --- the three-pool memory bus (v0.0.29, Stage 1) --------------------------
@@ -573,7 +565,7 @@ class MemoryBus:
                 parts.append(text)
         # Final guard: the per-pool caps sum to budget_tokens, but joining them adds a
         # separator, so _fit the union to be STRICTLY within budget (the mechanized cap).
-        return _fit("\n".join(parts), budget_tokens)
+        return fit_to_budget("\n".join(parts), budget_tokens)
 
     def hands_context(
         self,

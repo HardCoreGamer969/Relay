@@ -1193,6 +1193,7 @@ class RelayTuiApp(App):
         validate_fn=None,
         doctor_fn=None,
         runs_fn=None,
+        catalog: object | None = None,
     ) -> None:
         super().__init__()
         self._root = root
@@ -1210,6 +1211,10 @@ class RelayTuiApp(App):
         self._pending_steer: str | None = None
         self._models = models if models is not None else load_models()
         self._client = client
+        # The model catalog is passed to run_planned so resolve_context_window can
+        # read each actor's real context window from it (without it, the window
+        # always falls to the 8192 default and memory budgets are stunted).
+        self._catalog = catalog
         # Setup-flow seams (injected by tests; default to the real provider funcs).
         self._list_models_fn = list_models_fn
         self._validate_fn = validate_fn
@@ -1570,6 +1575,7 @@ class RelayTuiApp(App):
             run_kwargs=self._run_kwargs,
             transcript=self._session.transcript,
             memory=self._session.memory,
+            catalog=self._catalog,
         )
         self._runner.start(goal)
 
@@ -1612,6 +1618,7 @@ class RelayTuiApp(App):
             run_kwargs=self._run_kwargs,
             transcript=self._session.transcript,
             memory=self._session.memory,
+            catalog=self._catalog,
         )
         self._runner.start_steer(self._session.goal or steer, prior, steer)
 

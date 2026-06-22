@@ -340,11 +340,23 @@ def _apply_hunks(original: str, hunks: list[_Hunk], path: str) -> str:
 
     Raises :class:`PatchError` if an anchor or a hunk's context block does not
     locate -- the caller relies on this for atomic validation (a non-locating hunk
-    fails the WHOLE patch before anything is written)."""
+    fails the WHOLE patch before anything is written).
+
+    Line-ending preservation: the file's original line ending style (CRLF vs LF) is
+    detected and re-applied to the result. The matching/work lines are ``\\r``-stripped
+    so the fuzzy comparators (which match the model's CRLF-free hunk lines) work, but
+    the output preserves the file's native style -- a CRLF file stays CRLF, an LF file
+    stays LF. Without this, a "no-op" patch on a CRLF file would silently normalize to
+    LF (v0.0.31 fix)."""
+    has_crlf = "\r\n" in original
     trailing_nl = original.endswith("\n")
-    lines = original.split("\n")
+    # Split on \n, then strip \r from each line for matching (the comparators are
+    # \r-agnostic via _cmp_rstrip/_cmp_trim, but the replacement lines from the model
+    # have no \r, so we must work in a \r-free space and re-apply \r\n at the end).
+    raw_lines = original.split("\n")
     if trailing_nl:
-        lines = lines[:-1]  # drop the empty tail from the trailing newline
+        raw_lines = raw_lines[:-1]  # drop the empty tail from the trailing newline
+    lines = [line.rstrip("\r") for line in raw_lines]
     for hunk in hunks:
         start = 0
         anchored = bool(hunk.anchor)
@@ -366,6 +378,9 @@ def _apply_hunks(original: str, hunks: list[_Hunk], path: str) -> str:
     result = "\n".join(lines)
     if trailing_nl:
         result += "\n"
+    # Re-apply the original line ending style so the file stays in its native format.
+    if has_crlf:
+        result = result.replace("\n", "\r\n")
     return result
 
 
@@ -379,11 +394,17 @@ class Tools:
     for non-interactive contexts). ``auto_approve`` approves ``CONFIRM`` commands
     without asking -- but never affects ``BLOCKED`` commands, which are always
     refused.
+
+    ``bash_timeout_s`` bounds how long a bash command may run (default 120s). A
+    hung command (a server, a REPL, ``tail -f``) would otherwise block the worker
+    thread forever -- ``cancel_check`` is polled only before the next model call,
+    not during a subprocess. ``None`` disables the timeout (unbounded).
     """
 
     project_root: Path
     approver: Callable[[str, str], bool] | None = None
     auto_approve: bool = False
+    bash_timeout_s: float | None = 120.0
 
     def __post_init__(self) -> None:
         self.project_root = Path(self.project_root)
@@ -398,9 +419,16 @@ class Tools:
         symlink that sits inside the root but points outside it resolves to its
         real (outside) target and is refused, whereas a raw-string check for
         ``..`` would let it through and then read/edit/bash outside the root.
+
+        An ``OSError`` during resolve (network mount, broken symlink, permission)
+        is caught and surfaced as a :class:`ToolError` so the loop's existing
+        error handling feeds it back to the model as a recoverable observation.
         """
-        root = self.project_root.resolve()
-        target = (root / path).resolve()
+        try:
+            root = self.project_root.resolve()
+            target = (root / path).resolve()
+        except OSError as exc:
+            raise ToolError(f"cannot resolve path {path!r}: {exc}") from exc
         if not target.is_relative_to(root):
             raise PathEscapeError(
                 f"path {path!r} resolves outside the project root and was refused"
@@ -623,10 +651,13 @@ class Tools:
         (:data:`WEBFETCH_CHAR_CAP` with a truncation note), timed out
         (:data:`WEBFETCH_TIMEOUT_S`), and friendly-on-error -- a failure returns a
         concise ``webfetch failed: ...`` observation, never a raw traceback/blob, so
-        the loop can adapt. Only http(s) URLs are accepted.
+        the loop can adapt. Only http(s) URLs are accepted (case-insensitive scheme).
         """
         url = (url or "").strip()
-        if not (url.startswith("http://") or url.startswith("https://")):
+        # Case-insensitive scheme check: models sometimes emit ``HTTP://`` or
+        # ``Https://`` -- reject only genuinely non-http(s) schemes.
+        url_lower = url.lower()
+        if not (url_lower.startswith("http://") or url_lower.startswith("https://")):
             return f"webfetch failed: only http(s) URLs are supported (got {url!r})"
         try:
             raw = _http_get(url)
@@ -685,6 +716,10 @@ class Tools:
           - ``ALLOW`` (or an approved ``CONFIRM``) -> runs and returns combined
             stdout/stderr/exit.
 
+        A command that exceeds ``bash_timeout_s`` is killed and a friendly
+        ``bash timed out after Ns`` observation is returned -- so a hung command
+        (a server, a REPL, ``tail -f``) can't orphan the worker thread forever.
+
         This is a best-effort policy, NOT a sandbox (see module docstring).
         """
         verdict = classify(command)
@@ -702,13 +737,19 @@ class Tools:
                 # Safe default for non-interactive contexts: deny, visibly.
                 return f"DENIED (no approver; safe default): {verdict.reason}"
 
-        proc = subprocess.run(
-            command,
-            shell=True,
-            cwd=str(self.project_root.resolve()),
-            capture_output=True,
-            text=True,
-        )
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                cwd=str(self.project_root.resolve()),
+                capture_output=True,
+                text=True,
+                timeout=self.bash_timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            timeout_desc = f"{self.bash_timeout_s}s" if self.bash_timeout_s is not None else "(unbounded)"
+            snippet = command[:100]
+            return f"bash timed out after {timeout_desc} (command: {snippet})"
         parts: list[str] = []
         if proc.stdout:
             parts.append(proc.stdout.rstrip("\n"))

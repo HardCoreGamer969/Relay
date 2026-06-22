@@ -477,6 +477,39 @@ def test_confirm_plan_uses_one_round(tmp_path, monkeypatch):
     assert conv_kw["max_rounds"] == 1  # --confirm-plan is the degenerate 1-round case
 
 
+def test_plan_only_exits_without_executing(tmp_path, monkeypatch):
+    # --plan-only: the planning conversation runs, the committed plan is printed,
+    # but run_planned is NEVER called -- no executor calls, no files written.
+    from relay.conversation import ConversationResult
+    from relay.planner import Plan
+
+    monkeypatch.setattr(cli, "load_models", lambda: ModelConfig(brain="vendor/brain", hands="vendor/hands"))
+    monkeypatch.setattr(cli, "_warn_if_dirty_git", lambda root: None)
+
+    run_called = False
+
+    def fake_conv(goal, root, **kwargs):
+        return ConversationResult(
+            goal=goal,
+            plan=Plan.from_instructions(["create hello.txt", "create world.txt"]),
+            committed=True,
+        )
+
+    def fake_run(goal, root, **kwargs):
+        nonlocal run_called
+        run_called = True
+        raise AssertionError("run_planned should NOT be called with --plan-only")
+
+    monkeypatch.setattr(cli, "plan_conversationally", fake_conv)
+    monkeypatch.setattr(cli, "run_planned", fake_run)
+
+    result = runner.invoke(app, ["run", "-g", "build hello world", "--root", str(tmp_path),
+                                  "--no-log", "--plan-only"])
+    assert result.exit_code == 0
+    assert not run_called  # execution was skipped
+    assert "NOT executed" in result.output or "not executed" in result.output.lower()
+
+
 # --- v0.08(B): one continuous transcript CLI wiring ------------------------
 
 

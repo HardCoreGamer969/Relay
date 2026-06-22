@@ -105,6 +105,62 @@ _CEILING_DISABLE = frozenset({"0", "off", "none", "no", "false", "disable", "dis
 _UNSET = object()  # "this source had nothing usable" -- fall through to the next
 
 
+# --- the bash timeout (v0.0.32: a hung command must not orphan the worker) ---
+#
+# ``bash`` runs ``subprocess.run`` with no timeout by default, so a hanging command
+# (a server, a REPL, ``tail -f``) blocks the worker thread forever -- cancel_check
+# is only polled before the next call_model, not during a subprocess. This adds a
+# configurable timeout (default 120s) so a hung command is killed and the run
+# continues. ``0`` / ``off`` / ``none`` = no timeout (unbounded, for legitimate
+# long-running commands). Precedence: env > config > default, same as the ceiling.
+DEFAULT_BASH_TIMEOUT_S = 120
+_BASH_TIMEOUT_DISABLE = frozenset({"0", "off", "none", "no", "false", "disable", "disabled", "unbounded"})
+
+
+def _parse_bash_timeout(value: object) -> object:
+    """One bash-timeout source -> a positive ``float``, ``None`` (disabled), or ``_UNSET``."""
+    if value is None or isinstance(value, bool):
+        return _UNSET
+    if isinstance(value, (int, float)):
+        if value == 0:
+            return None
+        return float(value) if value > 0 else _UNSET
+    text = str(value).strip().lower()
+    if not text:
+        return _UNSET
+    if text in _BASH_TIMEOUT_DISABLE:
+        return None
+    try:
+        n = float(text)
+    except ValueError:
+        return _UNSET
+    if n == 0:
+        return None
+    return n if n > 0 else _UNSET
+
+
+def resolve_bash_timeout(
+    override: object = None, config: dict | None = None
+) -> float | None:
+    """Resolve the bash command timeout: **override > env > config > default**.
+
+    Returns a positive timeout in seconds, or ``None`` for "no timeout" (unbounded).
+    Invalid values fall through to the next source. The default is
+    :data:`DEFAULT_BASH_TIMEOUT_S` (120s) -- generous for most commands but
+    prevents a hung command from orphaning the worker thread.
+    """
+    for candidate in (override, os.environ.get("RELAY_BASH_TIMEOUT")):
+        parsed = _parse_bash_timeout(candidate)
+        if parsed is not _UNSET:
+            return parsed  # type: ignore[return-value]
+    config = config if config is not None else store.load_config()
+    cfg_val = config.get("bash_timeout_s") if isinstance(config, dict) else None
+    parsed = _parse_bash_timeout(cfg_val)
+    if parsed is not _UNSET:
+        return parsed  # type: ignore[return-value]
+    return DEFAULT_BASH_TIMEOUT_S
+
+
 def _parse_ceiling(value: object) -> object:
     """One ceiling source -> a positive ``int``, ``None`` (disabled), or ``_UNSET``.
 

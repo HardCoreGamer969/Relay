@@ -50,9 +50,18 @@ class PolicyResult:
 # --- Rule data --------------------------------------------------------------
 
 _PRIV_ESC = {"sudo", "su", "doas"}
-_FS_DESTROY = {"fdisk", "parted", "sfdisk", "cfdisk", "mkswap", "wipefs"}  # mkfs* handled separately
+_FS_DESTROY = {"fdisk", "parted", "sfdisk", "cfdisk", "mkswap", "wipefs",
+               "format", "diskpart"}  # mkfs* + Windows disk tools handled separately
 _POWER = {"shutdown", "reboot", "halt", "poweroff"}
 _SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
+
+# Windows file/deletion commands (the Unix ``rm``/``rmdir`` equivalents). On Windows
+# these are the destructive commands a model emits -- without them in the policy, a
+# ``del /s /q *`` would be ALLOW (no confirmation) and a ``del /s /q C:\`` would
+# sail past the BLOCKED guard. Matched by basename, like the Unix set.
+_WIN_RM = {"del", "erase", "rmdir", "rd"}
+# Windows disk-wipe / encryption-erase tool (``cipher /w:C:\`` wipes free space).
+_WIN_DISK_WIPE = {"cipher"}
 
 # A raw block device (writing to one destroys a filesystem). Character devices
 # like /dev/null, /dev/zero, /dev/random are intentionally NOT matched.
@@ -117,14 +126,43 @@ def _split_segments(command: str) -> list[list[str]]:
 
 
 def _is_system_or_home_path(arg: str) -> bool:
-    """True if ``arg`` points at root/an absolute path/the home dir."""
+    """True if ``arg`` points at root/an absolute path/the home dir.
+
+    Recognizes both Unix (``/``, ``~/``) and Windows (``C:\\``, ``%USERPROFILE%``)
+    absolute paths, so a Windows destructive command like ``del /s /q C:\\`` is
+    caught the same way ``rm -rf /`` is. Windows-style flags (``/s``, ``/q``,
+    ``/f``) are NOT paths -- they are short ``/<letter>`` tokens -- so they are
+    excluded to avoid false positives."""
     if arg in ("/", "/*", "/."):
         return True
+    # Unix absolute paths: ``/etc``, ``/`` -- but NOT ``/s`` or ``/q`` (Windows flags,
+    # a ``/`` followed by a single non-path char). A real Unix path is ``/`` + a
+    # name (letters/dots), while ``/s``, ``/q``, ``/f`` are Windows command flags.
     if arg.startswith("/"):
+        # A Windows-style flag: ``/`` + 1-2 letters, no slash, no dot. These are
+        # NOT paths. e.g. ``/s``, ``/q``, ``/f``, ``/si``. A real Unix path like
+        # ``/etc`` or ``/tmp`` has 3+ chars -- treat those as paths.
+        rest = arg[1:]
+        if rest and len(rest) <= 2 and rest.isalpha():
+            return False
+        return True
+    # Windows absolute paths: ``C:\``, ``C:/``, ``\`` (drive-relative root).
+    # NOTE: shlex in posix mode strips single backslashes, so ``C:\Users`` may
+    # arrive as ``C:Users``. Match both the raw form (``C:\`` / ``C:/``) and the
+    # shlex-stripped form (``C:`` + an uppercase word like ``C:Users``).
+    if re.match(r"^[A-Za-z]:[\\/]", arg) or arg.startswith("\\"):
+        return True
+    # Shlex-stripped Windows path: ``C:Users`` (colon + capitalized name). The
+    # capitalization distinguishes it from a Unix ``name:value`` assignment or a
+    # URL scheme (``http:``). A bare drive letter ``C:`` is also a path.
+    if re.match(r"^[A-Za-z]:[A-Z]", arg) or re.match(r"^[A-Za-z]:$", arg):
         return True
     if arg == "~" or arg.startswith("~/"):
         return True
     if arg in ("$HOME", "${HOME}") or arg.startswith("$HOME/") or arg.startswith("${HOME}/"):
+        return True
+    # Windows env-var home: %USERPROFILE% or %USERPROFILE%\...
+    if arg.startswith("%USERPROFILE%"):
         return True
     return False
 
@@ -197,6 +235,16 @@ def _classify_segment(tokens: list[str], command: str) -> PolicyResult | None:
         target = _dangerous_path_target(args)
         if target is not None:
             return PolicyResult(BLOCKED, f"rm on a system/home/absolute path ({target})", command)
+    # Windows deletion commands (del/erase/rmdir/rd): same BLOCKED/CONFIRM logic as
+    # rm. A system/home/absolute path -> BLOCKED; an in-project deletion -> CONFIRM.
+    # Without this, ``del /s /q *`` would be ALLOW (no confirmation) on Windows.
+    if prog in _WIN_RM:
+        target = _dangerous_path_target(args)
+        if target is not None:
+            return PolicyResult(BLOCKED, f"{prog} on a system/home/absolute path ({target})", command)
+    # Windows disk wipe (cipher /w:...) -- always BLOCKED (wipes free space).
+    if prog in _WIN_DISK_WIPE:
+        return PolicyResult(BLOCKED, f"disk wipe tool ({prog})", command)
     if prog in ("chmod", "chown") and _has_recursive_flag(args):
         target = _dangerous_path_target(args)
         if target is not None:
@@ -209,6 +257,9 @@ def _classify_segment(tokens: list[str], command: str) -> PolicyResult | None:
         # Not blocked above => an in-project deletion. Gate it: rm is destructive
         # and not an "everyday safe" command, so bias to CONFIRM over ALLOW.
         return PolicyResult(CONFIRM, "deletes files (rm)", command)
+    if prog in _WIN_RM:
+        # Not blocked above => an in-project deletion. Same rationale as rm: gate it.
+        return PolicyResult(CONFIRM, f"deletes files ({prog})", command)
     if prog == "git":
         reason = _git_confirm_reason(args)
         if reason is not None:

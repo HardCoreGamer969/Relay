@@ -382,6 +382,27 @@ def test_approve_with_changes_folds_change_then_proceeds(monkeypatch):
     assert any(e["kind"] == "plan_revised" for e in result.events)
 
 
+def test_approve_changes_with_empty_revision_does_not_commit(monkeypatch):
+    # If the revision produces an EMPTY plan (the brain failed to generate steps),
+    # the plan must NOT be committed as empty -- re-present and let the user react
+    # next round instead. Committing an empty plan would silently skip execution.
+    brain = _ReactionBrain(
+        _SMALL,
+        ["<plan><step>step one</step></plan>",
+         "<plan></plan>"],  # the revision produces no steps
+        {"looks good but add tests":
+         "<reaction>approve_changes</reaction><change>add tests</change>",
+         "ok just build it as-is":
+         "<reaction>approve</reaction>"},
+    )
+    monkeypatch.setattr(conv, "call_model", brain)
+    result = plan_conversationally("a thing", ".", models=CFG, client=object(),
+                                   user_turn=_scripted_user("looks good but add tests", "ok just build it as-is"))
+    assert result.committed is True  # committed on the SECOND round, not the first
+    assert result.rounds == 2
+    assert any(e["kind"] == "not_committed" for e in result.events)
+
+
 def test_revise_replans_then_commits(monkeypatch):
     # "rethink the whole approach" -> revise -> a new proposal is presented; the user
     # then approves the revised plan.

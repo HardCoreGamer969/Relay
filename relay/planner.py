@@ -25,7 +25,7 @@ from relay.investigation import investigate
 from relay.loop import describe_action, execute_action
 from relay.memory import MemoryBus, PlanMemory, memory_budget
 from relay.models import call_model
-from relay.protocol import parse
+from relay.protocol import parse, tag_content
 from relay.telemetry import Ledger
 from relay.tools import Tools
 
@@ -54,6 +54,25 @@ class PlanStep:
     instruction: str
     status: str = "pending"  # "pending" | "done" | "failed"
     outcome: str | None = None  # one-line result recorded when the step settles
+
+    def to_state(self) -> dict:
+        """Capture as a plain JSON-able value (for plan snapshots / persistence)."""
+        return {
+            "index": self.index,
+            "instruction": self.instruction,
+            "status": self.status,
+            "outcome": self.outcome,
+        }
+
+    @classmethod
+    def from_state(cls, state: dict) -> "PlanStep":
+        """Reconstruct from :meth:`to_state` output (round-trips equal)."""
+        return cls(
+            index=int(state.get("index", 0)),
+            instruction=state.get("instruction", ""),
+            status=state.get("status", "pending"),
+            outcome=state.get("outcome"),
+        )
 
 
 @dataclass
@@ -87,6 +106,28 @@ class Plan:
     def completed_outcomes(self) -> list[tuple[int, str, str]]:
         """``(index, instruction, outcome)`` for each completed (``done``) step."""
         return [(s.index, s.instruction, s.outcome or "") for s in self.steps if s.status == "done"]
+
+    # -- snapshot shape (v0.0.32: plan snapshot / fork / time-travel hook) ----
+
+    def to_state(self) -> dict:
+        """Capture full state as a plain JSON-able value (for snapshots / persistence).
+
+        Mirrors :meth:`relay.memory.PlanMemory.to_state` and
+        :meth:`relay.transcript.Transcript.to_state` -- a cheap point-in-time copy
+        so a steer can snapshot the prior plan, a future ``--show-plan-diff`` can
+        compare two states, and cross-session persistence is easy to add.
+        """
+        return {"steps": [s.to_state() for s in self.steps]}
+
+    @classmethod
+    def from_state(cls, state: dict) -> "Plan":
+        """Reconstruct from :meth:`to_state` output (round-trips equal)."""
+        return cls(steps=[PlanStep.from_state(s) for s in state.get("steps", [])])
+
+    def copy(self) -> "Plan":
+        """A cheap, independent copy (via the snapshot shape). Mutating the copy
+        does not affect the original -- the basis for plan snapshot/fork."""
+        return Plan.from_state(self.to_state())
 
 
 def project_digest(project_root: str | Path, *, max_depth: int = 2, max_entries: int = 200) -> str:
@@ -451,12 +492,13 @@ _RECORD_RE = re.compile(r'<record\s+kind="([^"]+)"\s*>(.*?)</record>', re.DOTALL
 
 
 def _tag(name: str, text: str) -> str | None:
-    pattern = _TAG_CACHE.get(name)
-    if pattern is None:
-        pattern = re.compile(rf"<{name}>(.*?)</{name}>", re.DOTALL)
-        _TAG_CACHE[name] = pattern
-    match = pattern.search(text or "")
-    return match.group(1).strip() if match else None
+    """Thin wrapper over :func:`relay.protocol.tag_content` (deduplicated v0.0.32).
+
+    Kept as a local alias so existing call sites are unchanged; the logic now
+    lives in one place (``protocol.tag_content``) instead of being duplicated
+    across planner.py and conversation.py.
+    """
+    return tag_content(name, text)
 
 
 def _parse_records(text: str) -> list[tuple[str, str, str]]:

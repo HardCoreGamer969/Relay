@@ -39,9 +39,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, replace
 
 from relay.config import ModelConfig
-from relay.memory import POOL_BRAIN, MemoryBus, PlanMemory, estimate_tokens
+from relay.memory import POOL_BRAIN, MemoryBus, PlanMemory
 from relay.models import call_model
 from relay.telemetry import Ledger
+from relay._utils import estimate_tokens, fit_to_budget
 
 # Phases a conversational turn can belong to (open set; these are the ones Relay
 # emits today). The transcript holds CONVERSATION, not an execution-event dump:
@@ -229,7 +230,7 @@ def render_for_brain(
         else ""
     )
     parts = [p for p in (narrative, recent_text) if p]
-    return _fit("\n\n".join(parts), budget_tokens)
+    return fit_to_budget("\n\n".join(parts), budget_tokens)
 
 
 def compact_transcript(
@@ -337,7 +338,7 @@ def _narrate(
             raise ValueError("empty narrative")
     except Exception as exc:  # noqa: BLE001 -- degrade gracefully, never crash
         text = _fallback_narrative(turns, note=exc.__class__.__name__)
-    return _fit(text, budget_tokens)
+    return fit_to_budget(text, budget_tokens)
 
 
 def _fallback_narrative(turns: list[Turn], *, note: str = "", max_turns: int = 12) -> str:
@@ -359,10 +360,3 @@ def _fallback_narrative(turns: list[Turn], *, note: str = "", max_turns: int = 1
 def _one_line(text: str, *, cap: int = 120) -> str:
     flat = " ".join((text or "").split())
     return flat if len(flat) <= cap else flat[: cap - 3] + "..."
-
-
-def _fit(text: str, budget: int | None) -> str:
-    """Guarantee the string fits the token budget (char-trim). ``None`` = no cap."""
-    if budget is None or estimate_tokens(text) <= budget:
-        return text
-    return text[: max(0, budget * 4)]

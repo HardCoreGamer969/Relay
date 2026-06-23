@@ -73,6 +73,19 @@ def test_webfetch_rejects_non_http_url():
     assert out.startswith("webfetch failed: only http(s) URLs are supported")
 
 
+def test_webfetch_accepts_uppercase_scheme(monkeypatch):
+    # Models sometimes capitalize the URL scheme (``HTTP://``, ``Https://``). The
+    # scheme check is case-insensitive so these are accepted, not rejected.
+    captured = {}
+    monkeypatch.setattr(tools_mod, "_http_get", lambda url: captured.setdefault("url", html_content))
+    html_content = "<html><body><h1>OK</h1></body></html>"
+    for url in ("HTTP://example.com", "Https://example.com", "HTtps://example.com"):
+        captured.clear()
+        out = Tools(".").webfetch(url)
+        assert "webfetch failed:" not in out, f"{url!r} should be accepted, not rejected"
+        assert "OK" in out
+
+
 def test_webfetch_real_helper_sets_user_agent(monkeypatch):
     """The network seam sends a real (non-default) User-Agent -- guards the
     models.dev-style 403. We intercept urlopen so no real request is made."""

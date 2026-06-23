@@ -137,6 +137,41 @@ def test_agentic_reviewer_reads_the_touched_file_through_run_planned(tmp_path):
     assert len(_hands_calls(client)) == 1
 
 
+def test_touched_paths_tracks_write_and_apply_patch(tmp_path):
+    # The touched-paths seed reaches the reviewer for write AND apply_patch, not
+    # just edit. A hands using write and apply_patch should have BOTH files read
+    # by the agentic reviewer (the v0.0.24 fix was blind to write/apply_patch).
+    (tmp_path / "existing.py").write_text("old\n", encoding="utf-8")
+    client = RoutedClient(
+        brain=[
+            "<plan><step>create new.py and patch existing.py</step></plan>",
+            # review: read both touched files, then accept
+            '<read path="new.py"/>',
+            '<read path="existing.py"/>',
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
+            # The hands uses write (new file) and apply_patch (existing file) -- not edit.
+            '<write path="new.py">NEW CONTENT</write>\n'
+            '<apply_patch>*** Begin Patch\n'
+            '*** Update File: existing.py\n'
+            '@@ old\n'
+            '-old\n'
+            '+new\n'
+            '*** End Patch</apply_patch>\n'
+            '<done>created new.py and patched existing.py</done>',
+        ],
+    )
+    result = run_planned("g", tmp_path, models=CFG, client=client)
+
+    assert result.status == STATUS_COMPLETED
+    # The reviewer read BOTH touched files (not just one -- the old code only tracked edit).
+    brain_reads = [e for e in result.events if e.kind == "brain_action" and "read" in e.message]
+    read_paths = [e.message for e in brain_reads]
+    assert any("new.py" in p for p in read_paths), f"reviewer did not read new.py (writes tracked?): {read_paths}"
+    assert any("existing.py" in p for p in read_paths), f"reviewer did not read existing.py (apply_patch tracked?): {read_paths}"
+
+
 # --- executor questions: self-answer vs escalate ---------------------------
 
 
@@ -319,6 +354,32 @@ def test_revise_plan_is_bounded(tmp_path):
     assert result.status == STATUS_COMPLETED
     assert result.revisions == 0
     assert "plan_revised" not in _kinds(result)  # revision suppressed; no evolve call
+
+
+def test_revise_that_aborts_does_not_mark_step_done(tmp_path):
+    # When evolve_plan returns None (brain aborts), the step must NOT be marked
+    # done and revisions must NOT be incremented -- the run ends as aborted with
+    # the step still pending. The old code marked done + incremented before the
+    # abort check, corrupting the plan and the revision count.
+    client = RoutedClient(
+        brain=[
+            "<plan><step>step 0</step><step>step 1</step></plan>",
+            "<verdict>revise_plan</verdict><reason>tail must change</reason>",
+            "<abort>goal is now unreachable</abort>",  # evolve_plan aborts
+        ],
+        hands=[
+            '<edit path="a.txt">A</edit>\n<done>did step 0</done>',
+        ],
+    )
+    result = run_planned("g", tmp_path, models=CFG, client=client)
+
+    assert result.status == STATUS_ABORTED_BY_BRAIN
+    assert result.revisions == 0  # the revision was NOT consumed by the abort
+    # The step that triggered the revise verdict is NOT marked done (it's still
+    # pending) -- the old code marked it done BEFORE calling evolve, corrupting
+    # the plan. The fix: only mark done after evolve succeeds.
+    step0 = result.plan.steps[0]
+    assert step0.status == "pending"  # not done -- evolve aborted, so no mark
 
 
 # --- failure path still records a dead end and replans ----------------------

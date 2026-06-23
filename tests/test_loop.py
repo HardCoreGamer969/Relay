@@ -10,9 +10,11 @@ from types import SimpleNamespace
 
 from relay.config import ModelConfig
 from relay.loop import (
+    MAX_CONSECUTIVE_PARSE_FAILURES,
     STATUS_COMPLETED,
     STATUS_MAX_STEPS,
     STATUS_PARSE_FAILURE_ABORT,
+    ParseFailureTracker,
     run_task,
 )
 from relay.telemetry import Ledger
@@ -148,3 +150,40 @@ def test_on_step_callback_streams_each_step(tmp_path):
     )
 
     assert seen == ["edit", "done"]
+
+
+# --- ParseFailureTracker (v0.0.32: shared by loop/orchestrator/investigation) ---
+
+
+def test_parse_failure_tracker_records_and_resets():
+    tracker = ParseFailureTracker(max_failures=3)
+    assert not tracker.exceeded
+    assert tracker.count == 0
+
+    tracker.record()
+    assert tracker.count == 1
+    assert not tracker.exceeded
+
+    tracker.record()
+    tracker.record()
+    assert tracker.count == 3
+    assert tracker.exceeded  # hit the limit
+
+    tracker.reset()
+    assert tracker.count == 0
+    assert not tracker.exceeded
+
+
+def test_parse_failure_tracker_records_to_ledger():
+    ledger = Ledger()
+    tracker = ParseFailureTracker(max_failures=3, ledger=ledger)
+
+    tracker.record()
+    tracker.record()
+    assert ledger.parse_failures == 2
+    assert tracker.count == 2
+
+
+def test_parse_failure_tracker_default_limit():
+    tracker = ParseFailureTracker()
+    assert tracker._max == MAX_CONSECUTIVE_PARSE_FAILURES == 3

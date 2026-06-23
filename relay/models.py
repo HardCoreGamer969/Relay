@@ -13,6 +13,8 @@ OpenRouter's returned ``cost`` exactly as before.
 
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +23,47 @@ from relay.client import build_client
 from relay.config import ModelConfig, load_models
 from relay.providers import DEFAULT_PROVIDER
 from relay.telemetry import CallRecord, Ledger, timer
+
+# --- retry with backoff for transient API failures (v0.0.32) -----------------
+#
+# A long autonomous run (50+ model calls) will eventually hit a transient API
+# blip (429 rate limit, 500/502/503 server error). Without retry, a single
+# transient error propagates up and aborts the entire run. This wraps the create
+# call with a bounded retry (2 attempts by default, exponential-ish backoff) for
+# retriable HTTP status codes only. Non-retriable errors (400 bad request, 401
+# auth, 404 model not found) propagate immediately -- a retry would just waste
+# time on a permanent failure.
+_RETRIABLE_STATUS = {429, 500, 502, 503, 504}
+_RETRY_DELAYS = [0.5, 1.0]  # seconds between attempts (2 retries -> 0.5s, 1.0s)
+
+
+def _max_retries() -> int:
+    """Configurable via ``RELAY_MAX_RETRIES`` env (default 2). 0 = no retry."""
+    try:
+        n = int(os.environ.get("RELAY_MAX_RETRIES", "2"))
+    except (TypeError, ValueError):
+        return 2
+    return max(0, n)
+
+
+def _is_retriable(exc: Exception) -> bool:
+    """Whether an exception is a transient API error worth retrying.
+
+    Checks for ``status_code`` (openai SDK v1 APIStatusError) and
+    ``response.status_code`` (some older/alternate shapes). Only retriable HTTP
+    status codes qualify; connection errors (timeouts, DNS) propagate immediately
+    -- they could indicate a misconfigured base_url or missing key, and retrying
+    would just mask the config issue for longer.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is not None and status in _RETRIABLE_STATUS:
+        return True
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status_code", None)
+        if status is not None and status in _RETRIABLE_STATUS:
+            return True
+    return False
 
 
 @dataclass
@@ -207,14 +250,33 @@ def call_model(
         kwargs.pop("top_p", None)
 
     with timer() as elapsed:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            extra_body=extra_body,
-            **kwargs,
-        )
+        max_retries = _max_retries()
+        response = None
+        for attempt in range(max_retries + 1):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    extra_body=extra_body,
+                    **kwargs,
+                )
+                break  # success
+            except Exception as exc:
+                if attempt < max_retries and _is_retriable(exc):
+                    time.sleep(_RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)])
+                    continue
+                raise  # non-retriable or exhausted retries: propagate
 
-    text = response.choices[0].message.content or ""
+    # Guard against an empty choices array (content filter, safety refusal,
+    # rate-limit-with-empty-body). An IndexError here would crash the entire run
+    # with a confusing error; returning empty text lets the loop's parse-failure
+    # nudge handle it gracefully.
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        text = ""
+    else:
+        message = getattr(choices[0], "message", None)
+        text = (getattr(message, "content", None) or "") if message is not None else ""
     usage = getattr(response, "usage", None)
     prompt_tokens, completion_tokens = _extract_tokens(usage)
 

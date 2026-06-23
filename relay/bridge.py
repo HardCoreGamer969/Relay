@@ -41,7 +41,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
-from relay.config import ModelConfig, resolve_max_total_steps
+from relay.config import ModelConfig, resolve_bash_timeout, resolve_max_total_steps
 from relay.conversation import DEFAULT_MAX_ROUNDS, ConversationResult, plan_conversationally
 from relay.memory import MemoryBus
 from relay.orchestrator import (
@@ -577,6 +577,7 @@ class EngineRunner:
         run_kwargs: dict | None = None,
         transcript: Transcript | None = None,
         memory: MemoryBus | None = None,
+        catalog: object | None = None,
     ) -> None:
         self.project_root = Path(project_root)
         self.models = models
@@ -585,6 +586,7 @@ class EngineRunner:
         self.assumption_level = assumption_level
         self.auto_approve = auto_approve
         self.max_rounds = max_rounds
+        self.catalog = catalog
         self.bridge = EngineBridge(on_request=on_request, on_event=on_event)
         # The transcript + memory are SESSION-owned (passed in) so a steer/queue
         # continuation run keeps the same conversation + learnings; a bare runner
@@ -595,9 +597,11 @@ class EngineRunner:
         self._on_finished = on_finished
         self._run_kwargs = dict(run_kwargs or {})  # extra run_planned knobs (tests)
         # The TUI is a production caller: default the global step ceiling (50, via
-        # env/config) so a stuck run can't grind unbounded. An explicit run_kwargs
-        # value (tests) is respected; setdefault only fills it when absent.
+        # env/config) so a stuck run can't grind unbounded, and the bash timeout (120s
+        # via env/config) so a hung command can't orphan the worker. An explicit
+        # run_kwargs value (tests) is respected; setdefault only fills when absent.
         self._run_kwargs.setdefault("max_total_steps", resolve_max_total_steps())
+        self._run_kwargs.setdefault("bash_timeout_s", resolve_bash_timeout())
         self._thread: threading.Thread | None = None
 
     # -- lifecycle -----------------------------------------------------------
@@ -670,6 +674,7 @@ class EngineRunner:
                     assumption_level=self.assumption_level, memory=self.memory,
                     committed_plan=conversation.plan, on_event=bridge.emit_event,
                     transcript=self.transcript, cancel_check=bridge.should_cancel,
+                    catalog=self.catalog,
                     **self._run_kwargs,
                 )
                 outcome = RunOutcome(status=result.status, result=result,
@@ -712,6 +717,7 @@ class EngineRunner:
                     assumption_level=self.assumption_level, memory=self.memory,
                     committed_plan=revised, on_event=bridge.emit_event,
                     transcript=self.transcript, cancel_check=bridge.should_cancel,
+                    catalog=self.catalog,
                     **self._run_kwargs,
                 )
                 outcome = RunOutcome(status=result.status, result=result)

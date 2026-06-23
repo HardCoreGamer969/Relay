@@ -253,3 +253,42 @@ def parse(text: str) -> ParseResult:
 
     placed.sort(key=lambda item: item[0])
     return ParseResult(actions=[action for _, action in placed], thinking=thinking)
+
+
+# --- shared tag-content helpers (v0.0.32: deduplicated from planner/conversation) ---
+#
+# Several modules (planner.py, conversation.py) extract the text content of a
+# simple ``<name>...</name>`` tag. These helpers centralize that logic so the
+# three copies don't drift. Each is a thin regex wrapper -- no behavioral change.
+
+_TAG_CONTENT_RE_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def tag_content(name: str, text: str) -> str | None:
+    """Extract the first ``<name>...</name>`` tag's stripped content, or ``None``.
+
+    A shared helper for modules that need to pull a single tag's text (e.g. the
+    brain's ``<verdict>``, ``<reaction>``, ``<scope>``). Compiled regexes are
+    cached per tag name for reuse.
+    """
+    pattern = _TAG_CONTENT_RE_CACHE.get(name)
+    if pattern is None:
+        pattern = re.compile(rf"<{name}>(.*?)</{name}>", re.DOTALL)
+        _TAG_CONTENT_RE_CACHE[name] = pattern
+    match = pattern.search(text or "")
+    return match.group(1).strip() if match else None
+
+
+def tag_contents(name: str, text: str) -> list[str]:
+    """Extract all ``<name>...</name>`` tags' stripped, non-empty contents.
+
+    A shared helper for modules that need multiple tags (e.g. the brain's
+    ``<ask>`` / ``<assume>`` / ``<record>`` tags).
+    """
+    pattern = _TAG_CONTENT_RE_CACHE.get(name)
+    if pattern is None:
+        pattern = re.compile(rf"<{name}>(.*?)</{name}>", re.DOTALL)
+        _TAG_CONTENT_RE_CACHE[name] = pattern
+    return [
+        m.group(1).strip() for m in pattern.finditer(text or "") if m.group(1).strip()
+    ]

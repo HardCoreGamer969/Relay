@@ -519,6 +519,15 @@ def test_bridge_explicit_ceiling_is_respected(tmp_path):
     assert runner._run_kwargs["max_total_steps"] == 3
 
 
+def test_bridge_threads_catalog_into_runner(tmp_path):
+    # The catalog is threaded from the TUI -> EngineRunner -> run_planned, so
+    # resolve_context_window reads each actor's real window instead of falling
+    # to the 8192 default. A None catalog (the default) is also valid.
+    sentinel = object()
+    runner = _bare_runner(tmp_path, catalog=sentinel)
+    assert runner.catalog is sentinel
+
+
 # --- v0.0.25: session-sticky working directory (Part 2) ----------------------
 
 

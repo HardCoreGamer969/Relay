@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from relay.protocol import parse
+from relay.protocol import parse, tag_content, tag_contents
 
 
 def test_parses_each_tag_type():
@@ -162,3 +162,33 @@ def test_question_inside_edit_body_is_not_parsed_loose():
     assert [a.kind for a in result.actions] == ["edit"]
     assert result.first("question") is None
     assert "<question>which db?</question>" in result.actions[0].content
+
+
+# --- shared tag-content helpers (v0.0.32: deduplicated from planner/conversation) ---
+
+
+def test_tag_content_extracts_first_tag():
+    assert tag_content("verdict", "<verdict>accept</verdict>") == "accept"
+    assert tag_content("scope", "noise <scope>small</scope> tail") == "small"
+
+
+def test_tag_content_returns_none_when_absent():
+    assert tag_content("verdict", "no tag here") is None
+    assert tag_content("verdict", "") is None
+
+
+def test_tag_content_strips_whitespace():
+    assert tag_content("verdict", "<verdict>  accept  </verdict>") == "accept"
+
+
+def test_tag_content_handles_multiline():
+    assert tag_content("reason", "<reason>line one\nline two</reason>") == "line one\nline two"
+
+
+def test_tag_contents_extracts_all_non_empty():
+    result = tag_contents("ask", "<ask>Q1</ask><ask></ask><ask>Q2</ask>")
+    assert result == ["Q1", "Q2"]  # the empty <ask></ask> is dropped
+
+
+def test_tag_contents_returns_empty_list_when_none():
+    assert tag_contents("ask", "no tags") == []

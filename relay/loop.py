@@ -28,6 +28,47 @@ from relay.tools import PatchError, ToolError, Tools, parse_patch
 # How many consecutive parse failures to tolerate before aborting the run.
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
 
+
+class ParseFailureTracker:
+    """Tracks consecutive parse failures and signals when the limit is exceeded.
+
+    Shared by the solo loop (``run_task``), the executor mini-loop
+    (``_run_executor_step``), and the brain investigation loop (``investigate``)
+    so the three don't drift on the nudge/abort threshold. Each ``record()``
+    call increments the counter (and the ledger's parse-failure count); a
+    successful turn calls ``reset()``. The ``exceeded`` property signals when
+    the loop should abort.
+    """
+
+    def __init__(
+        self,
+        max_failures: int = MAX_CONSECUTIVE_PARSE_FAILURES,
+        ledger: Ledger | None = None,
+    ) -> None:
+        self._count = 0
+        self._max = max_failures
+        self._ledger = ledger
+
+    def record(self) -> None:
+        """Record a parse failure (increments the counter + the ledger)."""
+        self._count += 1
+        if self._ledger is not None:
+            self._ledger.record_parse_failure()
+
+    def reset(self) -> None:
+        """Reset the counter after a successful turn."""
+        self._count = 0
+
+    @property
+    def exceeded(self) -> bool:
+        """True when the consecutive-failure limit has been reached."""
+        return self._count >= self._max
+
+    @property
+    def count(self) -> int:
+        """The current consecutive-failure count."""
+        return self._count
+
 # The three distinct ways a run can end. Kept distinct because "died on the
 # protocol" vs "merely ran out of turns" is the difference between a model that
 # *can't* drive Relay and one that just needs more steps -- they must not look
@@ -285,6 +326,7 @@ def run_task(
     on_step: Callable[[StepResult], None] | None = None,
     approver: Callable[[str, str], bool] | None = None,
     auto_approve: bool = False,
+    bash_timeout_s: float | None = 120.0,
 ) -> TaskResult:
     """Drive the single-model agent loop until ``<done>`` or ``max_steps``.
 
@@ -293,7 +335,7 @@ def run_task(
         project_root: Directory the agent's tools are confined to.
         role: Which model role drives the loop (single role; default ``hands``).
         max_steps: Maximum model turns before stopping.
-        models: Role->model config (defaults to :func:`relay.config.load_models`).
+        models: Role->model config (defaults to :func:`load_models`).
         ledger: Telemetry ledger (created if not supplied).
         client: OpenRouter client; injected in tests to stay network-free.
         on_step: Optional callback invoked with each :class:`StepResult` as it
@@ -302,8 +344,11 @@ def run_task(
             -> bool``. None + ``auto_approve`` False denies them (safe default).
         auto_approve: Approve ``CONFIRM`` bash commands without asking. Never
             affects ``BLOCKED`` commands, which are always refused.
+        bash_timeout_s: Timeout for bash commands in seconds. ``None`` disables
+            the timeout (unbounded). Default 120s.
     """
-    tools = Tools(Path(project_root), approver=approver, auto_approve=auto_approve)
+    tools = Tools(Path(project_root), approver=approver, auto_approve=auto_approve,
+                  bash_timeout_s=bash_timeout_s)
     ledger = ledger if ledger is not None else Ledger()
     result = TaskResult(goal=goal, ledger=ledger)
 

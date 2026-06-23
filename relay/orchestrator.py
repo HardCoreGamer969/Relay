@@ -439,12 +439,27 @@ def _run_executor_step(
             rendered = f"[{describe_action(action)}]\n{observation}"
             observations.append(rendered)
             transcript.append(rendered[:_TRANSCRIPT_ENTRY_CAP])
-            # Track files the executor actually WROTE (a successful edit returns
-            # "wrote <path> ..."), so the reviewer can be seeded to read what changed.
-            # A refused ("Refused: ...") or errored ("error: ...") edit is not counted.
-            if action.kind == "edit" and action.path and observation.startswith("wrote "):
+            # Track files the executor actually WROTE, so the reviewer can be seeded
+            # to read what changed. Covers all three write-producing tools: edit,
+            # write (both return "wrote <path> ..."), and apply_patch ("applied patch:
+            # ..."). A refused ("Refused: ...") or errored ("error: ...") op is not
+            # counted. Without this the agentic reviewer is blind to write/apply_patch
+            # -- it only sees edit, which v0.0.26+ actively discourages for partial edits.
+            if action.kind in ("edit", "write") and action.path and observation.startswith("wrote "):
                 if action.path not in touched:
                     touched.append(action.path)
+            elif action.kind == "apply_patch" and observation.startswith("applied patch"):
+                # Extract the paths from the parsed patch sections (more reliable than
+                # regexing the observation summary). Add and Delete are both "touched"
+                # -- a deleted file is also something the reviewer may want to verify.
+                try:
+                    from relay.tools import parse_patch as _pp
+                    for _sec in _pp(action.content or ""):
+                        _dest = _sec.move_to or _sec.path
+                        if _dest not in touched:
+                            touched.append(_dest)
+                except Exception:
+                    pass  # parse_patch failure is already reported in the observation
 
         messages.append(
             {"role": "user", "content": "\n\n".join(observations) if observations else "(no output)"}
@@ -580,6 +595,7 @@ def run_planned(
     assumption_level: str = "auto",
     transcript: Transcript | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    bash_timeout_s: float | None = 120.0,
 ) -> PlannedTaskResult:
     """Drive the autonomous two-role planner/executor loop.
 
@@ -708,7 +724,8 @@ def run_planned(
         emit("status", "plan declined by user before execution", {"status": STATUS_DECLINED})
         return finalize(plan)
 
-    tools = Tools(Path(project_root), approver=approver, auto_approve=auto_approve)
+    tools = Tools(Path(project_root), approver=approver, auto_approve=auto_approve,
+                  bash_timeout_s=bash_timeout_s)
     # Run-scoped read-tracking for the read-before-edit guard (v0.0.23): which files
     # the hands has read, by content hash. Shared across every step of this run, so a
     # read stays valid while the file is unchanged (content-valid, not step-scoped).
@@ -931,6 +948,34 @@ def run_planned(
             continue
 
         if disposition.kind == "revise":
+            # The reviewer asked to revise the remaining plan. Call evolve_plan
+            # FIRST: if the brain aborts (returns None), the step must NOT be
+            # marked done and the revision budget must NOT be consumed -- the run
+            # ends as aborted, with the step still pending and revisions unchanged.
+            if revisions >= max_plan_revisions:
+                # Budget exhausted: mark the step done and proceed with the existing
+                # tail (don't thrash). This path does NOT call evolve_plan, so no
+                # abort is possible here.
+                plan.mark_done(step, disposition.summary)
+                remember("fact", f"Step {step.index} done: {disposition.summary}", disposition.summary,
+                         provenance=f"step{step.index}")
+                emit("step_done", f"step {step.index} done: {disposition.summary}",
+                     {"index": step.index, "outcome": disposition.summary})
+                remember("decision", f"Revise remaining plan after step {step.index}: {disposition.revise_reason}",
+                         f"plan revision: {disposition.revise_reason}", provenance=f"step{step.index} review")
+                emit("status", f"plan-revision budget ({max_plan_revisions}) reached; keeping current plan",
+                     {"status": "revision_budget"})
+                continue
+            revised = evolve_plan(goal, plan, disposition.revise_reason, memory, models=models,
+                                  ledger=ledger, client=client, memory_budget_tokens=mem_budget, brain_role=brain_role)
+            if revised is None:
+                result.status = STATUS_ABORTED_BY_BRAIN
+                emit("status", "brain aborted: goal deemed unreachable", {"status": STATUS_ABORTED_BY_BRAIN})
+                break
+            # evolve_plan succeeded: NOW mark the step done, increment revisions,
+            # and adopt the revised plan.
+            revisions += 1
+            result.revisions = revisions
             plan.mark_done(step, disposition.summary)
             remember("fact", f"Step {step.index} done: {disposition.summary}", disposition.summary,
                      provenance=f"step{step.index}")
@@ -938,18 +983,6 @@ def run_planned(
                  {"index": step.index, "outcome": disposition.summary})
             remember("decision", f"Revise remaining plan after step {step.index}: {disposition.revise_reason}",
                      f"plan revision: {disposition.revise_reason}", provenance=f"step{step.index} review")
-            if revisions >= max_plan_revisions:
-                emit("status", f"plan-revision budget ({max_plan_revisions}) reached; keeping current plan",
-                     {"status": "revision_budget"})
-                continue  # don't thrash; proceed with the existing tail
-            revisions += 1
-            result.revisions = revisions
-            revised = evolve_plan(goal, plan, disposition.revise_reason, memory, models=models,
-                                  ledger=ledger, client=client, memory_budget_tokens=mem_budget, brain_role=brain_role)
-            if revised is None:
-                result.status = STATUS_ABORTED_BY_BRAIN
-                emit("status", "brain aborted: goal deemed unreachable", {"status": STATUS_ABORTED_BY_BRAIN})
-                break
             plan = _adopt_revision(plan, revised)
             result.plan = plan
             emit("plan_revised", f"plan revised: {len(plan.remaining())} new step(s)",

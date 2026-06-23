@@ -63,6 +63,32 @@ def test_bash_captures_stdout_and_exit_code(tmp_path):
     assert "[exit 0]" in out
 
 
+def test_bash_times_out_and_returns_friendly_message(tmp_path):
+    """A command exceeding bash_timeout_s is killed and reported -- it must not
+    hang the worker thread forever (a server/REPL/tail -f would otherwise block)."""
+    import subprocess as _sp
+    # Use a real subprocess with a tight timeout -- sleep 3 with timeout 0.5s.
+    tools = Tools(tmp_path, bash_timeout_s=0.5)
+    out = tools.bash("python -c \"import time; time.sleep(3)\"")
+    assert "timed out" in out
+    assert "0.5s" in out
+
+
+def test_bash_timeout_none_is_unbounded(tmp_path, monkeypatch):
+    """bash_timeout_s=None disables the timeout -- the subprocess.run call gets
+    timeout=None (the stdlib default: wait forever). Verify the kwarg is passed."""
+    calls = _record_subprocess(monkeypatch)
+    Tools(tmp_path, bash_timeout_s=None).bash("echo hi")
+    assert calls and calls[0][1].get("timeout") is None
+
+
+def test_bash_timeout_passed_to_subprocess(tmp_path, monkeypatch):
+    """The configured timeout reaches subprocess.run's timeout kwarg."""
+    calls = _record_subprocess(monkeypatch)
+    Tools(tmp_path, bash_timeout_s=45.0).bash("echo hi")
+    assert calls and calls[0][1].get("timeout") == 45.0
+
+
 def test_path_escape_is_rejected(tmp_path):
     tools = Tools(tmp_path)
     with pytest.raises(PathEscapeError):
@@ -72,6 +98,19 @@ def test_path_escape_is_rejected(tmp_path):
 def test_read_missing_file_raises_tool_error(tmp_path):
     with pytest.raises(ToolError):
         Tools(tmp_path).read("does-not-exist.txt")
+
+
+def test_resolve_oserror_surfaces_as_tool_error(tmp_path, monkeypatch):
+    """An OSError during Path.resolve() (network mount, broken symlink, permission)
+    must surface as a ToolError (recoverable), not crash the run with an OSError."""
+    from pathlib import Path as _Path
+
+    def boom(self, *args, **kwargs):
+        raise OSError("simulated filesystem error")
+
+    monkeypatch.setattr(_Path, "resolve", boom)
+    with pytest.raises(ToolError, match="cannot resolve path"):
+        Tools(tmp_path).read("somefile.txt")
 
 
 def test_nested_path_inside_root_still_works(tmp_path):

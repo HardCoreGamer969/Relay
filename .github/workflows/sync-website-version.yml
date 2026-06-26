@@ -1,0 +1,74 @@
+name: sync-website-version
+
+# Keeps website/index.html's version badge in lock-step with the code version
+# (relay/__init__.py). Fires when the version source changes on main, on a
+# published release, or manually. If the website needs updating it commits the
+# change back to main. (Pushes by GITHUB_TOKEN don't retrigger workflows, and the
+# bot commit touches only website/, which isn't in this workflow's path filter —
+# so there's no loop.)
+on:
+  push:
+    branches: [main]
+    paths:
+      - "relay/__init__.py"
+      - "pyproject.toml"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-website-version
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Always operate on the default branch so the commit can be pushed (a
+      # release event would otherwise check out a detached tag). Note: the badge
+      # tracks main HEAD's __version__ (the source of truth), NOT a release tag —
+      # if a release is ever cut from a commit ahead of main, sync that manually.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - uses: astral-sh/setup-uv@v8
+        with:
+          python-version: "3.12"
+
+      - name: Resolve code version
+        id: ver
+        run: echo "version=$(uv run --no-project python scripts/sync_version.py --print)" >> "$GITHUB_OUTPUT"
+
+      - name: Sync website badge to code version
+        run: uv run --no-project python scripts/sync_version.py
+
+      - name: Commit if the website changed
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          if git diff --quiet -- website/index.html; then
+            echo "website already at v${VERSION}; nothing to commit."
+            exit 0
+          fi
+          git config user.name "relay-bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add website/index.html
+          git commit -m "chore(website): sync version badge to v${VERSION} [skip ci]"
+          # Tolerate a concurrent developer push (rebase + retry). If the push is
+          # still refused (e.g. branch protection on main), degrade to a warning
+          # rather than failing every version bump — sync manually or via PR then.
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${DEFAULT_BRANCH}"; then
+              echo "pushed website version sync to ${DEFAULT_BRANCH}."
+              exit 0
+            fi
+            echo "push attempt ${attempt} failed; rebasing on ${DEFAULT_BRANCH}…"
+            git pull --rebase origin "${DEFAULT_BRANCH}" || break
+          done
+          echo "::warning::version-sync could not push to ${DEFAULT_BRANCH} (branch protection?). Run 'python scripts/sync_version.py' and commit website/index.html manually or via PR."

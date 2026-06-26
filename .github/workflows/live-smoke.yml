@@ -1,0 +1,44 @@
+name: live-smoke
+
+# A CANARY, not a merge gate. These tests hit a real cheap model (DeepSeek
+# deepseek-v4-flash) to prove the brain<->hands relay and the safety rails work
+# end to end. Keep this OFF required status checks — model flakiness should alert,
+# not block. It runs nightly and on demand; PRs/forks (no secret) skip cleanly.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * *" # 07:00 UTC nightly
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-smoke
+  cancel-in-progress: false
+
+jobs:
+  live:
+    name: live brain↔hands smoke (DeepSeek)
+    runs-on: ubuntu-latest
+    # Hard cap: a hung provider call can't pin a billable runner for the default
+    # 6 hours. The per-session USD cap bounds spend; this bounds wall-clock.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Sync (from lockfile)
+        run: uv sync --extra dev --frozen
+
+      # If DEEPSEEK_API_KEY is unset (e.g. a fork), the live fixtures SKIP rather
+      # than fail, so this stays green. A per-session USD cap (RELAY_LIVE_BUDGET_USD)
+      # plus per-test ceilings make a runaway loop impossible to overspend.
+      # --reruns 1 absorbs a transient API blip without masking a real failure.
+      - name: Run live tests
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          RELAY_LIVE_MODEL: deepseek-v4-flash
+          RELAY_LIVE_BUDGET_USD: "0.50"
+        run: uv run python -m pytest tests/live -m live -v --reruns 1 --reruns-delay 5

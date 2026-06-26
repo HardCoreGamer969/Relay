@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "pytest-socket", "pytest-rerunfailures"]
 
 # The brand is "Relay" and the CLI command is `relay`. The PyPI distribution
 # name is `relay-cli` because the bare `relay` name is taken on the registries.
@@ -30,3 +30,14 @@ relay = "relay.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["relay"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The default suite is the network-free unit/integration tests. Live tests
+# (tests/live/) hit a real provider API and are opt-in: they carry the ``live``
+# marker and are DESELECTED by default here. CI's live-smoke job re-selects them
+# with ``-m live`` (a later ``-m`` on the command line overrides this one).
+addopts = "-m 'not live'"
+markers = [
+    "live: real cheap-model integration test that calls a provider API; needs a provider key; deselected by default",
+]

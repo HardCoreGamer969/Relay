@@ -1,0 +1,88 @@
+name: quality
+
+# Lightweight guards that defend Relay's own stated invariants: a current lockfile,
+# a buildable package + working CLI entry point, a website version that matches the
+# code, no leaked secrets, and (advisory) lint.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lockfile:
+    name: lockfile up to date
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+      - name: Assert uv.lock matches pyproject.toml
+        run: uv lock --check
+
+  build:
+    name: build + CLI smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Build wheel + sdist
+        run: uv build
+      - name: CLI entry point resolves and runs
+        run: |
+          uv run --frozen relay --help
+          uv run --frozen python -c "import relay; print('relay', relay.__version__)"
+
+  website-version:
+    name: website version matches code
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v8
+        with:
+          python-version: "3.12"
+      # stdlib-only script; --no-project skips installing project deps.
+      - name: Check website version badge is in sync
+        run: uv run --no-project python scripts/sync_version.py --check
+
+  secret-scan:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE is only required for ORGANIZATION-owned repos; a
+          # personal/public repo needs no license. Add it as a secret if this repo
+          # later moves under an org.
+
+  lint:
+    name: ruff (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Advisory until the codebase formally adopts ruff: this job never blocks a
+    # merge — it surfaces lint/format drift without forcing a big upfront cleanup.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Lint
+        run: uvx ruff check relay tests scripts
+      - name: Format check
+        run: uvx ruff format --check relay tests scripts

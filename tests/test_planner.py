@@ -240,20 +240,36 @@ def test_review_revise_plan(monkeypatch, tmp_path):
     assert "config" in review.reason
 
 
-def test_review_empty_followup_downgrades_to_accept(monkeypatch, tmp_path):
+def test_review_empty_followup_downgrades_to_followup_with_hint(monkeypatch, tmp_path):
+    """v0.0.32 (0.2): the v0.0.31 behavior here was a silent rubber-stamp --
+    a ``<verdict>follow_up</verdict>`` with no followup instruction was
+    downgraded to ``accept``, letting an un-actionable follow-up through.
+    The new fail-CLOSED contract: a follow-up with no instruction is
+    STILL a follow-up, but with a clear "say WHAT you want fixed" hint
+    so the next review turn has something to act on.
+    """
     monkeypatch.setattr(planner_mod, "call_model", _FakeBrain("<verdict>follow_up</verdict>"))
     plan = _one_step_plan()
     review = review_step("g", plan, plan.steps[0], "did it", [], PlanMemory(),
                          tools=Tools(tmp_path), models=CFG, client=object())
-    assert review.verdict == "accept"  # unactionable follow-up -> accept
+    assert review.verdict == "follow_up"
+    assert "followup" in review.followup.lower()  # the hint names the problem
 
 
-def test_review_unparseable_defaults_to_accept(monkeypatch, tmp_path):
+def test_review_unparseable_defaults_to_followup(monkeypatch, tmp_path):
+    """v0.0.32 (0.2): the v0.0.31 behavior was a silent rubber-stamp on any
+    unparseable review -- missing verdict, prose-only reply, ...
+    defaulted to ``accept``. The new fail-CLOSED contract: an unparseable
+    non-empty reply is a ``follow_up`` with a clear "verdict tag missing"
+    hint. (An EMPTY reply -- the safe_default path from budget exhaustion
+    -- still accepts, because we have nothing to act on.)
+    """
     monkeypatch.setattr(planner_mod, "call_model", _FakeBrain("looks fine to me, nice work"))
     plan = _one_step_plan()
     review = review_step("g", plan, plan.steps[0], "did it", [], PlanMemory(),
                          tools=Tools(tmp_path), models=CFG, client=object())
-    assert review.verdict == "accept"
+    assert review.verdict == "follow_up"
+    assert "verdict" in review.followup.lower()  # names what's missing
 
 
 # --- v0.0.24: the AGENTIC reviewer reads the real work before verdicting --------
@@ -329,22 +345,28 @@ def test_agentic_reviewer_accepts_correct_file_a_blind_reviewer_would_reject(mon
     assert brain.calls == 2             # read, then accept (the read is what enabled the judgment)
 
     # Contrast: with NO filesystem handle the same brain never sees the contents, so it
-    # cannot reason its way to accept -- it burns its budget and falls back to the safe
-    # default. The READ is what turns a blind default into a genuine judgment.
+    # cannot reason its way to accept -- it burns its budget and falls back to the
+    # safe default. v0.0.32 (0.2): the safe default is now ``follow_up`` (fail CLOSED)
+    # rather than the v0.0.31 silent accept -- a stuck reviewer must NOT rubber-stamp.
+    # The READ is what turns a follow-up into a genuine accept.
     brain_blind = _ContentAwareBrain("CORRECT_IMPLEMENTATION")
     monkeypatch.setattr(planner_mod, "call_model", brain_blind)
     review_blind = review_step(
         "g", plan, plan.steps[0], "wrote impl.py", blind_transcript, PlanMemory(),
         tools=None, touched_paths=["impl.py"], max_review_steps=3, models=CFG, client=object(),
     )
-    assert review_blind.verdict == "accept"   # ...but only via the safe default
-    assert brain_blind.calls == 3             # ...after exhausting the budget, never seeing the file
+    assert review_blind.verdict == "follow_up"  # ...only via the (now fail-CLOSED) safe default
+    assert brain_blind.calls == 3               # ...after exhausting the budget, never seeing the file
 
 
-def test_reviewer_budget_exhaustion_falls_back_to_accept(monkeypatch, tmp_path):
+def test_reviewer_budget_exhaustion_fails_closed(monkeypatch, tmp_path):
     (tmp_path / "f.py").write_text("x = 1\n", encoding="utf-8")
     # A brain that investigates forever and never verdicts -> bounded by max_review_steps,
-    # then the safe accept default (running out of review budget must not block progress).
+    # then the safe default fires. v0.0.32 (0.2): the safe default is now ``follow_up``
+    # (fail CLOSED) -- a stuck reviewer that never verdicts must NOT rubber-stamp
+    # accept. The follow-up text names the parse problem so the next turn has
+    # something to act on; the run will exhaust the follow-up budget and the
+    # step will fail, which is the right outcome (don't accept an unverified step).
     brain = _ScriptedBrain('<read path="f.py"/>')  # always reads, never a verdict
     monkeypatch.setattr(planner_mod, "call_model", brain)
     plan = _one_step_plan()
@@ -353,7 +375,8 @@ def test_reviewer_budget_exhaustion_falls_back_to_accept(monkeypatch, tmp_path):
         tools=Tools(tmp_path), touched_paths=["f.py"], max_review_steps=3,
         models=CFG, client=object(),
     )
-    assert review.verdict == "accept"
+    assert review.verdict == "follow_up"  # was "accept" in v0.0.31
+    assert "verdict" in review.followup.lower()  # names the parse problem
     assert brain.calls == 3  # exactly the review budget -- no infinite loop
 
 

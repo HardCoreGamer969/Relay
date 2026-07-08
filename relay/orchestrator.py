@@ -22,6 +22,7 @@ substrate. All loops are bounded so a weak model cannot burn money in a spiral.
 from __future__ import annotations
 
 import platform
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -74,6 +75,12 @@ STATUS_UNRESOLVED_ESCALATION = "unresolved_escalation"
 # clean terminal status, not an error: a cancelled run still gets its result
 # turn and compacted transcript.
 STATUS_CANCELLED = "cancelled"
+# v0.0.32: a hard cost ceiling (``--max-cost`` / ``RELAY_MAX_COST``) was
+# reached. The run stops the moment ``ledger.total_cost()`` crosses the
+# ceiling at the step boundary -- a real-money safety net, distinct from
+# the per-step / per-run call-count ceilings. Shown to the user with the
+# spent-and-limit pair so they can decide to raise and resume.
+STATUS_MAX_COST = "max_cost"
 
 _EXECUTOR_SYSTEM_PROMPT_TEMPLATE = """\
 You are the EXECUTOR (the "hands") of Relay. You carry out ONE step of a larger
@@ -171,6 +178,72 @@ def build_executor_system_prompt(
 EXECUTOR_SYSTEM_PROMPT = build_executor_system_prompt()
 
 
+# v0.0.32 (0.2): the parse-failure nudge is now SPECIFIC, not generic.
+# Instead of a single catch-all "no valid action" hint, the nudge names
+# the specific shape that came closest to working -- a recognized
+# tag-name with a wrong shape (e.g. ``<edit`` with no closing ``>``,
+# ``<done`` with no body, an unclosed ``<bash>``) -- so the model can
+# correct the next turn. The generic nudge was the v0.0.31 behavior:
+# the model would re-emit the SAME malformed tag because the hint never
+# named what was wrong.
+def _specific_parse_failure_nudge(text: str) -> str:
+    """A targeted hint for the most common malformed-tag shapes.
+
+    Looks at the raw reply for one of the four known-failure modes and
+    returns a nudge that names the problem. Falls back to the generic
+    hint if none of the specific patterns match (the common case of
+    "the model just emitted prose with no tag at all").
+    """
+    s = text or ""
+    # Unclosed block tag: an opening ``<edit ...>``, ``<bash>``, etc.
+    # with no matching close. Look for a ``<name`` that's not followed
+    # by a ``</name>`` somewhere later.
+    open_unclosed = re.search(
+        r"<(edit|write|bash|apply_patch|done|blocked|question|finding|plan|abort|"
+        r"thinking|step|followup|reason|verdict|headline|scope|reaction|decision|"
+        r"ask|assume|record)\b[^>]*>",
+        s,
+        re.IGNORECASE,
+    )
+    has_any_close = re.search(
+        r"</(edit|write|bash|apply_patch|done|blocked|question|finding|plan|abort|"
+        r"thinking|step|followup|reason|verdict|headline|scope|reaction|decision|"
+        r"ask|assume|record)>",
+        s,
+        re.IGNORECASE,
+    )
+    # A "self-closing" tag that didn't close: e.g. ``<read path="x"`` (no ``/>``).
+    unterminated_self_close = re.search(
+        r"<(read|list|grep|glob|webfetch|mkdir)\b[^/>]*$", s, re.IGNORECASE | re.DOTALL
+    )
+    if open_unclosed and not has_any_close:
+        return (
+            f"Your reply opened a ``{open_unclosed.group(0).split(' ')[0]}...`` tag "
+            "but never closed it. Re-emit the SAME action with a matching closing "
+            "tag (e.g. <bash>cmd</bash>). Block tags MUST be balanced: opening AND "
+            "closing tag, in that order."
+        )
+    if unterminated_self_close:
+        return (
+            "Your reply has an unterminated self-closing tag (e.g. ``<read "
+            'path="x"`` without a trailing ``/>``). Self-closing tags MUST end '
+            "with ``/>`` (slash then greater-than) on the same line."
+        )
+    # Catch the case where the model used double-quotes for an attribute
+    # whose value itself contains a double-quote (e.g. a path with a "
+    # in it): the regex would have stopped at the first internal quote.
+    if re.search(r'=\s*"[^"]*"[^"]*"', s):
+        return (
+            'An attribute value contains a literal double-quote -- e.g. '
+            'path="with"quote". Switch to single-quotes for the value (path=\'with"quote\') '
+            "or remove the embedded quote. The parser can't represent a path with a "
+            'double-quote in it inside a double-quoted attribute value.'
+        )
+    # The fallback: the model emitted prose with no tag at all, or an
+    # unrecognised tag. Name the recognized set so it can pick one.
+    return _EXEC_PARSE_NUDGE
+
+
 _EXEC_PARSE_NUDGE = (
     "No valid action was found. Emit exactly one protocol tag, e.g. "
     '<read path="..."/>, <edit path="...">...</edit>, <bash>...</bash>, '
@@ -210,6 +283,9 @@ class PlannedTaskResult:
     # The effective global step ceiling for this run (None = unbounded), so a
     # surface can tell the user how to raise it when STATUS_MAX_STEPS is hit.
     max_total_steps: int | None = None
+    # v0.0.32: the cost ceiling (None = unbounded), so a surface can tell
+    # the user how to raise it when STATUS_MAX_COST is hit.
+    max_cost: float | None = None
     # The continuous conversation thread (planning turns, mid-run escalations,
     # decisions, the result turn). ``transcript`` is the full live thread (source
     # of truth); ``transcript_compacted`` is its post-execution readable form.
@@ -371,7 +447,7 @@ def _run_executor_step(
         if parsed.is_parse_failure:
             if ledger is not None:
                 ledger.record_parse_failure()
-            consecutive_parse_failures += 1
+                consecutive_parse_failures += 1
             if emit is not None:
                 emit("exec_parse_failure", "no valid action", {"snippet": " ".join(reply.split())[:200]})
             if consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
@@ -379,7 +455,7 @@ def _run_executor_step(
                     False, failure_reason="executor produced no valid actions (parse-failure abort)",
                     calls=calls, transcript=transcript,
                 )
-            messages.append({"role": "user", "content": _EXEC_PARSE_NUDGE})
+            messages.append({"role": "user", "content": _specific_parse_failure_nudge(reply)})
             continue
         consecutive_parse_failures = 0
 
@@ -404,7 +480,13 @@ def _run_executor_step(
                 continue  # already surfaced in the pre-pass above
             if action.kind == "blocked":
                 reason = action.content or "no reason given"
-                return _StepOutcome(False, failure_reason=f"blocked: {reason}", calls=calls, transcript=transcript)
+                # v0.0.32 (0.2): touched paths flow even on blocked -- a blocked
+                # step that wrote files first (e.g. partial refactor) still
+                # produced a touched-path set the reviewer should see.
+                return _StepOutcome(
+                    False, failure_reason=f"blocked: {reason}", calls=calls,
+                    transcript=transcript, touched_paths=touched,
+                )
             if action.kind == "done":
                 return _StepOutcome(
                     True, summary=action.content or "step complete", calls=calls,
@@ -415,13 +497,14 @@ def _run_executor_step(
                 if resolve_question is None:
                     return _StepOutcome(
                         False, failure_reason=f"executor asked a question but no resolver was available: {question}",
-                        calls=calls, transcript=transcript,
+                        calls=calls, transcript=transcript, touched_paths=touched,
                     )
                 resolution = resolve_question(question)
                 if resolution.unresolved:
                     return _StepOutcome(
                         False, failure_reason=f"unresolved escalation: {question}", calls=calls,
                         transcript=transcript, unresolved=True, unresolved_question=question,
+                        touched_paths=touched,
                     )
                 answer_obs = f"[question]\nANSWER: {resolution.answer}"
                 observations.append(answer_obs)
@@ -490,8 +573,9 @@ def friendly_terminal_message(status: str, *, max_total_steps: int | None = None
     status has no special friendly form (the caller keeps its own wording).
 
     Covers the terminals a user can do something about: the stuck-loop pair
-    (``escalation_limit`` / ``repeated_step``) and the global step ceiling
-    (``max_steps``). Says, in plain terms, what happened and what to try next.
+    (``escalation_limit`` / ``repeated_step``), the global step ceiling
+    (``max_steps``), and the cost ceiling (``max_cost``). Says, in plain
+    terms, what happened and what to try next.
     """
     if status in (STATUS_ESCALATION_LIMIT, STATUS_REPEATED_STEP):
         return (
@@ -505,6 +589,13 @@ def friendly_terminal_message(status: str, *, max_total_steps: int | None = None
             "limit. If the project is genuinely large, raise it with --max-total-steps, "
             "the RELAY_MAX_TOTAL_STEPS env var, or the config, then re-run -- or restate "
             "the goal as smaller steps and review the partial work."
+        )
+    if status == STATUS_MAX_COST:
+        return (
+            "Relay hit its cost ceiling and stopped as a safety limit (a real-money "
+            "guard, not a call-count guard). To continue: raise --max-cost (or set "
+            "RELAY_MAX_COST, or the max_cost field in config.json), then re-run -- or "
+            "split the goal and review the partial work that already paid for itself."
         )
     return None
 
@@ -587,6 +678,7 @@ def run_planned(
     max_review_steps: int = 4,
     max_plan_revisions: int = 5,
     max_total_steps: int | None = None,
+    max_cost: float | None = None,
     context_window: int | None = None,
     catalog: Any | None = None,
     on_event: EventCallback | None = None,
@@ -648,6 +740,7 @@ def run_planned(
     transcript = transcript if transcript is not None else Transcript()
     result = PlannedTaskResult(goal=goal, ledger=ledger, memory=memory, transcript=transcript)
     result.max_total_steps = max_total_steps  # so a surface can tell the user how to raise it
+    result.max_cost = max_cost  # so a surface can tell the user how to raise it (the cost ceiling)
 
     cfg = models if models is not None else load_models()
     # v0.0.29: resolve BOTH actor windows and budget each pool to its own (passing
@@ -916,6 +1009,24 @@ def run_planned(
                      {"status": STATUS_MAX_STEPS, "max_total_steps": max_total_steps})
                 break
             step_budget = min(max_executor_steps, remaining)
+
+        # Cost ceiling guard (v0.0.32): the user-set hard cap on dollars spent
+        # (--max-cost / RELAY_MAX_COST). Checked at the step boundary, same
+        # seam as max_total_steps, so the run halts BEFORE the next step
+        # starts rather than mid-call. ``ledger.total_cost()`` is None when no
+        # call has reported a cost yet (e.g. a provider that doesn't return
+        # cost) -- in that case the guard has no signal to act on and we let
+        # the call-count ceiling carry the run.
+        if max_cost is not None and ledger is not None:
+            spent = ledger.total_cost()
+            if spent is not None and spent >= max_cost:
+                result.status = STATUS_MAX_COST
+                emit(
+                    "status",
+                    f"stopped: spent ${spent:.4f}, reached the cost ceiling (${max_cost:.4f})",
+                    {"status": STATUS_MAX_COST, "spent": spent, "max_cost": max_cost},
+                )
+                break
 
         emit("step_start", f"step {step.index}: {step.instruction}",
              {"index": step.index, "instruction": step.instruction})

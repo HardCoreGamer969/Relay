@@ -17,6 +17,7 @@ from relay.memory import POOL_BRAIN, POOL_SHARED, MemoryBus, PlanMemory, memory_
 from relay.orchestrator import (
     STATUS_ABORTED_BY_BRAIN,
     STATUS_ESCALATION_LIMIT,
+    STATUS_MAX_COST,
     STATUS_PLANNING_FAILED,
     STATUS_REPEATED_STEP,
     STATUS_UNRESOLVED_ESCALATION,
@@ -573,6 +574,105 @@ def test_overall_budget_exhausted_is_max_steps(tmp_path):
     text = [t for t in result.transcript.turns if t.phase == "result"][-1].text
     assert "ceiling" in text.lower()
     assert ("RELAY_MAX_TOTAL_STEPS" in text or "--max-total-steps" in text)
+
+
+# --- v0.0.32: cost ceiling (--max-cost / RELAY_MAX_COST) ---------------------
+
+
+def test_cost_ceiling_fires_when_total_cost_crosses_limit(tmp_path):
+    """A real-money guard, distinct from max_total_steps: the run halts at
+    the step boundary when ledger.total_cost() crosses max_cost. Here, two
+    steps at $0.00002 each -> total $0.00004 -- well under a $0.00003 ceiling
+    after step 0 (since ledger records step 0's $0.00002 + the review's
+    $0.00002 = $0.00004, which is >= 0.00003) -- so the run halts before
+    step 1. This pins the guard end-to-end through run_planned."""
+    # Inject a known cost into the ledger after each call so we can hit the
+    # ceiling deterministically without a real provider returning cost.
+    from relay.telemetry import CallRecord
+
+    real_create = None  # we'll wrap the completions
+
+    class _CostInjectingCompletions:
+        def __init__(self, inner):
+            self.inner = inner
+            self.record_calls = 0
+
+        def create(self, *, model, **kwargs):
+            # Bump cost per call to $0.001, so two brain calls = $0.002 and
+            # the ceiling of $0.0015 fires after the second call.
+            self.record_calls += 1
+            return self.inner.create(model=model, **kwargs)
+
+    # The cheaper approach: monkeypatch ``_extract_cost`` to return 0.001
+    # for every call, so the ledger hits the ceiling after 2 model calls.
+    from relay import models as _models
+    original = _models._extract_cost
+    _models._extract_cost = lambda usage, *, provider, model: 0.001
+    try:
+        client = RoutedClient(
+            brain=[
+                "<plan><step>create a.txt</step><step>create b.txt</step></plan>",
+                "<verdict>accept</verdict>",  # review of step 0
+            ],
+            hands=['<edit path="a.txt">A</edit>\n<done>did a</done>'],
+        )
+        result = run_planned(
+            "g", tmp_path, models=CFG, client=client, max_cost=0.0015
+        )
+        # Total cost is >= the ceiling -> STATUS_MAX_COST, not max_steps.
+        assert result.status == STATUS_MAX_COST
+        # Step 0 ran (a.txt was written); step 1 did NOT.
+        assert (tmp_path / "a.txt").exists()
+        # The ceiling is recorded on the result for the surface to surface.
+        assert result.max_cost == 0.0015
+        # The result turn tells the user how to raise it.
+        text = [t for t in result.transcript.turns if t.phase == "result"][-1].text
+        assert "cost" in text.lower()
+    finally:
+        _models._extract_cost = original
+
+
+def test_no_cost_ceiling_means_no_max_cost_status(tmp_path):
+    """With max_cost=None (default) the cost guard has nothing to do, even
+    if the ledger reports cost -- the run completes or hits another
+    terminal, not max_cost."""
+    from relay import models as _models
+    original = _models._extract_cost
+    _models._extract_cost = lambda usage, *, provider, model: 999.0
+    try:
+        client = RoutedClient(
+            brain=[
+                "<plan><step>create a.txt</step></plan>",
+                "<verdict>accept</verdict>",  # review of step 0
+            ],
+            hands=['<edit path="a.txt">A</edit>\n<done>did a</done>'],
+        )
+        result = run_planned("g", tmp_path, models=CFG, client=client)  # no max_cost
+        assert result.status == STATUS_COMPLETED  # ceiling didn't fire
+    finally:
+        _models._extract_cost = original
+
+
+def test_max_cost_resolves_with_no_ledger_cost_unknown_is_a_noop(tmp_path):
+    """If the provider never returns a cost, ledger.total_cost() is None
+    -- the guard has no signal and falls through (the call-count ceiling
+    or completion carries the run). This is the v0.0.32 contract: a
+    provider that doesn't surface cost is not unfairly throttled."""
+    from relay import models as _models
+    original = _models._extract_cost
+    _models._extract_cost = lambda usage, *, provider, model: None
+    try:
+        client = RoutedClient(
+            brain=[
+                "<plan><step>create a.txt</step></plan>",
+                "<verdict>accept</verdict>",
+            ],
+            hands=['<edit path="a.txt">A</edit>\n<done>did a</done>'],
+        )
+        result = run_planned("g", tmp_path, models=CFG, client=client, max_cost=0.0001)
+        assert result.status == STATUS_COMPLETED  # no cost signal -> no guard
+    finally:
+        _models._extract_cost = original
 
 
 def test_planning_failed(tmp_path):

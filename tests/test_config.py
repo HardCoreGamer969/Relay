@@ -11,6 +11,7 @@ from relay.config import (
     assumption_summary,
     resolve_assumption_level,
     resolve_bash_timeout,
+    resolve_max_cost,
     resolve_max_total_steps,
 )
 
@@ -164,3 +165,60 @@ def test_bash_timeout_invalid_falls_through(monkeypatch):
     assert resolve_bash_timeout(config={"bash_timeout_s": 90}) == 90.0
     monkeypatch.setenv("RELAY_BASH_TIMEOUT", "-5")   # negative -> next source
     assert resolve_bash_timeout(config={}) == 120
+
+
+# --- v0.0.32: max_cost (override > env > config > default-off) ----------------
+
+
+def test_max_cost_defaults_to_unbounded(monkeypatch):
+    """No source => unbounded (None) -- the user's wallet is the default."""
+    monkeypatch.delenv("RELAY_MAX_COST", raising=False)
+    assert resolve_max_cost() is None
+    assert resolve_max_cost(config={}) is None
+
+
+def test_max_cost_env_beats_config(monkeypatch):
+    """RELAY_MAX_COST wins over config.json's max_cost."""
+    monkeypatch.setenv("RELAY_MAX_COST", "1.50")
+    assert resolve_max_cost(config={"max_cost": 9.99}) == 1.50
+
+
+def test_max_cost_config_beats_default(monkeypatch):
+    """config.json's max_cost is the rung below env."""
+    monkeypatch.delenv("RELAY_MAX_COST", raising=False)
+    assert resolve_max_cost(config={"max_cost": 2.0}) == 2.0
+
+
+def test_max_cost_override_beats_env(monkeypatch):
+    """The per-run --max-cost flag wins over env."""
+    monkeypatch.setenv("RELAY_MAX_COST", "1.50")
+    assert resolve_max_cost(override=0.25, config={}) == 0.25
+
+
+def test_max_cost_can_be_disabled(monkeypatch):
+    """0 / off / none -> unbounded (None). Explicit disable, not omission."""
+    monkeypatch.delenv("RELAY_MAX_COST", raising=False)
+    assert resolve_max_cost(override=0, config={}) is None
+    assert resolve_max_cost(override="off", config={}) is None
+    assert resolve_max_cost(override="none", config={}) is None
+    monkeypatch.setenv("RELAY_MAX_COST", "none")
+    assert resolve_max_cost(config={"max_cost": 5.0}) is None
+
+
+def test_max_cost_invalid_falls_through(monkeypatch):
+    """An unparseable value falls through to the next source -- a typo in
+    RELAY_MAX_COST must not silently disable the cost ceiling."""
+    monkeypatch.setenv("RELAY_MAX_COST", "abc")
+    assert resolve_max_cost(config={"max_cost": 0.75}) == 0.75
+    monkeypatch.setenv("RELAY_MAX_COST", "-1")  # negative -> next source
+    assert resolve_max_cost(config={}) is None  # no config -> default None
+
+
+def test_max_cost_accepts_string_and_number(monkeypatch):
+    """Both "1.50" and 1.5 are accepted (typers pass either, depending on
+    context). The resolver is permissive on type so the CLI / env / config
+    sources can each hand it their native shape."""
+    monkeypatch.delenv("RELAY_MAX_COST", raising=False)
+    assert resolve_max_cost(override="1.50") == 1.5
+    assert resolve_max_cost(override=1.5) == 1.5
+    assert resolve_max_cost(config={"max_cost": "0.10"}) == 0.10

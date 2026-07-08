@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Sync the marketing website's displayed version to Relay's single source of truth.
 
-The source of truth for Relay's version is ``relay/__init__.py`` (``__version__``),
-which also matches ``pyproject.toml``. The static website (``website/index.html``)
-shows the version in two places; rather than hand-editing those on every release,
-this script rewrites them from ``__version__`` so they can never drift.
+The source of truth for Relay's version is ``relay/__init__.py`` (``__version__``).
+``pyproject.toml`` declares ``dynamic = ["version"]`` (with ``[tool.hatch.version]
+path = "relay/__init__.py"``) so the wheel and the source agree by construction --
+there is no second place to keep in sync. The static website
+(``website/index.html``) shows the version in two places; rather than
+hand-editing those on every release, this script rewrites them from
+``__version__`` so they can never drift.
 
 The two website spots are marked with stable data attributes so replacement is
 exact (never a fragile match on the version string itself):
@@ -30,7 +33,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 INIT_PY = ROOT / "relay" / "__init__.py"
-PYPROJECT = ROOT / "pyproject.toml"
 WEBSITE = ROOT / "website" / "index.html"
 
 # (data-attribute, prefix shown before the version) for each website spot.
@@ -40,26 +42,18 @@ WEBSITE_SLOTS = (
 )
 
 
-def _read_version(path: Path, pattern: str) -> str:
-    text = path.read_text(encoding="utf-8")
-    match = re.search(pattern, text)
-    if not match:
-        raise SystemExit(f"could not find a version in {path} (pattern: {pattern!r})")
-    return match.group(1)
-
-
 def code_version() -> str:
-    """The authoritative version from ``relay/__init__.py`` (cross-checked vs pyproject)."""
-    version = _read_version(INIT_PY, r'__version__\s*=\s*["\']([^"\']+)["\']')
-    # A drifted pyproject is a real bug; surface it loudly rather than silently
-    # publishing a website version that disagrees with the packaged one.
-    pyproject_version = _read_version(PYPROJECT, r'(?m)^\s*version\s*=\s*["\']([^"\']+)["\']')
-    if pyproject_version != version:
-        raise SystemExit(
-            f"version mismatch: relay/__init__.py is {version!r} but "
-            f"pyproject.toml is {pyproject_version!r}. Reconcile these first."
-        )
-    return version
+    """The authoritative version: ``relay/__init__.py:__version__``.
+
+    This is the SINGLE source of truth -- ``pyproject.toml`` reads it via
+    ``[tool.hatch.version] path = "relay/__init__.py"``, so a drift between
+    source and wheel is impossible by construction. No cross-check needed.
+    """
+    text = INIT_PY.read_text(encoding="utf-8")
+    match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', text)
+    if not match:
+        raise SystemExit(f"could not find a version in {INIT_PY}")
+    return match.group(1)
 
 
 def render(html: str, version: str) -> str:

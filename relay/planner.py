@@ -613,7 +613,7 @@ def review_step(
         seed,
         terminators=("verdict",),
         parse_terminal=_parse_review,
-        safe_default=lambda: _parse_review(""),  # absent verdict -> accept (never blocks)
+        safe_default=lambda: _parse_review(""),  # budget/parse-failure exhausted -> fail-CLOSED (follow_up with hint)
         budget=max_review_steps,
         tools=tools,
         brain_role=brain_role,
@@ -629,13 +629,73 @@ def review_step(
 
 
 def _parse_review(text: str) -> StepReview:
-    verdict = (_tag("verdict", text) or "accept").lower()
+    """Parse the reviewer's ``<verdict>...</verdict>`` reply.
+
+    v0.0.32 (0.2): the v0.0.31 behavior defaulted to ``accept`` on ANY
+    parse failure (missing verdict, unknown verdict, missing followup,
+    AND the safe_default path triggered by budget exhaustion). All of
+    those were silent rubber-stamps -- a reviewer that's supposed to
+    catch a bad edit would ACCEPT a bad edit whenever the brain got
+    confused, ran out of tokens, or hit the parse-failure cap. The new
+    contract: any unparseable reply -- empty, missing verdict, unknown
+    verdict, missing followup -- is flagged as ``follow_up`` (with a
+    clear, non-blank reason naming the parse problem), so a real review
+    is forced to happen next turn. The follow-up text is the parse
+    problem itself -- e.g. "verdict tag missing" -- which the hands can
+    act on or the brain can refine. A stuck review will exhaust the
+    follow-up budget, which marks the step failed; the v0.0.31 default
+    was to accept silently, which never failed.
+    """
+    if not (text or "").strip():
+        # The investigation ran out of budget / parse-failure budget and
+        # gave up. The v0.0.31 safe_default was accept; the v0.0.32
+        # fail-CLOSED contract says: even an empty reply should be a
+        # follow-up, not a silent accept, so the run fails open.
+        return StepReview(
+            verdict="follow_up",
+            followup=(
+                "review budget exhausted without a verdict -- emit "
+                "<verdict>accept|follow_up|revise_plan</verdict> explicitly"
+            ),
+            reason="review produced no verdict (budget exhausted or empty reply)",
+            records=[],
+        )
+
+    raw_verdict = _tag("verdict", text)
+    if raw_verdict is None:
+        # Missing verdict tag on a non-empty reply: the reviewer SAID
+        # something but didn't follow the grammar. Fail CLOSED -- force
+        # a corrective follow-up rather than rubber-stamping.
+        return StepReview(
+            verdict="follow_up",
+            followup="verdict tag missing -- emit <verdict>accept|follow_up|revise_plan</verdict>",
+            reason="review reply did not contain a verdict tag",
+            records=_parse_records(text),
+        )
+    verdict = raw_verdict.lower()
     if verdict not in ("accept", "follow_up", "revise_plan"):
-        verdict = "accept"  # unparseable verdict -> don't block progress
+        # Unrecognized verdict: also fail CLOSED.
+        return StepReview(
+            verdict="follow_up",
+            followup=(
+                f"verdict {raw_verdict!r} is not one of accept|follow_up|revise_plan -- "
+                "emit a recognized verdict"
+            ),
+            reason=f"unrecognized verdict value: {raw_verdict!r}",
+            records=_parse_records(text),
+        )
     followup = _tag("followup", text) or ""
     reason = _tag("reason", text) or ""
     if verdict == "follow_up" and not followup.strip():
-        verdict = "accept"  # a follow-up with no instruction is unactionable
+        # A follow-up with no instruction: still fail CLOSED, but with
+        # a clear "say WHAT you want fixed" followup so the next turn
+        # can recover.
+        return StepReview(
+            verdict="follow_up",
+            followup="<followup> tag is empty -- name the specific change you want",
+            reason="follow_up verdict with no followup instruction",
+            records=_parse_records(text),
+        )
     return StepReview(
         verdict=verdict, followup=followup.strip(), reason=reason.strip(), records=_parse_records(text)
     )

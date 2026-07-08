@@ -206,7 +206,6 @@ def parse(text: str) -> ParseResult:
 
     consume(_WRITE_RE, _add_write)
     consume(_ABORT_RE, lambda m: placed.append((m.start(), Action(kind="abort", content=m.group(1).strip()))))
-    consume(_BLOCKED_RE, lambda m: placed.append((m.start(), Action(kind="blocked", content=m.group(1).strip()))))
 
     def _add_edit(m: re.Match[str]) -> None:
         path = _attrs(m.group(1)).get("path")
@@ -217,13 +216,17 @@ def parse(text: str) -> ParseResult:
 
     consume(_EDIT_RE, _add_edit)
     consume(_BASH_RE, lambda m: placed.append((m.start(), Action(kind="bash", content=m.group(1).strip()))))
-    consume(_DONE_RE, lambda m: placed.append((m.start(), Action(kind="done", content=m.group(1).strip()))))
-    # After edit/bash/done so a <question> mentioned inside one of their bodies
-    # (e.g. an <edit> file body) is masked first and not parsed as a loose action.
+    # v0.0.32 (0.2): consume <question> and <finding> BEFORE <done> and
+    # <blocked>, so a literal ``<done>`` / ``<blocked>`` written inside a
+    # question/finding body is masked out and not falsely parsed as a
+    # step terminator. The old order parsed done/blocked first, so a
+    # ``<question>...<done>bar</done>...</question>`` turn would emit
+    # a phantom "done" action and the step would falsely complete. Same
+    # masking rationale for finding.
     consume(_QUESTION_RE, lambda m: placed.append((m.start(), Action(kind="question", content=m.group(1).strip()))))
-    # <finding> (v0.0.29) last among the block tags, same masking rationale as
-    # <question>: a <finding> written inside an <edit>/<bash> body is masked first.
     consume(_FINDING_RE, lambda m: placed.append((m.start(), Action(kind="finding", content=m.group(1).strip()))))
+    consume(_DONE_RE, lambda m: placed.append((m.start(), Action(kind="done", content=m.group(1).strip()))))
+    consume(_BLOCKED_RE, lambda m: placed.append((m.start(), Action(kind="blocked", content=m.group(1).strip()))))
 
     # Self-closing tags last, scanned over the fully-masked text.
     for m in _SELF_CLOSING_RE.finditer(masked):

@@ -269,3 +269,175 @@ def test_exhausts_retries_then_propagates(monkeypatch):
             "brain", [{"role": "user", "content": "hi"}], models=cfg, ledger=Ledger(), client=client
         )
     assert client.calls == 3  # 1 initial + 2 retries = 3 total attempts
+
+
+# --- v0.0.32: connection-error retry + Retry-After + jitter + timeout --------
+
+
+def test_retries_on_api_connection_error(monkeypatch):
+    """An openai.APIConnectionError (TCP reset / DNS failure / TLS handshake)
+    is retried -- the v0.0.31 fix: a single transient network blip used to
+    propagate and abort the whole run."""
+    from openai import APIConnectionError
+    monkeypatch.setattr("relay.models.time.sleep", lambda s: None)
+    cfg = ModelConfig(brain="vendor/brain-model", hands="vendor/hands-model")
+
+    # APIConnectionError takes a single ``request`` arg; we build a stub
+    # that quacks like an httpx Request for the constructor.
+    class _StubCompletions:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise APIConnectionError(request=None)
+            return make_response("ok", 5, 5, 0.0001)
+
+    class _StubClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=_StubCompletions())
+
+    result = call_model(
+        "brain", [{"role": "user", "content": "hi"}], models=cfg, ledger=Ledger(), client=_StubClient()
+    )
+    assert result.text == "ok"
+    # (2 calls = 1 connection error + 1 success)
+
+
+def test_retries_on_api_timeout_error(monkeypatch):
+    """An openai.APITimeoutError (a request timed out) is also retried --
+    the v0.0.32 explicit ``timeout`` kwarg makes timeouts surface as
+    APITimeoutError instead of hanging, and we treat it as retriable."""
+    from openai import APITimeoutError
+    monkeypatch.setattr("relay.models.time.sleep", lambda s: None)
+    cfg = ModelConfig(brain="vendor/brain-model", hands="vendor/hands-model")
+    client = _RetryingClient(fail_times=1, error_cls=APITimeoutError, status=None)
+
+    result = call_model(
+        "brain", [{"role": "user", "content": "hi"}], models=cfg, ledger=Ledger(), client=client
+    )
+    assert result.text == "ok"
+    assert client.calls == 2
+
+
+def test_honors_retry_after_header(monkeypatch):
+    """When the provider's ``Retry-After`` header is present, its value (in
+    seconds) is used for the sleep instead of the exponential-backoff
+    fallback. The v0.0.32 fix -- the openai SDK ignores Retry-After itself."""
+    sleeps: list[float] = []
+
+    class _RespWithHeader:
+        status_code = 429
+        headers = {"Retry-After": "7"}
+
+        def __init__(self):
+            self.status_code = 429
+            self.headers = {"Retry-After": "7"}
+
+    class _ErrorWithHeader(Exception):
+        def __init__(self):
+            super().__init__("HTTP 429")
+            self.status_code = 429
+            self.response = _RespWithHeader()
+
+    class _Completions:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise _ErrorWithHeader()
+            return make_response("ok", 5, 5, 0.0001)
+
+    class _Client:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=_Completions())
+
+    def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr("relay.models.time.sleep", fake_sleep)
+    cfg = ModelConfig(brain="vendor/brain-model", hands="vendor/hands-model")
+    client = _Client()
+    result = call_model(
+        "brain", [{"role": "user", "content": "hi"}], models=cfg, ledger=Ledger(), client=client
+    )
+    assert result.text == "ok"
+    assert client.chat.completions.calls == 2
+    assert sleeps == [7.0]  # Retry-After honored, not the exponential fallback
+
+
+def test_exponential_backoff_with_jitter(monkeypatch):
+    """When no Retry-After is present, the sleep follows exponential backoff
+    with jitter: base = 0.5 * 2**attempt, capped at 30s, plus uniform jitter
+    in [0, base). On attempt 0, base = 0.5; on attempt 1, base = 1.0. The
+    test asserts the sleep is within [base, 2*base)."""
+    sleeps: list[float] = []
+
+    def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr("relay.models.time.sleep", fake_sleep)
+    monkeypatch.setenv("RELAY_MAX_RETRIES", "2")
+    cfg = ModelConfig(brain="vendor/brain-model", hands="vendor/hands-model")
+    client = _RetryingClient(fail_times=2, status=503)
+
+    result = call_model(
+        "brain", [{"role": "user", "content": "hi"}], models=cfg, ledger=Ledger(), client=client
+    )
+    assert result.text == "ok"
+    assert len(sleeps) == 2
+    # attempt 0: base=0.5, sleep in [0.5, 1.0)
+    assert 0.5 <= sleeps[0] < 1.0, f"first sleep {sleeps[0]} not in [0.5, 1.0)"
+    # attempt 1: base=1.0, sleep in [1.0, 2.0)
+    assert 1.0 <= sleeps[1] < 2.0, f"second sleep {sleeps[1]} not in [1.0, 2.0)"
+
+
+def test_request_timeout_is_passed_explicitly(monkeypatch):
+    """The explicit ``timeout`` kwarg is forwarded to ``client.chat.completions.create``
+    so a hung provider can't stall a step on the SDK's 600s default. We
+    pin it to 120s here to prove the kwarg flows through."""
+    seen: dict = {}
+
+    class _Completions:
+        def create(self, **kwargs):
+            seen.update(kwargs)
+            return make_response("ok", 5, 5, 0.0001)
+
+    class _Client:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=_Completions())
+
+    monkeypatch.setenv("RELAY_REQUEST_TIMEOUT_S", "120")
+    cfg = ModelConfig(brain="vendor/brain-model", hands="vendor/hands-model")
+    call_model(
+        "brain", [{"role": "user", "content": "hi"}], models=cfg, ledger=Ledger(), client=_Client()
+    )
+    assert seen.get("timeout") == 120.0
+
+
+def test_request_timeout_default_is_explicit_and_bounded(monkeypatch):
+    """Without an env override, the timeout is the SDK default (600s) but
+    is now passed EXPLICITLY rather than relying on the SDK's implicit
+    default. The fact that it's a kwarg at all is the fix -- the v0.0.31
+    bug was a fully implicit 600s."""
+    seen: dict = {}
+
+    class _Completions:
+        def create(self, **kwargs):
+            seen.update(kwargs)
+            return make_response("ok", 5, 5, 0.0001)
+
+    class _Client:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=_Completions())
+
+    monkeypatch.delenv("RELAY_REQUEST_TIMEOUT_S", raising=False)
+    cfg = ModelConfig(brain="vendor/brain-model", hands="vendor/hands-model")
+    call_model(
+        "brain", [{"role": "user", "content": "hi"}], models=cfg, ledger=Ledger(), client=_Client()
+    )
+    assert "timeout" in seen
+    assert seen["timeout"] == 600.0

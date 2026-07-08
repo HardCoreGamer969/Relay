@@ -187,3 +187,50 @@ def test_parse_failure_tracker_records_to_ledger():
 def test_parse_failure_tracker_default_limit():
     tracker = ParseFailureTracker()
     assert tracker._max == MAX_CONSECUTIVE_PARSE_FAILURES == 3
+
+
+# --- v0.0.32: solo loop applies the read-before-edit guard -----------------
+
+
+def test_solo_loop_refuses_blind_edit_of_existing_file(tmp_path):
+    """The solo single-model loop (``run_task``) used to call unguarded
+    ``execute_action``, so a model could blind-clobber a file it had never
+    read. The fix: ``guarded_execute_action`` is now in scope for the solo
+    path too, with a fresh per-run ``reads`` dict. A blind edit is REFUSED
+    and the file is untouched. (The model emits ``<edit>`` AND ``<done>`` in
+    the same reply; the refusal is the recoverable observation, the ``<done>``
+    is honored -- so the run completes, but the file is unchanged.)
+    """
+    (tmp_path / "f.txt").write_text("ORIGINAL", encoding="utf-8")
+    client = ScriptedClient(
+        [
+            '<edit path="f.txt">CLOBBERED</edit>\n<done>done</done>',
+        ]
+    )
+    result = run_task(
+        "edit f.txt", tmp_path, models=CFG, client=client, role="hands", max_steps=2
+    )
+    # The blind edit is refused; the <done> still closes the step. The point
+    # is the file on disk is unchanged.
+    assert (tmp_path / "f.txt").read_text(encoding="utf-8") == "ORIGINAL"
+    # The refusal observation is in the steps (a recoverable "Refused: ..."
+    # was emitted, not a step abort).
+    refused = [s for s in result.steps if "Refused" in s.observation]
+    assert refused, "expected a refused-edit observation in the steps"
+
+
+def test_solo_loop_allows_edit_after_read(tmp_path):
+    """The same model can re-read the file and then edit it -- the guard's
+    contract holds in the solo path: read invalidates nothing on its own,
+    the read's content hash is what permits a later edit."""
+    (tmp_path / "f.txt").write_text("ORIGINAL", encoding="utf-8")
+    client = ScriptedClient(
+        [
+            '<read path="f.txt"/>\n<edit path="f.txt">UPDATED</edit>\n<done>done</done>',
+        ]
+    )
+    result = run_task(
+        "edit f.txt", tmp_path, models=CFG, client=client, role="hands", max_steps=2
+    )
+    assert result.status == STATUS_COMPLETED
+    assert (tmp_path / "f.txt").read_text(encoding="utf-8") == "UPDATED"

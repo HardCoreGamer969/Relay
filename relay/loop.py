@@ -117,6 +117,62 @@ Rules:
 """
 
 
+# v0.0.32 (0.2): a SPECIFIC parse-failure nudge for the solo loop. The
+# v0.0.31 generic "no valid action" hint was vague enough that a model
+# would re-emit the same malformed tag. The new hint names the shape of
+# the problem (unclosed block tag, unterminated self-closing tag, or
+# the fallback catch-all), so the next turn can correct it.
+import re as _re_for_nudge
+
+
+def _specific_parse_nudge(text: str) -> str:
+    s = text or ""
+    open_unclosed = _re_for_nudge.search(
+        r"<(edit|write|bash|apply_patch|done|blocked|question|finding|plan|abort|"
+        r"thinking|step|followup|reason|verdict|headline|scope|reaction|decision|"
+        r"ask|assume|record)\b[^>]*>",
+        s,
+        _re_for_nudge.IGNORECASE,
+    )
+    has_any_close = _re_for_nudge.search(
+        r"</(edit|write|bash|apply_patch|done|blocked|question|finding|plan|abort|"
+        r"thinking|step|followup|reason|verdict|headline|scope|reaction|decision|"
+        r"ask|assume|record)>",
+        s,
+        _re_for_nudge.IGNORECASE,
+    )
+    unterminated_self_close = _re_for_nudge.search(
+        r"<(read|list|grep|glob|webfetch|mkdir)\b[^/>]*$",
+        s,
+        _re_for_nudge.IGNORECASE | _re_for_nudge.DOTALL,
+    )
+    if open_unclosed and not has_any_close:
+        return (
+            f"Your reply opened a ``{open_unclosed.group(0).split(' ')[0]}...`` tag "
+            "but never closed it. Re-emit the SAME action with a matching closing "
+            "tag (e.g. <bash>cmd</bash>). Block tags MUST be balanced: opening AND "
+            "closing tag, in that order."
+        )
+    if unterminated_self_close:
+        return (
+            "Your reply has an unterminated self-closing tag (e.g. ``<read "
+            'path="x"`` without a trailing ``/>``). Self-closing tags MUST end '
+            "with ``/>`` (slash then greater-than) on the same line."
+        )
+    if _re_for_nudge.search(r'=\s*"[^"]*"[^"]*"', s):
+        return (
+            'An attribute value contains a literal double-quote -- e.g. '
+            'path="with"quote". Switch to single-quotes for the value (path=\'with"quote\') '
+            "or remove the embedded quote. The parser can't represent a path with a "
+            'double-quote in it inside a double-quoted attribute value.'
+        )
+    return (
+        "No valid action was found in your message. Re-emit your next step using "
+        "the protocol tags exactly, e.g. <read path=\"...\"/>, <edit path=\"...\">"
+        "...</edit>, <bash>...</bash>, or <done>...</done>."
+    )
+
+
 @dataclass
 class StepResult:
     """One executed step in the transcript."""
@@ -275,8 +331,13 @@ def guarded_execute_action(tools: Tools, action: Action, reads: dict[str, str] |
     - ``<edit>``/``<write>`` to an existing file with a current read: applied, then the
       read is invalidated (the write changed the file).
 
-    ``reads is None`` disables the guard (plain :func:`execute_action`) -- the solo
-    single-model loop does not track reads.
+    ``reads is None`` disables the guard (plain :func:`execute_action`).
+    v0.0.32 (0.10): the solo single-model loop (``run_task``) now tracks
+    reads too (a fresh per-run dict, since the solo loop is single-role,
+    single-goal) -- so the read-before-edit guard is in scope for both
+    the two-role and the solo paths. ``reads is None`` is now reserved
+    for direct callers that want the unguarded path (none in production
+    code today).
     """
     if reads is None:
         return execute_action(tools, action)
@@ -351,6 +412,15 @@ def run_task(
                   bash_timeout_s=bash_timeout_s)
     ledger = ledger if ledger is not None else Ledger()
     result = TaskResult(goal=goal, ledger=ledger)
+    # v0.0.32: the read-before-edit guard (``guarded_execute_action``) is now
+    # in scope for the solo loop too. The solo loop used to call unguarded
+    # ``execute_action`` (loop.py:404 before this change), so a solo agent
+    # could blind-clobber a file it had never read. Same freshness model as
+    # the executor (content-hash based) -- a read in turn N is valid for
+    # edits in turn M while the file is unchanged. A fresh per-run dict
+    # here (vs. the cross-step dict in ``run_planned``) is the right
+    # granularity: the solo loop is single-role, single-goal.
+    reads: dict[str, str] = {}
 
     messages: list[dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -384,10 +454,11 @@ def run_task(
                 {
                     "role": "user",
                     "content": (
-                        "No valid action was found in your message. Re-emit your next "
-                        "step using the protocol tags exactly, e.g. "
-                        '<read path="..."/>, <edit path="...">...</edit>, '
-                        "<bash>...</bash>, or <done>...</done>."
+                        # v0.0.32 (0.2): a specific, name-the-problem nudge
+                        # instead of a generic "no valid action" hint --
+                        # the v0.0.31 hint was vague enough that the model
+                        # would re-emit the SAME malformed tag.
+                        _specific_parse_nudge(reply)
                     ),
                 }
             )
@@ -401,7 +472,7 @@ def run_task(
                 result.done_summary = action.content or ""
                 emit(StepResult(kind="done", detail=describe_action(action), observation=""))
                 break
-            observation = execute_action(tools, action)
+            observation = guarded_execute_action(tools, action, reads)
             emit(StepResult(kind=action.kind, detail=describe_action(action), observation=observation))
             observations.append(f"[{describe_action(action)}]\n{observation}")
 

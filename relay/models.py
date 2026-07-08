@@ -14,12 +14,15 @@ OpenRouter's returned ``cost`` exactly as before.
 from __future__ import annotations
 
 import os
+import random
 import time
 from dataclasses import dataclass
 from typing import Any
 
+from openai import APIConnectionError, APITimeoutError
+
 from relay.catalog import get_catalog
-from relay.client import build_client
+from relay.client import _default_request_timeout_s, build_client
 from relay.config import ModelConfig, load_models
 from relay.providers import DEFAULT_PROVIDER
 from relay.telemetry import CallRecord, Ledger, timer
@@ -27,14 +30,17 @@ from relay.telemetry import CallRecord, Ledger, timer
 # --- retry with backoff for transient API failures (v0.0.32) -----------------
 #
 # A long autonomous run (50+ model calls) will eventually hit a transient API
-# blip (429 rate limit, 500/502/503 server error). Without retry, a single
-# transient error propagates up and aborts the entire run. This wraps the create
-# call with a bounded retry (2 attempts by default, exponential-ish backoff) for
-# retriable HTTP status codes only. Non-retriable errors (400 bad request, 401
-# auth, 404 model not found) propagate immediately -- a retry would just waste
-# time on a permanent failure.
+# blip (429 rate limit, 500/502/503 server error, a TCP reset during the
+# connection). Without retry, a single transient error propagates up and
+# aborts the entire run. This wraps the create call with a bounded retry
+# (2 attempts by default) using EXPONENTIAL backoff with jitter, honoring the
+# provider's ``Retry-After`` header, and retrying both retriable HTTP status
+# codes AND connection-level errors (the v0.0.31 fix: connection errors used
+# to propagate immediately, masking transient network issues for the whole
+# run). Non-retriable errors (400 bad request, 401 auth, 404 model not found)
+# still propagate immediately -- a retry would just waste time on a permanent
+# failure.
 _RETRIABLE_STATUS = {429, 500, 502, 503, 504}
-_RETRY_DELAYS = [0.5, 1.0]  # seconds between attempts (2 retries -> 0.5s, 1.0s)
 
 
 def _max_retries() -> int:
@@ -49,12 +55,18 @@ def _max_retries() -> int:
 def _is_retriable(exc: Exception) -> bool:
     """Whether an exception is a transient API error worth retrying.
 
-    Checks for ``status_code`` (openai SDK v1 APIStatusError) and
-    ``response.status_code`` (some older/alternate shapes). Only retriable HTTP
-    status codes qualify; connection errors (timeouts, DNS) propagate immediately
-    -- they could indicate a misconfigured base_url or missing key, and retrying
-    would just mask the config issue for longer.
+    Two classes of transient failure are now retried:
+
+    1. **Retriable HTTP status codes** (429 / 500 / 502 / 503 / 504) on the
+       exception or its ``.response`` -- a server told us to come back.
+    2. **Connection-level errors** (TCP reset, DNS failure, TLS handshake
+       failure) raised as ``openai.APIConnectionError`` or
+       ``openai.APITimeoutError`` -- the SDK couldn't reach the provider
+       at all. These used to propagate immediately (the v0.0.31 fix):
+       a single TCP blip would otherwise abort a 50-call run.
     """
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return True
     status = getattr(exc, "status_code", None)
     if status is not None and status in _RETRIABLE_STATUS:
         return True
@@ -64,6 +76,52 @@ def _is_retriable(exc: Exception) -> bool:
         if status is not None and status in _RETRIABLE_STATUS:
             return True
     return False
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Parse the provider's ``Retry-After`` header, if any.
+
+    RFC 7231 allows two formats: a delta-seconds (e.g. ``"2"``) or an
+    HTTP-date (e.g. ``"Wed, 21 Oct 2015 07:28:00 GMT"``). We only honor
+    the delta-seconds form -- HTTP-date parsing adds a dependency and
+    the delta form is what every major provider sends. Returns ``None``
+    when the header is absent or unparseable, so the caller falls back
+    to its exponential backoff.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    # openai SDK response objects expose ``.headers`` (httpx.Headers) which
+    # supports ``.get`` case-insensitively. Fall back to a dict for older
+    # shapes.
+    headers = getattr(response, "headers", None) or (
+        response if isinstance(response, dict) else {}
+    )
+    try:
+        value = headers.get("Retry-After") or headers.get("retry-after")
+    except AttributeError:
+        return None
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, seconds) if seconds >= 0 else None
+
+
+def _backoff_seconds(attempt: int) -> float:
+    """Exponential backoff with jitter, bounded so a long retry storm
+    doesn't run away.
+
+    The base is ``0.5 * 2**attempt`` (0.5s, 1s, 2s, 4s, ...); jitter is
+    uniform on [0, base) so two parallel callers don't thunder. The
+    whole thing is capped at 30s -- past that, a problem is no longer
+    "transient" and the caller should hear about it.
+    """
+    base = 0.5 * (2 ** attempt)
+    base = min(base, 30.0)
+    return base + random.uniform(0, base)
 
 
 @dataclass
@@ -251,6 +309,11 @@ def call_model(
 
     with timer() as elapsed:
         max_retries = _max_retries()
+        # v0.0.32: explicit request timeout. The openai SDK's 600s default
+        # would stall a step for 10 minutes on a hung provider; we surface
+        # the same default explicitly so a hung connection is reported in a
+        # bounded time and can be retried.
+        request_timeout = _default_request_timeout_s()
         response = None
         for attempt in range(max_retries + 1):
             try:
@@ -258,12 +321,20 @@ def call_model(
                     model=model,
                     messages=messages,
                     extra_body=extra_body,
+                    timeout=request_timeout,
                     **kwargs,
                 )
                 break  # success
             except Exception as exc:
                 if attempt < max_retries and _is_retriable(exc):
-                    time.sleep(_RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)])
+                    # v0.0.32: honor the provider's Retry-After (the SDK
+                    # doesn't itself -- this is the missing piece in the
+                    # openai SDK's built-in retry). When absent, fall back
+                    # to exponential backoff with jitter.
+                    sleep_s = _retry_after_seconds(exc)
+                    if sleep_s is None:
+                        sleep_s = _backoff_seconds(attempt)
+                    time.sleep(sleep_s)
                     continue
                 raise  # non-retriable or exhausted retries: propagate
 

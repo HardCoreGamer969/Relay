@@ -4,7 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "relay-cli"
-version = "0.0.31"
+# Version is declared in `relay/__init__.py` (`__version__`) and read by hatchling
+# via the [tool.hatch.version] path below. Single source of truth -- the
+# website/badge/scripts and the wheel can never silently disagree.
+dynamic = ["version"]
 description = "Relay — a planner/executor coding agent built on a model-agnostic, multi-provider seam."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,6 +33,12 @@ relay = "relay.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["relay"]
+
+[tool.hatch.version]
+# Source of truth: `relay/__init__.py:__version__`. The wheel (and any hatch-driven
+# artifact) reads its version from here, so a forgotten `pyproject.toml` bump can
+# no longer ship a stale version to PyPI.
+path = "relay/__init__.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

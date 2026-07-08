@@ -91,14 +91,40 @@ _WRITE_KINDS = ("edit", "bash", "write", "apply_patch", "mkdir")
 
 
 def _has_terminator(reply: str, terminators: Sequence[str]) -> bool:
-    """True iff any terminator tag opens in ``reply`` (``<verdict>``, ``<plan>``, ...).
+    """True iff any terminator tag is actually present (open AND close) in ``reply``.
 
-    Presence-based, matching how the consumers' own parsers key off the tag: the char
-    right after the name must be whitespace, ``>`` or ``/`` so ``<verdict>`` matches but
-    ``<verdictish>`` does not.
+    v0.0.32 (0.2): the v0.0.31 implementation was a substring check
+    (``<verdict>`` / ``<verdict `` / ``<verdict/``) that fired on the OPEN
+    of a tag, including a tag mentioned in prose. The fix requires a
+    BALANCED tag (open + body + close), which the parser's tag-content
+    helper gives us. The two things this catches that the old code
+    missed:
+
+      - an unclosed tag (``<verdict>accept`` with no ``</verdict>``) does
+        not falsely terminate -- the model was probably mid-sentence;
+      - a tag inside a longer body but at least balanced DOES terminate
+        (the legitimate emit case the tests pin).
+
+    The trade-off: a model that DESCRIBES a tag in backticks (e.g.
+    "I will now emit ``<verdict>accept</verdict>``") still has a balanced
+    tag in its reply and will be treated as having terminated. That's a
+    smaller risk than the v0.0.31 substring check, and the actual emit
+    case is the common one -- the description case is rare in practice
+    (the brain is told to emit a verdict, not to describe emitting one).
     """
+    if not reply:
+        return False
+    parsed = parse(reply)
+    for action in parsed.actions:
+        if action.kind in terminators:
+            return True
+    # Fallback: the parser doesn't know every terminator kind (verdict,
+    # decision, ...). For those, a balanced-tag check is the best we can
+    # do without expanding the parser's Action surface. The check is
+    # MORE conservative than the v0.0.31 substring: it requires a closing
+    # tag, so an unclosed or mid-thought mention is correctly ignored.
     for name in terminators:
-        if re.search(rf"<{re.escape(name)}[\s/>]", reply or ""):
+        if re.search(rf"<{re.escape(name)}\b[^>]*>.*?</{re.escape(name)}>", reply, re.DOTALL):
             return True
     return False
 

@@ -26,6 +26,7 @@ from relay.config import (
     load_models,
     resolve_assumption_level,
     resolve_bash_timeout,
+    resolve_max_cost,
     resolve_max_total_steps,
 )
 from relay.context import resolve_context_window
@@ -52,6 +53,7 @@ from relay.orchestrator import (
     STATUS_ABORTED_BY_BRAIN,
     STATUS_DECLINED,
     STATUS_ESCALATION_LIMIT,
+    STATUS_MAX_COST,
     STATUS_PLANNING_FAILED,
     STATUS_REPEATED_STEP,
     STATUS_UNRESOLVED_ESCALATION,
@@ -74,13 +76,14 @@ console = Console()
 
 @app.command()
 def models() -> None:
-    """Print each role and the OpenRouter model resolved for it."""
+    """Print each role's resolved (provider, model) -- multi-provider aware (v0.0.32)."""
     cfg = load_models()
     table = Table(title="Relay: roles -> models")
     table.add_column("Role", style="bold cyan")
-    table.add_column("OpenRouter model", style="green")
-    table.add_row("brain (planner)", cfg.brain)
-    table.add_row("hands (executor)", cfg.hands)
+    table.add_column("Provider", style="green")
+    table.add_column("Model", style="green")
+    table.add_row("brain (planner)", cfg.brain_provider, cfg.brain)
+    table.add_row("hands (executor)", cfg.hands_provider, cfg.hands)
     console.print(table)
 
 
@@ -178,6 +181,13 @@ def run(
         "Default 50; pass 0 to disable (unbounded). Overrides RELAY_MAX_TOTAL_STEPS "
         "and config for this run.",
     ),
+    max_cost: float | None = typer.Option(
+        None, "--max-cost",
+        help="Hard cost ceiling (dollars) for a planned run. The run halts at "
+        "the step boundary when ledger.total_cost() crosses this value. "
+        "Default unbounded; pass 0 to disable explicitly. Overrides "
+        "RELAY_MAX_COST and config for this run.",
+    ),
     no_supervise: bool = typer.Option(
         False, "--no-supervise",
         help="Disable brain supervision (no step-boundary review calls).",
@@ -215,6 +225,7 @@ def run(
     approver = None if auto_approve else _interactive_approver
     dial = resolve_assumption_level(override=assume or None)
     ceiling = resolve_max_total_steps(override=max_total_steps)  # 50 by default; flag/env/config can raise
+    cost_ceiling = resolve_max_cost(override=max_cost)
     bash_timeout = resolve_bash_timeout()
     _warn_if_dirty_git(root)
 
@@ -227,7 +238,7 @@ def run(
         result = _run_planned(
             goal, root, cfg, ledger, auto_approve, approver, confirm_plan,
             supervise=not no_supervise, dial=dial, show_transcript=show_transcript,
-            max_total_steps=ceiling, bash_timeout_s=bash_timeout,
+            max_total_steps=ceiling, max_cost=cost_ceiling, bash_timeout_s=bash_timeout,
             plan_only=plan_only,
         )
     wall_time_s = time.perf_counter() - start
@@ -277,7 +288,7 @@ def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver, 
 
 def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, *,
                  supervise=True, dial="auto", show_transcript=False, max_total_steps=None,
-                 bash_timeout_s=120.0, plan_only=False):
+                 max_cost=None, bash_timeout_s=120.0, plan_only=False):
     """Conversational planning -> commit -> the two-role autonomous loop.
 
     Both phases share ONE transcript, so a mid-run escalation appears as the next
@@ -335,7 +346,7 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
             supervise=supervise, user_decision=_interactive_user_decision,
             assumption_level=dial, committed_plan=conversation.plan,
             on_event=_print_event, transcript=transcript,
-            max_total_steps=max_total_steps,
+            max_total_steps=max_total_steps, max_cost=max_cost,
             catalog=catalog,
             bash_timeout_s=bash_timeout_s,
         )
@@ -494,15 +505,18 @@ def doctor(
     cfg = load_models()  # loads .env so the provider keys are visible
     checks = _doctor_checks(cfg, slugs)
 
-    # Provider-aware key precheck: every provider in play needs its key env set --
-    # checked BEFORE building any client (so a missing key never builds/charges).
+    # Provider-aware key precheck: every provider in play needs a key --
+    # either in the env var or in auth.json (``resolve_key`` is the single
+    # source of truth -- v0.0.32: env-var-only check used to false-positive
+    # on a user who set their key via ``relay config set-key``). Checked
+    # BEFORE building any client (so a missing key never builds/charges).
     missing = _missing_provider_keys(checks)
     if missing:
         names = missing[0] if len(missing) == 1 else ", ".join(missing)
         verb = "is" if len(missing) == 1 else "are"
         console.print(
             f"[red]{names} {verb} not set[/red] - cannot probe models. "
-            "Copy .env.example to .env and add your key(s)."
+            "Copy .env.example to .env, or set it with `relay config set-key <provider>`."
         )
         raise typer.Exit(code=1)
 
@@ -537,7 +551,16 @@ def _doctor_checks(cfg, slugs) -> list[tuple[str, str, str]]:
 
 
 def _missing_provider_keys(checks) -> list[str]:
-    """Key env-vars (deduped, in order) that are needed by some provider but unset."""
+    """Key env-vars (deduped, in order) that are needed by some provider but unset.
+
+    v0.0.32: check both the env var AND the auth.json store -- ``build_client``
+    accepts both (env > auth.json), so a key saved via ``relay config set-key``
+    is just as usable as one in the env. Checking only ``os.environ`` here
+    would report a false "not set" for a user who set their key in-app,
+    and the doctor would hard-exit before even probing. ``resolve_key`` is
+    the single source of truth for "is this provider's key present?".
+    """
+    from relay.secrets import resolve_key
     missing: list[str] = []
     seen: set[str] = set()
     for _, provider, _ in checks:
@@ -548,7 +571,7 @@ def _missing_provider_keys(checks) -> list[str]:
             profile = resolve_provider(provider)
         except ValueError:
             continue  # unknown provider surfaces as a failed probe, not a key error
-        if not os.environ.get(profile.key_env) and profile.key_env not in missing:
+        if resolve_key(profile.id, profile.key_env) is None and profile.key_env not in missing:
             missing.append(profile.key_env)
     return missing
 
@@ -616,7 +639,7 @@ def _print_doctor_table(rows) -> None:
     table = Table(title="Relay doctor: provider/model preflight")
     table.add_column("Role", style="bold")
     table.add_column("Provider")
-    table.add_column("Model slug", overflow="fold")
+    table.add_column("Model", overflow="fold")
     table.add_column("Status")
     table.add_column("Note", overflow="fold")
     for row in rows:
@@ -916,6 +939,9 @@ def _print_planned_status(result) -> None:
     elif status == STATUS_MAX_STEPS:
         msg = friendly_terminal_message(status, max_total_steps=getattr(result, "max_total_steps", None))
         console.print(f"\n[yellow]STEP CEILING[/yellow] {msg}")
+    elif status == STATUS_MAX_COST:
+        msg = friendly_terminal_message(status)
+        console.print(f"\n[yellow]COST CEILING[/yellow] {msg}")
     elif status == STATUS_DECLINED:
         console.print("\n[yellow]DECLINED[/yellow] plan not approved; nothing executed")
     else:

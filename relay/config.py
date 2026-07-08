@@ -183,6 +183,56 @@ def _parse_ceiling(value: object) -> object:
     return n if n > 0 else (None if n == 0 else _UNSET)
 
 
+def resolve_max_cost(
+    override: object = None, config: dict | None = None
+) -> float | None:
+    """Resolve the run's hard cost ceiling (dollars): **override > env > config > default-off**.
+
+    A real-money safety net (the v0.0.32 ``--max-cost`` / ``RELAY_MAX_COST``
+    knob): the run halts at the step boundary when ``ledger.total_cost()``
+    crosses the ceiling. Distinct from ``max_total_steps`` (call-count
+    ceiling) -- this one is dollars, not calls. ``None`` = unbounded; a
+    non-positive or unparseable value falls through to the next source.
+
+    ``override`` is the per-run CLI flag (``--max-cost``); the env knob is
+    ``RELAY_MAX_COST``; ``config.json``'s top-level ``max_cost`` is the
+    next rung. No built-in default -- the user's wallet is the default.
+    """
+    for candidate in (override, os.environ.get("RELAY_MAX_COST")):
+        parsed = _parse_cost(candidate)
+        if parsed is not _UNSET:
+            return parsed  # type: ignore[return-value]
+    config = config if config is not None else store.load_config()
+    cfg_val = config.get("max_cost") if isinstance(config, dict) else None
+    parsed = _parse_cost(cfg_val)
+    if parsed is not _UNSET:
+        return parsed  # type: ignore[return-value]
+    return None
+
+
+def _parse_cost(value: object) -> object:
+    """One cost-ceiling source -> a positive ``float``, ``None`` (disabled), or ``_UNSET``.
+
+    Mirrors :func:`_parse_ceiling` for ints. Accepts a plain number (``5.0``,
+    ``"0.50"``) or one of the disable tokens (``"off"`` / ``"none"`` /
+    ``"0"``). Invalid values return ``_UNSET`` so resolution falls through.
+    """
+    if value is None or isinstance(value, bool):
+        return _UNSET
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else (None if value == 0 else _UNSET)
+    text = str(value).strip().lower()
+    if not text:
+        return _UNSET
+    if text in _CEILING_DISABLE:
+        return None
+    try:
+        n = float(text)
+    except ValueError:
+        return _UNSET
+    return n if n > 0 else (None if n == 0 else _UNSET)
+
+
 def resolve_max_total_steps(
     override: object = None, config: dict | None = None
 ) -> int | None:

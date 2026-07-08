@@ -5,11 +5,18 @@ to touch anything outside it (resolve-then-check; see ``_resolve``).
 
 ``bash`` additionally consults the command policy (``relay.policy``) before
 running anything: it refuses ``BLOCKED`` commands outright and gates
-``CONFIRM`` commands behind an approver callback. NOTE the honest limit -- the
-policy is a best-effort speed bump against obvious destructive commands, NOT a
+``CONFIRM`` commands behind an approver callback. NOTE the honest limit --
+the policy is a best-effort speed bump against obvious destructive commands, NOT a
 security sandbox. cwd-pinning + string classification do not contain an
 adversarial command (env expansion, command substitution, eval, etc. evade
 both). Real isolation (process/container sandboxing) is a later milestone (v0.95).
+
+v0.0.32: bash inherits a SECRET-SCRUBBED environment (every key/token/secret
+env var is dropped before exec) and every observation is run through
+:func:`relay.debug.redact_secrets` before it reaches the model. This closes
+the exfiltration path where a model could ``env`` / ``set`` / read a ``.env``
+file and observe the parent's API keys, then send them back as part of its
+own next message.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from relay.debug import redact_secrets
 from relay.policy import BLOCKED, CONFIRM, classify
 
 
@@ -54,6 +62,31 @@ GLOB_MATCH_CAP = 200
 WEBFETCH_CHAR_CAP = 4000
 WEBFETCH_MAX_BYTES = 2_000_000
 WEBFETCH_TIMEOUT_S = 15
+
+# v0.0.32: text observations (read, grep, bash) are bounded the same way glob
+# already was. A 50k-line read or a verbose build log would otherwise balloon
+# every downstream call's context and turn one careless tool call into a silent
+# money-leak. The cap is per observation: below it, the text is returned as-is;
+# above it, the head and tail are kept and a "(N lines truncated)" marker
+# makes the omission honest. The agent can re-``read`` with a narrower scope
+# (``head``-style patterns or smaller paths) if it needs the middle.
+OBSERVATION_LINE_CAP = 200
+OBSERVATION_LINE_HEAD = 100  # when truncated, keep this many from the top
+OBSERVATION_LINE_TAIL = 100  # ... and this many from the bottom
+OBSERVATION_CHAR_CAP = 50_000  # hard ceiling on any one observation's chars
+
+# v0.0.32: bash inherits a SECRET-SCRUBBED env. Any env var whose name matches
+# one of these suffix patterns is dropped before exec -- so a model that runs
+# ``env`` or ``set`` can't see ``OPENROUTER_API_KEY`` (or any of the other
+# shell-injected credentials the parent process carries), and even if a key
+# leaks through some other path the post-run ``redact_secrets`` pass would
+# still mask it in the observation. Conservative on purpose: false positives
+# (a non-credential ``FOO_TOKEN``) only cost the user a missing env var;
+# a false negative (a secret leaked to the model) costs them a key.
+_SECRET_ENV_SUFFIXES = (
+    "_API_KEY", "_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_PASSWD",
+    "_AUTH", "_CREDENTIAL", "_CREDENTIALS", "_PRIVATE_KEY",
+)
 _WEBFETCH_UA = "Relay/0.0.26 (coding agent; +https://github.com/)"
 
 _SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style)\b.*?</\1>")
@@ -94,10 +127,12 @@ def _short_fetch_reason(exc: Exception) -> str:
     return reason[:120]
 
 
-def _existing_file_metrics(target: Path) -> tuple[int, int] | None:
-    """``(byte size, line count)`` of ``target`` if it is an existing regular file, else
-    ``None`` (a NEW file -- nothing is being replaced). Read BEFORE an overwrite so the
-    observation can reveal a whole-file replacement (v0.0.31). Never raises."""
+def _existing_file_metrics(target: Path) -> tuple[int, int, str] | None:
+    """``(byte size, line count, eol)`` of ``target`` if it is an existing regular file,
+    else ``None`` (a NEW file -- nothing is being replaced). Read BEFORE an overwrite so
+    the observation can reveal a whole-file replacement (v0.0.31) AND the next write can
+    preserve the file's native EOL (CRLF vs LF) -- a CRLF file stays CRLF, an LF file
+    stays LF, a brand-new file defaults to LF. Never raises."""
     try:
         if not target.is_file():
             return None
@@ -106,21 +141,221 @@ def _existing_file_metrics(target: Path) -> tuple[int, int] | None:
         return None
     text = raw.decode("utf-8", errors="replace")
     lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
-    return len(raw), lines
+    # Detect the file's native EOL: any CRLF in the bytes -> CRLF, else LF. This is the
+    # value we'll re-apply on write so we don't silently rewrite the file's line endings
+    # on every edit (the v0.0.31 bug: ``read_text(..., newline=None)`` universal-newlines
+    # normalized CRLF -> LF before ``has_crlf`` could see it, so writes always went
+    # out as LF -- corrupting CRLF files into LF on POSIX and LF files into CRLF on
+    # Windows). Using raw bytes here is the fix: the on-disk EOL is visible at the
+    # byte level no matter what the text-mode decoding does.
+    eol = "\r\n" if b"\r\n" in raw else "\n"
+    return len(raw), lines, eol
 
 
-def _wrote_observation(path: str, content: str, *, before: tuple[int, int] | None = None) -> str:
+# --- v0.0.32: byte-exact I/O with EOL preservation ---------------------------
+#
+# A long-standing bug: read_text/write_text with default ``newline=None`` ran every
+# read and write through universal-newlines, which silently translated CRLF <-> LF
+# at the stdlib boundary. The fix is to do the text<->bytes conversion explicitly so:
+#   1. ``read`` returns text with the file's native EOL preserved (so ``has_crlf`` in
+#      apply_patch can see CRLF and the comparison is byte-correct).
+#   2. ``write`` / ``edit`` / ``apply_patch`` write bytes in the file's native EOL
+#      (a CRLF file stays CRLF, an LF file stays LF; new files default to LF).
+# These helpers centralize the conversion so the bug can't regress in a single spot
+# while the read/write sites all change.
+
+DEFAULT_EOL = "\n"  # a brand-new file defaults to LF (the universal default)
+
+
+def _read_text_preserving_eol(path: Path) -> str:
+    """Read ``path`` as bytes, decode as UTF-8, return text with native EOL preserved.
+
+    Uses raw bytes so CRLF survives the round-trip (universal-newlines would
+    silently translate it to LF). ``errors="replace"`` is the same policy the
+    bash subprocess uses: a stray non-UTF-8 byte becomes U+FFFD, never a crash.
+    """
+    raw = path.read_bytes()
+    return raw.decode("utf-8", errors="replace")
+
+
+def _write_text_preserving_eol(path: Path, text: str, *, eol: str) -> int:
+    """Write ``text`` to ``path`` in the given EOL (``"\\n"`` or ``"\\r\\n"``).
+
+    Conversion: if ``eol`` is CRLF, every ``\\n`` in ``text`` becomes ``\\r\\n`` first.
+    (Text never has bare ``\\r`` here -- the model emits LF, and our reads preserve the
+    file's EOL but the source ``text`` we pass in is always LF-only on the write path.)
+    Returns the number of bytes actually written -- what was committed to disk, not the
+    character count -- so the caller can report true on-disk size in the observation.
+    """
+    if eol == "\r\n":
+        payload = text.replace("\n", "\r\n").encode("utf-8")
+    else:
+        payload = text.replace("\r\n", "\n").encode("utf-8")
+    path.write_bytes(payload)
+    return len(payload)
+
+
+def _scrubbed_env() -> dict[str, str]:
+    """A copy of ``os.environ`` with every secret-shaped var dropped.
+
+    The bash subprocess inherits THIS, not the live process env, so a model
+    that runs ``env`` / ``set`` / ``printenv`` / ``cat ~/.bashrc`` can't see
+    ``OPENROUTER_API_KEY`` (or any other credential-shaped value the parent
+    process happens to carry). The path-based / home-directory tricks are
+    out of scope of this scrub -- bash is still a shell -- but the in-process
+    leak the plan called out (the parent env) is closed here.
+
+    Anything matching :data:`_SECRET_ENV_SUFFIXES` (case-insensitive) is
+    dropped. ``PATH``, ``HOME``, ``LANG``, etc. are kept so the subprocess
+    can actually find tools. A new value is returned (the live env is
+    untouched) so subsequent calls don't see a permanently mutated state.
+    """
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if not any(name.upper().endswith(suffix) for suffix in _SECRET_ENV_SUFFIXES)
+    }
+
+
+def _scrubbed_secrets_from_env() -> list[str]:
+    """The values of the secret-shaped env vars that exist RIGHT NOW.
+
+    These are passed as ``known_secrets`` to :func:`redact_secrets` so the
+    post-run observation is masked even if a command like ``echo $OPENAI_API_KEY``
+    or ``python -c "import os; print(os.environ)"`` somehow produced the value
+    in the output (a 2nd-line defense after the env-scrub; the env-scrub is
+    the primary, this catches the accidental ``export`` or the script that
+    re-imports the value).
+    """
+    secrets: list[str] = []
+    for name, value in os.environ.items():
+        if any(name.upper().endswith(suffix) for suffix in _SECRET_ENV_SUFFIXES):
+            if value and len(value) >= 6:  # same floor as the redactor
+                secrets.append(value)
+    return secrets
+
+
+def _redact_observation(text: str, *, extra_secrets: list[str] | None = None) -> str:
+    """Run an observation through :func:`redact_secrets` before it reaches the model.
+
+    Every text observation (read / grep / bash / webfetch) goes through this
+    so a file that contains a key in plaintext, a stderr line that echoes
+    a curl header, or a script that prints an env var, never reaches the
+    next model call. Non-text observations (list / glob / mkdir / wrote)
+    don't contain user data and skip this step.
+
+    ``extra_secrets`` is for the live env values the parent process is
+    carrying, which the redactor would otherwise only catch by pattern
+    (sk-/Bearer/marker); the explicit list is a strict superset.
+    """
+    if not text:
+        return text
+    return redact_secrets(text, known_secrets=extra_secrets)
+
+
+def _kill_process_tree(proc: "subprocess.Popen[bytes]") -> None:
+    """Kill the bash subprocess AND every descendant, on timeout.
+
+    The bash call uses ``start_new_session=True`` (POSIX new session, Windows
+    ``CREATE_NEW_PROCESS_GROUP``) so the subprocess is the root of its own
+    process group; killing the group walks every descendant the shell spawned:
+
+    - POSIX: ``os.killpg(proc.pid, SIGTERM)`` walks the group, with a SIGKILL
+      escalation if the tree doesn't exit within ~2s.
+    - Windows: ``taskkill /T /F /PID <pid>`` ships with every Windows install
+      and walks the tree by force. A plain ``proc.kill()`` is the fallback
+      when taskkill is unavailable.
+
+    Failures are swallowed -- this is a best-effort cleanup. The timeout has
+    already fired and the caller is about to return an observation; orphaning
+    one extra process is the lesser evil vs. hanging the worker.
+    """
+    try:
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                    capture_output=True, timeout=5,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        else:
+            import signal
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    pass
+    except Exception:  # noqa: BLE001 -- cleanup must never mask the TimeoutExpired
+        pass
+
+
+def _cap_observation(text: str) -> str:
+    """Bound a tool observation so it can't blow up the model's context window.
+
+    Two independent caps, the larger of which wins:
+      - by lines: if ``text`` has more than :data:`OBSERVATION_LINE_CAP` lines,
+        keep the first :data:`OBSERVATION_LINE_HEAD` and last
+        :data:`OBSERVATION_LINE_TAIL` with an explicit "(N lines truncated)"
+        marker between them -- the agent can tell something is missing and
+        re-read with a narrower scope if it needs the middle.
+      - by chars: a hard ceiling (:data:`OBSERVATION_CHAR_CAP`) on the returned
+        text. Lines-cap catches the "50k lines of 1 char each" case; char-cap
+        catches the "one 50k-char line" case (e.g. a minified bundle).
+    The original text is left alone -- a small text is returned unchanged, so
+    the common path is a no-op.
+    """
+    if not text:
+        return text
+    # Char cap first: a single huge line is the cheaper case to catch.
+    if len(text) > OBSERVATION_CHAR_CAP:
+        text = text[:OBSERVATION_CHAR_CAP] + (
+            f"\n... (truncated to {OBSERVATION_CHAR_CAP} chars; "
+            "narrow the call if you need the rest)"
+        )
+    # Line cap: keep head + tail so a 50k-line log is still actionable.
+    lines = text.splitlines()
+    if len(lines) > OBSERVATION_LINE_CAP:
+        head = lines[:OBSERVATION_LINE_HEAD]
+        tail = lines[-OBSERVATION_LINE_TAIL:]
+        omitted = len(lines) - OBSERVATION_LINE_HEAD - OBSERVATION_LINE_TAIL
+        marker = f"... ({omitted} lines truncated) ..."
+        return "\n".join(head + [marker] + tail)
+    return text
+
+
+def _wrote_observation(
+    path: str,
+    bytes_written: int,
+    *,
+    content: str,
+    before: tuple[int, int, str] | None = None,
+) -> str:
     """The shared ``wrote <path> (<bytes> bytes, <lines> lines)`` line for edit/write.
 
-    ``before`` is the prior ``(bytes, lines)`` when an EXISTING file was overwritten --
-    edit/write replace the WHOLE file, so the observation says it replaced the file and
-    by how much. This makes a fragment that just clobbered a large file VISIBLE to the
-    hands and the reviewer (v0.0.31) instead of looking like a normal small write. A new
-    file (``before is None``) keeps the plain observation -- nothing was destroyed."""
+    ``bytes_written`` is the on-disk byte count AFTER EOL conversion (a 100-char text
+    of all-LF content with no ``\r`` writes 100 bytes; the same text on a CRLF target
+    writes 200 bytes). Reporting the real on-disk size is what makes the observation
+    match ``wc -c`` and what lets the v0.0.31 "replaced entire file" note compare
+    apples-to-apples. ``content`` is used ONLY for the line count (which is EOL-agnostic
+    -- N LFs == N CRLFs == N lines). ``before`` carries the prior ``(bytes, lines, eol)``
+    when an EXISTING file was overwritten -- edit/write replace the WHOLE file, so the
+    observation says it replaced the file and by how much. A new file (``before is None``)
+    keeps the plain observation -- nothing was destroyed.
+    """
     lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
-    base = f"wrote {path} ({len(content)} bytes, {lines} lines)"
+    base = f"wrote {path} ({bytes_written} bytes, {lines} lines)"
     if before is not None:
-        before_bytes, before_lines = before
+        before_bytes, before_lines, _eol = before
         base += f" -- replaced entire file (was {before_bytes} bytes, {before_lines} lines)"
     return base
 
@@ -436,13 +671,26 @@ class Tools:
         return target
 
     def read(self, path: str) -> str:
-        """Return the contents of a file."""
+        """Return the contents of a file, with its native EOL preserved.
+
+        Reads as bytes and decodes as UTF-8 (never through universal-newlines), so
+        CRLF stays CRLF -- the apply_patch CRLF-preservation logic and the agentic
+        reviewer's content hash both depend on this. The result is then capped
+        (head + tail + ``(N lines truncated)`` marker) so a large file can't
+        blow up the model's context window; the agent can re-read with a narrower
+        scope if it needs the middle. Finally, secrets present in the parent's
+        process env are masked (so a ``read`` of ``.env`` can't leak the user's
+        API keys back into the model's next message).
+        """
         target = self._resolve(path)
         if not target.exists():
             raise ToolError(f"no such file: {path}")
         if target.is_dir():
             raise ToolError(f"{path} is a directory, not a file")
-        return target.read_text(encoding="utf-8")
+        return _cap_observation(
+            _redact_observation(_read_text_preserving_eol(target),
+                                extra_secrets=_scrubbed_secrets_from_env())
+        )
 
     def list(self, path: str = ".") -> str:
         """Return a directory listing (directories suffixed with ``/``)."""
@@ -480,14 +728,23 @@ class Tools:
         out: list[str] = []
         for f in files:
             try:
-                text = f.read_text(encoding="utf-8")
+                text = _read_text_preserving_eol(f)
             except (UnicodeDecodeError, OSError):
                 continue  # skip binary / unreadable files
             prefix = f"{f.relative_to(root).as_posix()}:" if multi else ""
             for lineno, line in enumerate(text.splitlines(), start=1):
                 if regex.search(line):
                     out.append(f"{prefix}{lineno}: {line}")
-        return "\n".join(out) if out else "(no matches)"
+        # The whole-grep result is also a tool observation: cap it the same way
+        # read is, so a recursive grep across node_modules can't flood the loop.
+        # Redact too -- a grep that hits a .env line would otherwise echo the
+        # key value back to the model.
+        return _cap_observation(
+            _redact_observation(
+                "\n".join(out) if out else "(no matches)",
+                extra_secrets=_scrubbed_secrets_from_env(),
+            )
+        )
 
     def glob(self, pattern: str, base: str = ".") -> str:
         """Return paths matching ``pattern`` under ``base``, relative to the root.
@@ -522,13 +779,16 @@ class Tools:
         """Write ``content`` as the full new contents of ``path``.
 
         Parent directories are created as needed. (v0.02 is full-file write;
-        diff-based edits come in a later milestone.)
+        diff-based edits come in a later milestone.) Preserves the file's native
+        EOL on overwrite (a CRLF file stays CRLF, an LF file stays LF); a NEW file
+        defaults to LF. The observation reports the real on-disk byte count.
         """
         target = self._resolve(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         before = _existing_file_metrics(target)  # measured BEFORE the overwrite
-        target.write_text(content, encoding="utf-8")
-        return _wrote_observation(path, content, before=before)
+        eol = before[2] if before is not None else DEFAULT_EOL
+        bytes_written = _write_text_preserving_eol(target, content, eol=eol)
+        return _wrote_observation(path, bytes_written, content=content, before=before)
 
     def write(self, path: str, content: str) -> str:
         """Write ``content`` as the WHOLE contents of ``path`` (create or overwrite).
@@ -538,12 +798,14 @@ class Tools:
         -edit guard (in :mod:`relay.loop`) exempts creating a NEW file but requires a
         current read before overwriting an EXISTING one (you shouldn't blind-clobber a
         file you haven't seen); a successful write invalidates the recorded read.
+        Preserves the file's native EOL on overwrite; new files default to LF.
         """
         target = self._resolve(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         before = _existing_file_metrics(target)  # measured BEFORE the overwrite
-        target.write_text(content, encoding="utf-8")
-        return _wrote_observation(path, content, before=before)
+        eol = before[2] if before is not None else DEFAULT_EOL
+        bytes_written = _write_text_preserving_eol(target, content, eol=eol)
+        return _wrote_observation(path, bytes_written, content=content, before=before)
 
     def apply_patch(self, patch_text: str) -> str:
         """Apply an OpenCode patch envelope ATOMICALLY (all-or-nothing).
@@ -598,7 +860,12 @@ class Tools:
                 target = self._resolve(sec.path)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 body = "\n".join(sec.add_lines)
-                target.write_text(body + ("\n" if sec.add_lines else ""), encoding="utf-8")
+                # A new file: default to LF. The model emits LF; a brand-new file has
+                # no on-disk EOL to preserve. (If a project prefers CRLF, its existing
+                # files dictate that and the next Update on a new file will follow.)
+                _write_text_preserving_eol(
+                    target, body + ("\n" if sec.add_lines else ""), eol=DEFAULT_EOL
+                )
                 summary.append(f"+{sec.path}")
             elif sec.op == "delete":
                 self._resolve(sec.path).unlink()
@@ -611,7 +878,10 @@ class Tools:
                 dest = sec.move_to or sec.path
                 dest_target = self._resolve(dest)
                 dest_target.parent.mkdir(parents=True, exist_ok=True)
-                dest_target.write_text(updated_text[idx], encoding="utf-8")
+                # _apply_hunks preserves the source file's EOL: it produces CRLF text
+                # for a CRLF file and LF text for an LF file. Write the bytes back
+                # straight through; the EOL is already baked in.
+                dest_target.write_bytes(updated_text[idx].encode("utf-8"))
                 if is_move:
                     self._resolve(sec.path).unlink()
                     summary.append(f"~{dest} (renamed from {sec.path})")
@@ -665,8 +935,13 @@ class Tools:
             return f"webfetch failed: could not fetch {url} ({_short_fetch_reason(exc)})"
         text = _html_to_text(raw)
         if len(text) > WEBFETCH_CHAR_CAP:
-            return text[:WEBFETCH_CHAR_CAP] + f"\n... (truncated at {WEBFETCH_CHAR_CAP} chars)"
-        return text if text else "(empty response)"
+            text = text[:WEBFETCH_CHAR_CAP] + f"\n... (truncated at {WEBFETCH_CHAR_CAP} chars)"
+        # A fetched page can echo headers / tokens / API keys in its body. Mask
+        # any of the parent's process env values before returning to the model.
+        return _redact_observation(
+            text or "(empty response)",
+            extra_secrets=_scrubbed_secrets_from_env(),
+        )
 
     # -- read-tracking support (v0.0.23: the read-before-edit guard) ----------
     #
@@ -737,23 +1012,74 @@ class Tools:
                 # Safe default for non-interactive contexts: deny, visibly.
                 return f"DENIED (no approver; safe default): {verdict.reason}"
 
+        # v0.0.32: the timeout-kill path. ``subprocess.run(timeout=...)`` only
+        # stops WAITING after the timeout -- it doesn't actually kill the child
+        # (and certainly not the child's children: a hanging ``python -m
+        # http.server`` the shell spawned, a forked compiler, ...). We use
+        # :class:`Popen` directly so we own the child handle and can walk the
+        # descendant tree on timeout (POSIX ``killpg``, Windows ``taskkill /T``).
+        proc: subprocess.Popen[bytes] | None = None
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=str(self.project_root.resolve()),
-                capture_output=True,
-                text=True,
-                timeout=self.bash_timeout_s,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                # v0.0.32: decode output as UTF-8 with ``errors="replace"`` (the
+                # locale default on Windows is cp1252, which would mojibake any
+                # non-Latin output and crash outright on a stray non-cp1252
+                # byte). Read the raw bytes and decode ourselves so we get
+                # ``errors="replace"`` semantics (Popen doesn't accept those
+                # kwargs directly).
+                env=_scrubbed_env(),
+                # v0.0.32: own process group so the timeout-kill can walk it.
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired:
-            timeout_desc = f"{self.bash_timeout_s}s" if self.bash_timeout_s is not None else "(unbounded)"
-            snippet = command[:100]
-            return f"bash timed out after {timeout_desc} (command: {snippet})"
-        parts: list[str] = []
-        if proc.stdout:
-            parts.append(proc.stdout.rstrip("\n"))
-        if proc.stderr:
-            parts.append("[stderr]\n" + proc.stderr.rstrip("\n"))
-        parts.append(f"[exit {proc.returncode}]")
-        return "\n".join(parts)
+            try:
+                stdout_b, stderr_b = proc.communicate(timeout=self.bash_timeout_s)
+            except subprocess.TimeoutExpired:
+                timeout_desc = f"{self.bash_timeout_s}s" if self.bash_timeout_s is not None else "(unbounded)"
+                snippet = command[:100]
+                _kill_process_tree(proc)
+                # Reap the killed process so we don't leave a zombie on POSIX.
+                try:
+                    proc.communicate(timeout=2)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+                return f"bash timed out after {timeout_desc} (command: {snippet})"
+            stdout = stdout_b.decode("utf-8", errors="replace")
+            stderr = stderr_b.decode("utf-8", errors="replace")
+            parts: list[str] = []
+            if stdout:
+                parts.append(stdout.rstrip("\n"))
+            if stderr:
+                parts.append("[stderr]\n" + stderr.rstrip("\n"))
+            parts.append(f"[exit {proc.returncode}]")
+            return _cap_observation(
+                _redact_observation(
+                    "\n".join(parts), extra_secrets=_scrubbed_secrets_from_env()
+                )
+            )
+        finally:
+            # Best-effort: if the Popen somehow still has an open handle
+            # (an exception path between Popen and communicate), close it.
+            if proc is not None and proc.stdout is not None:
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
+            if proc is not None and proc.stderr is not None:
+                try:
+                    proc.stderr.close()
+                except OSError:
+                    pass
+            # Reap on any non-timeexit path; communicate() above handles the
+            # normal path. (A child that completed but raised in our code
+            # before communicate would otherwise be a zombie until the
+            # process exited.)
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    _kill_process_tree(proc)

@@ -38,13 +38,14 @@ surfaced via :attr:`ParseResult.is_parse_failure` so the loop can correct it.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
 # Action kinds the parser can produce.
 KINDS = (
     "read", "list", "grep", "edit", "bash", "done", "plan", "abort", "blocked", "question",
-    "write", "glob", "apply_patch", "webfetch", "mkdir", "finding",
+    "write", "glob", "apply_patch", "webfetch", "mkdir", "finding", "tool",
 )
 
 
@@ -69,6 +70,11 @@ class Action:
     content: str | None = None
     steps: list[str] | None = None
     url: str | None = None
+    # Generic registry-backed calls use ``tool_name`` + JSON ``arguments``.
+    # Legacy actions keep their historical strongly-named fields above.
+    tool_name: str | None = None
+    arguments: dict | None = None
+    eol: str | None = None
 
 
 @dataclass
@@ -101,25 +107,98 @@ class ParseResult:
         return plan.steps if plan is not None else None
 
 
-_ATTR_RE = re.compile(r"""(\w+)\s*=\s*(["'])(.*?)\2""", re.DOTALL)
-_THINKING_RE = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL)
-_PLAN_RE = re.compile(r"<plan>(.*?)</plan>", re.DOTALL)
-_STEP_RE = re.compile(r"<step>(.*?)</step>", re.DOTALL)
-_ABORT_RE = re.compile(r"<abort>(.*?)</abort>", re.DOTALL)
-_BLOCKED_RE = re.compile(r"<blocked>(.*?)</blocked>", re.DOTALL)
-_QUESTION_RE = re.compile(r"<question>(.*?)</question>", re.DOTALL)
-_FINDING_RE = re.compile(r"<finding>(.*?)</finding>", re.DOTALL)
-_EDIT_RE = re.compile(r"""<edit\s+([^>]*?)>(.*?)</edit>""", re.DOTALL)
-_WRITE_RE = re.compile(r"""<write\s+([^>]*?)>(.*?)</write>""", re.DOTALL)
-_APPLY_PATCH_RE = re.compile(r"<apply_patch>(.*?)</apply_patch>", re.DOTALL)
-_BASH_RE = re.compile(r"<bash>(.*?)</bash>", re.DOTALL)
-_DONE_RE = re.compile(r"<done>(.*?)</done>", re.DOTALL)
-_SELF_CLOSING_RE = re.compile(r"<(read|list|grep|glob|webfetch|mkdir)\b([^>]*?)/>", re.DOTALL)
+_ATTR_RE = re.compile(r"""([A-Za-z_]\w*)\s*=\s*(["'])(.*?)\2""", re.DOTALL)
+_STEP_RE = re.compile(r"<step(?:\s[^>]*)?>(.*?)</step>", re.DOTALL)
+
+_BLOCK_KINDS = {
+    "thinking", "plan", "apply_patch", "write", "abort", "edit", "bash",
+    "question", "finding", "done", "blocked", "tool",
+}
+_SELF_CLOSING_KINDS = {"read", "list", "grep", "glob", "webfetch", "mkdir"}
+_NAME_RE = re.compile(r"/?([A-Za-z_][\w.-]*)")
+
+
+def _xml_unescape(text: str) -> str:
+    """Decode only XML's five predefined entities, exactly once.
+
+    ``html.unescape`` deliberately is not used: it accepts a much wider HTML
+    entity vocabulary and could silently rewrite source code.  ``&amp;`` is
+    decoded last so an input such as ``&amp;lt;`` remains the literal ``&lt;``
+    rather than being recursively decoded to ``<``.
+    """
+    return (
+        text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+    )
 
 
 def _attrs(text: str) -> dict[str, str]:
-    """Parse ``name="value"`` attributes (single or double quoted)."""
-    return {m.group(1): m.group(3) for m in _ATTR_RE.finditer(text)}
+    """Parse quoted attributes and decode XML entities in their values."""
+    return {m.group(1): _xml_unescape(m.group(3)) for m in _ATTR_RE.finditer(text)}
+
+
+def _find_tag_end(text: str, start: int) -> int:
+    """Return the ``>`` ending the tag at ``start``, respecting quoted attrs."""
+    quote: str | None = None
+    for index in range(start + 1, len(text)):
+        char = text[index]
+        if quote is None:
+            if char in ('"', "'"):
+                quote = char
+            elif char == ">":
+                return index
+        elif char == quote:
+            quote = None
+    return -1
+
+
+def _opening_tag(text: str, start: int) -> tuple[str, dict[str, str], bool, int] | None:
+    """Parse one opening tag as ``(name, attrs, self_closing, end_index)``."""
+    if start < 0 or start >= len(text) or text[start] != "<":
+        return None
+    end = _find_tag_end(text, start)
+    if end < 0:
+        return None
+    raw = text[start + 1:end]
+    if raw.lstrip().startswith("/"):
+        return None
+    match = _NAME_RE.match(raw.lstrip())
+    if match is None:
+        return None
+    name = match.group(1)
+    self_closing = raw.rstrip().endswith("/")
+    attr_text = raw.lstrip()[match.end():]
+    if self_closing:
+        attr_text = attr_text.rstrip()[:-1]
+    return name, _attrs(attr_text), self_closing, end
+
+
+def _body(text: str, name: str, open_end: int) -> tuple[str, int, bool] | None:
+    """Return ``(body, next_index, ambiguous_close)`` for a block tag.
+
+    A second closing tag before another opening tag of the same name is the
+    legacy silent-truncation shape (``<edit>foo</edit>bar</edit>``).  Surface it
+    as an invalid action instead of writing only the prefix.
+    """
+    close = f"</{name}>"
+    close_start = text.find(close, open_end + 1)
+    if close_start < 0:
+        return None
+    next_index = close_start + len(close)
+    next_close = text.find(close, next_index)
+    next_open_match = re.search(rf"<{re.escape(name)}(?:\s|>)", text[next_index:])
+    next_open = next_index + next_open_match.start() if next_open_match else -1
+    ambiguous = next_close >= 0 and (next_open < 0 or next_close < next_open)
+    if ambiguous:
+        next_index = next_close + len(close)
+    return text[open_end + 1:close_start], next_index, ambiguous
+
+
+def _decode_body(body: str, attrs: dict[str, str]) -> str:
+    return _xml_unescape(body) if attrs.get("escape", "").lower() == "xml" else body
 
 
 def _strip_block_newlines(content: str) -> str:
@@ -169,102 +248,107 @@ def parse(text: str) -> ParseResult:
     if not text:
         return ParseResult()
 
-    placed: list[tuple[int, Action]] = []
+    actions: list[Action] = []
     thinking: list[str] = []
-    masked = text
+    cursor = 0
+    while cursor < len(text):
+        start = text.find("<", cursor)
+        if start < 0:
+            break
+        opened = _opening_tag(text, start)
+        if opened is None:
+            cursor = start + 1
+            continue
+        kind, attrs, self_closing, open_end = opened
 
-    def consume(regex: re.Pattern[str], on_match) -> None:
-        nonlocal masked
-        spans: list[tuple[int, int]] = []
-        for m in regex.finditer(masked):
-            on_match(m)
-            spans.append((m.start(), m.end()))
-        masked = _mask(masked, spans)
+        if self_closing and kind in _SELF_CLOSING_KINDS:
+            if kind == "read":
+                if attrs.get("path"):
+                    actions.append(Action(kind="read", path=attrs["path"]))
+            elif kind == "list":
+                actions.append(Action(kind="list", path=attrs.get("path", ".")))
+            elif kind == "grep":
+                if attrs.get("pattern") and attrs.get("path"):
+                    actions.append(Action(kind="grep", pattern=attrs["pattern"], path=attrs["path"]))
+            elif kind == "glob":
+                if attrs.get("pattern"):
+                    actions.append(Action(kind="glob", pattern=attrs["pattern"], path=attrs.get("path", ".")))
+            elif kind == "webfetch":
+                if attrs.get("url"):
+                    actions.append(Action(kind="webfetch", url=attrs["url"]))
+            elif kind == "mkdir" and attrs.get("path"):
+                actions.append(Action(kind="mkdir", path=attrs["path"]))
+            cursor = open_end + 1
+            continue
 
-    consume(_THINKING_RE, lambda m: thinking.append(m.group(1).strip()))
+        if not self_closing and kind in _BLOCK_KINDS:
+            found = _body(text, kind, open_end)
+            if found is None:
+                cursor = open_end + 1
+                continue
+            raw_body, cursor, ambiguous = found
+            if ambiguous:
+                continue
+            content = _decode_body(raw_body, attrs)
+            if kind == "thinking":
+                thinking.append(content.strip())
+            elif kind == "plan":
+                steps = [_xml_unescape(m.group(1)).strip() for m in _STEP_RE.finditer(content)]
+                actions.append(Action(kind="plan", steps=[step for step in steps if step]))
+            elif kind in ("edit", "write"):
+                if attrs.get("path"):
+                    actions.append(Action(
+                        kind=kind,
+                        path=attrs["path"],
+                        content=_strip_block_newlines(content),
+                        eol=attrs.get("eol"),
+                    ))
+            elif kind == "tool":
+                name = attrs.get("name")
+                try:
+                    arguments = json.loads(content)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    arguments = None
+                if name and isinstance(arguments, dict):
+                    actions.append(Action(kind="tool", tool_name=name, arguments=arguments))
+            elif kind == "apply_patch":
+                actions.append(Action(kind=kind, content=_strip_block_newlines(content), eol=attrs.get("eol")))
+            elif kind == "bash":
+                actions.append(Action(kind=kind, content=content.strip()))
+            else:
+                actions.append(Action(kind=kind, content=content.strip()))
+            continue
 
-    def _add_plan(m: re.Match[str]) -> None:
-        steps = [s.group(1).strip() for s in _STEP_RE.finditer(m.group(1))]
-        placed.append((m.start(), Action(kind="plan", steps=[s for s in steps if s])))
+        cursor = open_end + 1
 
-    # Plan first, so <step>/<edit>/etc. inside a plan body are not parsed loose.
-    consume(_PLAN_RE, _add_plan)
-    # apply_patch next: its body is a patch envelope that may ADD a file whose content
-    # contains tag-like lines (e.g. +<edit ...>), so mask it early before loose scans.
-    consume(
-        _APPLY_PATCH_RE,
-        lambda m: placed.append((m.start(), Action(kind="apply_patch", content=_strip_block_newlines(m.group(1))))),
-    )
-    # write next: its body is arbitrary file content that may contain tag-like lines,
-    # so mask it early before the loose-tag scans below (same reasoning as edit).
-    def _add_write(m: re.Match[str]) -> None:
-        path = _attrs(m.group(1)).get("path")
-        if path:
-            placed.append(
-                (m.start(), Action(kind="write", path=path, content=_strip_block_newlines(m.group(2))))
-            )
-
-    consume(_WRITE_RE, _add_write)
-    consume(_ABORT_RE, lambda m: placed.append((m.start(), Action(kind="abort", content=m.group(1).strip()))))
-
-    def _add_edit(m: re.Match[str]) -> None:
-        path = _attrs(m.group(1)).get("path")
-        if path:
-            placed.append(
-                (m.start(), Action(kind="edit", path=path, content=_strip_block_newlines(m.group(2))))
-            )
-
-    consume(_EDIT_RE, _add_edit)
-    consume(_BASH_RE, lambda m: placed.append((m.start(), Action(kind="bash", content=m.group(1).strip()))))
-    # v0.0.32 (0.2): consume <question> and <finding> BEFORE <done> and
-    # <blocked>, so a literal ``<done>`` / ``<blocked>`` written inside a
-    # question/finding body is masked out and not falsely parsed as a
-    # step terminator. The old order parsed done/blocked first, so a
-    # ``<question>...<done>bar</done>...</question>`` turn would emit
-    # a phantom "done" action and the step would falsely complete. Same
-    # masking rationale for finding.
-    consume(_QUESTION_RE, lambda m: placed.append((m.start(), Action(kind="question", content=m.group(1).strip()))))
-    consume(_FINDING_RE, lambda m: placed.append((m.start(), Action(kind="finding", content=m.group(1).strip()))))
-    consume(_DONE_RE, lambda m: placed.append((m.start(), Action(kind="done", content=m.group(1).strip()))))
-    consume(_BLOCKED_RE, lambda m: placed.append((m.start(), Action(kind="blocked", content=m.group(1).strip()))))
-
-    # Self-closing tags last, scanned over the fully-masked text.
-    for m in _SELF_CLOSING_RE.finditer(masked):
-        kind = m.group(1)
-        attrs = _attrs(m.group(2))
-        if kind == "read":
-            if attrs.get("path"):
-                placed.append((m.start(), Action(kind="read", path=attrs["path"])))
-        elif kind == "list":
-            placed.append((m.start(), Action(kind="list", path=attrs.get("path", "."))))
-        elif kind == "grep":
-            if attrs.get("pattern") and attrs.get("path"):
-                placed.append(
-                    (m.start(), Action(kind="grep", pattern=attrs["pattern"], path=attrs["path"]))
-                )
-        elif kind == "glob":
-            if attrs.get("pattern"):
-                placed.append(
-                    (m.start(), Action(kind="glob", pattern=attrs["pattern"], path=attrs.get("path", ".")))
-                )
-        elif kind == "webfetch":
-            if attrs.get("url"):
-                placed.append((m.start(), Action(kind="webfetch", url=attrs["url"])))
-        elif kind == "mkdir":
-            if attrs.get("path"):
-                placed.append((m.start(), Action(kind="mkdir", path=attrs["path"])))
-
-    placed.sort(key=lambda item: item[0])
-    return ParseResult(actions=[action for _, action in placed], thinking=thinking)
+    return ParseResult(actions=actions, thinking=thinking)
 
 
-# --- shared tag-content helpers (v0.0.32: deduplicated from planner/conversation) ---
-#
-# Several modules (planner.py, conversation.py) extract the text content of a
-# simple ``<name>...</name>`` tag. These helpers centralize that logic so the
-# three copies don't drift. Each is a thin regex wrapper -- no behavioral change.
-
-_TAG_CONTENT_RE_CACHE: dict[str, re.Pattern[str]] = {}
+def _named_contents(name: str, text: str) -> list[str]:
+    """Extract balanced ``name`` blocks with the same escaping rules as actions."""
+    values: list[str] = []
+    cursor = 0
+    source = text or ""
+    while cursor < len(source):
+        start = source.find("<", cursor)
+        if start < 0:
+            break
+        opened = _opening_tag(source, start)
+        if opened is None:
+            cursor = start + 1
+            continue
+        found_name, attrs, self_closing, open_end = opened
+        if found_name != name or self_closing:
+            cursor = open_end + 1
+            continue
+        found = _body(source, name, open_end)
+        if found is None:
+            cursor = open_end + 1
+            continue
+        body, cursor, ambiguous = found
+        if not ambiguous:
+            values.append(_decode_body(body, attrs).strip())
+    return values
 
 
 def tag_content(name: str, text: str) -> str | None:
@@ -274,12 +358,8 @@ def tag_content(name: str, text: str) -> str | None:
     brain's ``<verdict>``, ``<reaction>``, ``<scope>``). Compiled regexes are
     cached per tag name for reuse.
     """
-    pattern = _TAG_CONTENT_RE_CACHE.get(name)
-    if pattern is None:
-        pattern = re.compile(rf"<{name}>(.*?)</{name}>", re.DOTALL)
-        _TAG_CONTENT_RE_CACHE[name] = pattern
-    match = pattern.search(text or "")
-    return match.group(1).strip() if match else None
+    values = _named_contents(name, text)
+    return values[0] if values else None
 
 
 def tag_contents(name: str, text: str) -> list[str]:
@@ -288,10 +368,4 @@ def tag_contents(name: str, text: str) -> list[str]:
     A shared helper for modules that need multiple tags (e.g. the brain's
     ``<ask>`` / ``<assume>`` / ``<record>`` tags).
     """
-    pattern = _TAG_CONTENT_RE_CACHE.get(name)
-    if pattern is None:
-        pattern = re.compile(rf"<{name}>(.*?)</{name}>", re.DOTALL)
-        _TAG_CONTENT_RE_CACHE[name] = pattern
-    return [
-        m.group(1).strip() for m in pattern.finditer(text or "") if m.group(1).strip()
-    ]
+    return [value for value in _named_contents(name, text) if value]

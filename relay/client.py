@@ -30,20 +30,19 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 def _default_request_timeout_s() -> float:
     """Per-request timeout, in seconds, for OpenAI SDK calls.
 
-    Default 600s matches the openai SDK's historical default; a hung provider
-    (no TCP response, no TLS handshake) would otherwise stall a step for
-    10 minutes. ``RELAY_REQUEST_TIMEOUT_S`` lets the user raise/lower this
-    without code changes. Returns a positive float; invalid values fall
-    through to the default.
+    This is the total deadline for one logical Relay model call, including its
+    retries.  The 120s default prevents the SDK's historical ten-minute stall;
+    ``RELAY_REQUEST_TIMEOUT_S`` lets the user raise/lower it without code
+    changes. Returns a positive float; invalid values fall through to default.
     """
     raw = os.environ.get("RELAY_REQUEST_TIMEOUT_S")
     if not raw:
-        return 600.0
+        return 120.0
     try:
         n = float(raw)
     except (TypeError, ValueError):
-        return 600.0
-    return n if n > 0 else 600.0
+        return 120.0
+    return n if n > 0 else 120.0
 
 
 def build_client(

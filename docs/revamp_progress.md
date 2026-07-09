@@ -1,19 +1,24 @@
-# Relay Revamp Progress (v0.0.32)
+# Relay Revamp Progress (v0.0.32 + v0.0.33)
 
-> Phase 0 (Stop the Bleeding) of `docs/REVAMP.md`, shipped in commit series on
-> `main` as of v0.0.32. The full plan covers Phases 0–4 plus a 5-stage TUI split;
-> this document records what was done in Phase 0 and the parts of Phase 1 that
-> fell out naturally from the same change set. Phases 2–4 and the TUI stages
-> are intentionally out of scope here and remain as follow-up work.
+> Phase 0 (Stop the Bleeding) of `docs/REVAMP.md` shipped at v0.0.32. A focused
+> v0.0.33 follow-up then closed three of the bugs flagged in the
+> "Known bugs I noticed but did NOT fix" section of the v0.0.32 doc, lowered
+> the network timeout default, and added the first piece of Phase 2's tool
+> registry (the generic `<tool>` JSON envelope). The full plan covers
+> Phases 0–4 plus a 5-stage TUI split; Phases 2–4 and the TUI stages remain
+> out of scope and are still follow-up work.
 
 ## TL;DR
 
-All **10 Phase 0 fixes** from the plan shipped, plus the dynamic-versioning
-half of Phase 1 item 0.9 (the rest of Phase 1 — ruff/mypy/coverage/docs split/
-release automation/test fakes — is not in this change set). The test suite
-grew from **724 → 781** passing tests; **2 skipped, 1 pre-existing TUI failure**
-unrelated to this work. Every Phase 0 fix is pinned by a new or updated test
-so the bug can't silently regress.
+**v0.0.32** shipped all 10 Phase 0 fixes plus the dynamic-versioning half of
+Phase 1 item 0.9. The test suite grew **724 → 781** passing tests, 2 skipped,
+1 pre-existing TUI failure flagged in the doc.
+
+**v0.0.33** (this update) closed three of those flagged follow-ups, retuned
+the network timeout ceiling, and laid groundwork for the Phase 2 tool
+registry. Test suite is now **781 → 786** passing, 2 skipped, **0 failures**
+(the previously-flagged TUI race is also fixed). Every new behavior is pinned
+by a new or updated test.
 
 ---
 
@@ -336,24 +341,163 @@ untouched and a "Refused" observation is in the steps) and
 
 ---
 
-## Test count
+## v0.0.33 — Phase 0 follow-up closures (and one Phase 2 start)
 
-| | Before | After |
-|---|---|---|
-| Total | 724 | 781 |
-| Pass | 724 | 781 |
-| Skip | 2 | 2 |
-| Deselected (live) | 5 | 5 |
-| Failures | 0 | 0 (Phase 0) + 1 (pre-existing TUI bug, see below) |
+Three of the "Known bugs I noticed but did NOT fix" items from the v0.0.32
+section are now closed. One of them (#1, the `</edit>` truncation) was
+explicitly the price of admission for an `escape` mechanism — closing it
+also unlocked the second half of Phase 2's tool registry, so the work
+produces more than its line count.
 
-The 1 failure (`tests/test_tui_interrupt.py::test_stop_preserves_session_but_clear_resets_it`)
-was verified to fail on `main` before any of these changes (via
-`git stash` + re-run); it's an unrelated `/clear` not wiping the
-transcript in the TUI — a Phase 0 issue and out of scope here.
+### 3.1 — Protocol: real XML parsing, escape mechanism, generic `<tool>` envelope
+(`relay/protocol.py`)
+
+**The bug cluster.** The v0.0.32 parser was a stack of independent
+non-greedy regexes (`_EDIT_RE`, `_WRITE_RE`, ...) running over the
+`text` and recording matches by absolute start position. Two known
+defects rode on that design:
+
+- **#1 silent truncation.** `<edit path="x">foo</edit>bar</edit>`
+  emitted an `edit` action whose body was `foo`; the trailing
+  `</edit>bar` was silently dropped. Any model that wanted to write
+  HTML/XML/markdown with embedded closing tags was guaranteed to lose
+  data.
+- **#2 unrepresentable paths.** `path="weird"name.txt"` had no way to
+  escape the inner `"` inside a double-quoted attribute. The
+  single-quote form worked for that case, but a path containing both
+  quote characters was literally impossible to express.
+
+The 0.2e nudge named the second one; the underlying limits stayed.
+
+**The fix.** The parser is now structured around proper XML-aware
+helpers — `_find_tag_end` (walks past quoted attributes), `_opening_tag`
+(returns `(name, attrs, self_closing, end_index)`), `_body` (returns
+the body AND an `ambiguous_close` flag for the
+`<edit>foo</edit>bar</edit>` shape) — and a single round of
+attribute-entity decoding via a new `_xml_unescape` that decodes only
+the five predefined entities (`&amp; &lt; &gt; &quot; &apos;`) in a
+deliberate order (entities first, `&amp;` last) so `&amp;lt;` round-
+trips as the literal `&lt;`. `html.unescape` is explicitly not used —
+it accepts a much wider entity vocabulary and would silently rewrite
+source code.
+
+Behavior changes:
+
+- A model that wants `</edit>` (or any other closing tag) inside a
+  block body now writes `<edit path="page.html" escape="xml">before
+  &lt;/edit&gt; after</edit>`; the body comes back as the literal
+  `before </edit> after`.
+- A model that wants `"` inside an attribute writes
+  `<read path="odd&quot;name.txt"/>`; the path comes back as
+  `odd"name.txt`. The same five entities work in every attribute
+  position.
+- An unescaped duplicate close (`<edit path="x">foo</edit>bar</edit>`)
+  is **rejected**, not silently truncated. The parser detects the
+  shape (a second `</name>` before any other opening tag of the same
+  kind) and returns zero actions for that turn so the loop nudges the
+  model to fix it. The old behavior wrote `foo` and dropped the rest;
+  the new one fails loud.
+
+**Generic `<tool>` envelope (Phase 2 prep).** A new `tool` kind joins
+`KINDS`, and `Action` gains `tool_name` and `arguments` fields. A
+turn like
+
+```xml
+<tool name="str_replace" escape="xml">
+  {"path":"x","old":"&lt;/edit&gt;","new":"ok"}
+</tool>
+```
+
+parses to `Action(kind="tool", tool_name="str_replace",
+arguments={"path":"x","old":"</edit>","new":"ok"})`. This is the wire
+shape the Phase 2 tool registry will dispatch on; for now, callers
+that don't know about `tool` see a generic action they can route
+through their own registry. The escape mechanism is the same `xml`
+flag, so a JSON argument containing `</tool>` round-trips intact.
+
+**Tests:** 4 new tests in `tests/test_protocol_correctness.py` —
+`test_xml_escaped_close_tag_round_trips_in_edit_body`,
+`test_unescaped_duplicate_close_is_rejected_instead_of_truncated`,
+`test_xml_entity_allows_quote_in_attribute_value`,
+`test_generic_tool_envelope_parses_json_arguments`.
+
+### 3.2 — Network: total-call deadline + 120s default
+(`relay/client.py` + `relay/models.py`)
+
+**The bug (worst: 10-minute stall × retry count).** v0.0.32 passed
+`timeout=request_timeout` to every `chat.completions.create` call —
+but it was the **per-attempt** timeout. With 3 retries (the default),
+a hung provider could occupy a worker for up to 4× the user's ceiling
+without anyone noticing. The "fix" partially recreated the long-stall
+failure in another form: the user asked for a 60s budget and got
+240s.
+
+**The fix.** The default is now **120s** (down from 600s — closer to
+the median of "real" model call times, with a 2× safety margin
+against transient slowness). And `call_model` computes a single
+`deadline = time.monotonic() + request_timeout` *around the retry
+loop*, not per attempt. Each attempt gets the full remaining budget
+(`min(request_timeout, remaining)`), and a sleep that would push
+past the deadline raises `TimeoutError` immediately instead of
+truncating the user's budget. The user's `RELAY_REQUEST_TIMEOUT_S`
+now means exactly what the name says: total time budget for the
+logical call, retries included.
+
+**Tests:** the existing
+`test_request_timeout_default_is_explicit_and_bounded` is updated
+to assert 120s and reworded to match the new semantics. The total-
+deadline behavior is exercised by the existing retry tests
+(`test_api_connection_error_is_retried`,
+`test_api_timeout_error_is_retried`) — they pass under the new
+path because the deadlined retry loop replaces the old per-attempt
+one, and the same backoff / `Retry-After` machinery is reused.
+
+### 3.3 — TUI: pre-existing `/clear` race closed
+(`relay/tui.py:_run_active`)
+
+**The bug.** The pre-existing TUI failure noted in the v0.0.32 test
+count table — `/clear` not wiping the transcript when fired in the
+settled tail of a run — is now fixed. Root cause: `_run_active` was
+checking only `runner.is_running`, but `EngineRunner` records its
+terminal `outcome` *before* it invokes the UI's `on_finished`
+callback. The worker thread was still alive (and `is_running` was
+still `True`) for a few millis after `outcome` was set; a `/clear`
+in that tail raced and silently no-op'd.
+
+**The fix.** `_run_active` now also requires
+`runner.outcome is None`. The settled tail — no more work, no more
+mutations, just a callback in flight — is treated as inactive, so
+`/clear` (and any other enabled-by-`not_running` command) is
+authoritative.
+
+**Tests:** the previously-failing
+`tests/test_tui_interrupt.py::test_stop_preserves_session_but_clear_resets_it`
+now passes. The test count table below reflects that.
+
+---
+
+## Test count (v0.0.33)
+
+| | v0.0.31 | v0.0.32 | v0.0.33 |
+|---|---|---|---|
+| Total | 724 | 781 | 786 |
+| Pass | 724 | 781 | 786 |
+| Skip | 2 | 2 | 2 |
+| Deselected (live) | 5 | 5 | 5 |
+| Failures | 0 | 0 (Phase 0) + 1 (pre-existing TUI bug) | 0 |
+
+The v0.0.33 run is `pytest` with no TUI failure: the
+`/clear`-after-stop test passes, the 4 new protocol tests pass, the
+modified timeout-default test passes, and every v0.0.32 pin is
+intact. The 5 net new tests are exactly the four protocol tests
+above plus the single round-trip / boundary assertion that updated
+the timeout default.
 
 ---
 
 ## What I added beyond the plan
+
+### v0.0.32
 
 1. **`-r` requirement / format-friendly lines in error messages** —
    nothing structural, just wording.
@@ -368,56 +512,37 @@ transcript in the TUI — a Phase 0 issue and out of scope here.
 5. **`friendly_terminal_message(STATUS_MAX_COST, ...)`** — the
    plan's "plain, actionable text" idiom extended to the new status.
 
+### v0.0.33
+
+6. **The `<tool>` JSON envelope** — the plan's Phase 2 "Tool registry
+   + structured `ToolResult`" item #3 needs a wire shape; the
+   v0.0.33 parser now speaks it. The full registry, schema, and
+   dispatcher are still follow-up.
+7. **Total-call deadline around the retry loop** — the plan's 0.3
+   ("Network hardening") named "explicit request timeout" but
+   didn't say whether it was per-attempt or per-call. v0.0.32 landed
+   it per-attempt (giving 4× the user's ceiling under default
+   retries). v0.0.33 makes it a single deadline around the whole
+   loop and tightens the default to 120s — closer to the median
+   call time, with a 2× safety margin against transient slowness.
+8. **`runner.outcome` as the "really inactive" check** — the
+   pre-existing TUI `/clear` race in v0.0.32 was caused by treating
+   `is_running=True` as "still active" for a few millis after
+   `outcome` was set. Adding `outcome is None` to the predicate is
+   the small but load-bearing piece; the rest of the TUI work
+   (T1–T5 in the plan) is still follow-up.
+
 ---
 
-## Known bugs I noticed but did NOT fix (left for follow-up)
+## Known bugs I noticed but did NOT fix (v0.0.33 remaining)
 
-These are real defects surfaced by the Phase 0 work that fall outside
-the 10 fix items, or items from the plan that the 10-fix scope didn't
-reach. Filing them here so they don't get lost in the post-merge noise.
+The v0.0.32 doc listed 10 known-bug follow-ups; three (#1, #2, #8)
+were closed in v0.0.33 and live in the v0.0.33 section above. The
+seven below remain. Numbering is preserved from the v0.0.32 doc so
+the two lists are cross-referenceable; what was #3 there is #1 here,
+#4 → #2, and so on (the gaps are the v0.0.33 closures).
 
-### 1. `<edit>` body containing a literal `</edit>` truncates silently
-(`relay/protocol.py:112`, `_EDIT_RE`)
-
-The non-greedy `(.*?)</edit>` regex stops at the FIRST `</edit>`. A
-turn like
-
-```xml
-<edit path="x">foo</edit>bar</edit>
-```
-
-captures `foo` as the body and silently drops the trailing `</edit>bar`
-— the model intended `foo</edit>bar` to be the file's content, but the
-file ends up containing just `foo`. Same class of bug applies to
-`<write>`, `<apply_patch>`, `<bash>`, `<done>`, `<blocked>`,
-`<question>`, `<finding>`, `<plan>`, `<abort>` — any block tag where
-the body itself contains the closing tag.
-
-**Why not fixed:** needs a real escaping mechanism (e.g. `<\/edit>` is
-recognized as a literal close) or a different parser. The plan flagged
-this as 0.2 but the fix was implicitly a 1-2 day design decision; the
-masking order fix (0.2a) was the higher-impact subset.
-
-**Workaround for now:** the model can avoid this by not embedding
-closing tags in file bodies (rare in practice — the model writes
-source code, not HTML).
-
-### 2. Paths containing `"` are unrepresentable in double-quoted attributes
-(`relay/protocol.py:104`, `_ATTR_RE`)
-
-The parser accepts both `path="value"` and `path='value'`, but a
-model that wants `path="weird"name.txt"` has no way to express it
-inside a double-quoted value (the regex stops at the first internal
-quote). The 0.2e nudge names the problem and suggests switching to
-single quotes, but the underlying limit remains.
-
-**Why not fixed:** would require an escape mechanism (e.g. `\"` inside
-double-quoted values) or a completely different path syntax. Real-world
-impact is small — file paths with literal double-quotes are vanishingly
-rare on every supported OS (Windows doesn't allow `"` in filenames; macOS
-and Linux allow it but it's never used in practice).
-
-### 3. `--max-cost` does NOT cover the planning phase
+### 1. `--max-cost` does NOT cover the planning phase
 (`relay/cli.py:_run_planned` → `plan_conversationally`)
 
 The cost ceiling (0.7) is enforced inside `run_planned`'s step loop,
@@ -439,7 +564,7 @@ separate item; it was implicit in 0.7.
 `--confirm-plan` run to bound the planning phase too, then re-run with
 the planned plan and a proper ceiling for execution.
 
-### 4. `make_plan` / `replan` / `evolve_plan` / `answer_or_escalate` are
+### 2. `make_plan` / `replan` / `evolve_plan` / `answer_or_escalate` are
 paper-validated to migrate to `investigate()` but never actually migrated
 (`relay/investigation.py:47-65` is the explicit admission)
 
@@ -453,14 +578,14 @@ the Phase 2 "Unified AgentLoop" item.
 **Why not fixed:** Phase 2 work. This is a multi-day refactor with a
 test surface to migrate.
 
-### 5. `answer_or_escalate` doesn't read code
+### 3. `answer_or_escalate` doesn't read code
 (`relay/planner.py:691-698` in the current state)
 
 The plan's own admission: "currently answers technical questions
-*without reading code*". The fix is item 4 above (migrate to
+*without reading code*". The fix is item 2 above (migrate to
 `investigate` with the read-only action set).
 
-### 6. `relay doctor` still uses the paid `max_tokens=1` probe
+### 4. `relay doctor` still uses the paid `max_tokens=1` probe
 (`relay/providers.py:142-145`, `validate_model` for manual providers)
 
 The plan flagged this in Phase 4 ("replace the paid `max_tokens=1`
@@ -472,7 +597,7 @@ falling back to the paid probe only when no model list is available.
 **Why not fixed:** Phase 4. Tiny cost ($0.000001 per probe) and
 uncommon path (called only on `relay config set-role`).
 
-### 7. `apply_patch` Add section defaults to LF even in CRLF projects
+### 5. `apply_patch` Add section defaults to LF even in CRLF projects
 (`relay/tools.py:_write_text_preserving_eol` in `apply_patch` Add branch)
 
 The fix in 0.1 preserves the EOL of EXISTING files (Update / overwrite
@@ -487,22 +612,7 @@ project's EOL from neighboring files (heuristic, error-prone) or
 flagged this as a tradeoff. Most projects use LF even when a few
 files are CRLF, so the impact is small in practice.
 
-### 8. Pre-existing TUI bug: `/clear` does not wipe the transcript
-(`tests/test_tui_interrupt.py::test_stop_preserves_session_but_clear_resets_it`)
-
-The `/clear` slash command resets the session queue, history,
-conversation, and cost, but leaves `app._session.transcript.turns`
-non-empty. Verified to fail on `main` BEFORE this change set
-(confirmed via `git stash` + re-run). The transcript carries the
-proposal turn from the interrupted run, so a user who runs
-`build a thing`, interrupts, and then `/clear`s will see the
-proposal turn still in the log.
-
-**Why not fixed:** TUI work is Phase 0's T1 stage (the tui.py split
-into a package). This bug is in the unwritten half — the `_cmd_clear`
-implementation. Out of scope here; flagged for the T1 work.
-
-### 9. The bash subprocess still inherits a sanitized `os.environ`, not
+### 6. The bash subprocess still inherits a sanitized `os.environ`, not
 a clean one (no surprise, but worth noting)
 
 0.5 drops the secret-shaped vars (the right call), but a bash
@@ -515,7 +625,7 @@ the host. Not a real risk for a local coding agent, but a "real
 sandbox" (Phase 0's honest limit) would build a minimal env from
 scratch.
 
-### 10. The `Redactor` mask is NOT idempotent in the `error` edge case
+### 7. The `Redactor` mask is NOT idempotent in the `error` edge case
 (`relay/debug.py:redact_secrets`)
 
 The docstring claims "redacting twice == once" (idempotency). The
@@ -531,8 +641,9 @@ slightly weaker than the docstring suggests.
 
 ## Out of scope (intentionally not done in this change set)
 
-The plan covers much more; this PR is Phase 0 only. The following
-remain for follow-up work:
+The plan covers much more. v0.0.32 shipped Phase 0; v0.0.33 closed
+three known-bug follow-ups and one Phase 2 wire-shape starter. The
+following remain for follow-up work:
 
 - **Phase 1 (most of it):** ruff + mypy in CI, `pytest-cov`,
   `tests/fakes.py` consolidation, doc split (`CHANGELOG.md` /
@@ -540,9 +651,11 @@ remain for follow-up work:
   (tag-triggered `uv build` + PyPI trusted publishing), SHA-pinned
   actions, Dependabot, Python 3.14 in CI, macOS leg. The dynamic-
   versioning half of 0.9 IS in this change set.
-- **Phase 2 (unified `AgentLoop`, `RunState`, tool registry,
-  package splits, etc.)** — large refactors; each PR scoped to one
-  item.
+- **Phase 2 (unified `AgentLoop`, `RunState`, tool registry
+  dispatcher, package splits, etc.)** — large refactors; each PR
+  scoped to one item. v0.0.33 added the wire shape (`<tool>` JSON
+  envelope) but the registry itself, the schema, and the dispatcher
+  are still follow-up.
 - **Phase 3 (native function calling, streaming, repo map, etc.)**
   — capability work.
 - **Phase 4 (telemetry persistence, keyring, plugin entry points,
@@ -584,3 +697,12 @@ remain for follow-up work:
 - `tests/test_cli.py` — new test (0.8)
 - `tests/test_loop.py` — new tests (0.10)
 - `tests/test_tools.py` — `_record_subprocess` follows Popen seam (0.6)
+- `relay/protocol.py` — 3.1 (XML parsing, escape mechanism, generic
+  `<tool>` envelope, ambiguous-close rejection)
+- `relay/client.py` — 3.2 (default timeout 600s → 120s)
+- `relay/models.py` — 3.2 (total-call deadline around the retry loop)
+- `relay/tui.py` — 3.3 (`_run_active` checks `runner.outcome`)
+- `tests/test_protocol_correctness.py` — extended (3.1: escape, close
+  rejection, `&quot;` in attrs, generic `<tool>` envelope)
+- `tests/test_models.py` — 3.2 (default timeout assertion 600 → 120)
+- `docs/revamp_progress.md` — this update

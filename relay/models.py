@@ -309,19 +309,25 @@ def call_model(
 
     with timer() as elapsed:
         max_retries = _max_retries()
-        # v0.0.32: explicit request timeout. The openai SDK's 600s default
-        # would stall a step for 10 minutes on a hung provider; we surface
-        # the same default explicitly so a hung connection is reported in a
-        # bounded time and can be retried.
+        # One deadline covers the logical call INCLUDING retries.  Giving each
+        # attempt a fresh timeout would multiply the user's ceiling by the
+        # retry count and recreate the long-stall failure in another form.
         request_timeout = _default_request_timeout_s()
+        deadline = time.monotonic() + request_timeout
         response = None
         for attempt in range(max_retries + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"model call exceeded its {request_timeout:g}s total deadline"
+                )
             try:
+                attempt_timeout = request_timeout if attempt == 0 else remaining
                 response = client.chat.completions.create(
                     model=model,
                     messages=messages,
                     extra_body=extra_body,
-                    timeout=request_timeout,
+                    timeout=attempt_timeout,
                     **kwargs,
                 )
                 break  # success
@@ -334,6 +340,11 @@ def call_model(
                     sleep_s = _retry_after_seconds(exc)
                     if sleep_s is None:
                         sleep_s = _backoff_seconds(attempt)
+                    remaining = deadline - time.monotonic()
+                    if sleep_s >= remaining:
+                        raise TimeoutError(
+                            f"model call exceeded its {request_timeout:g}s total deadline"
+                        ) from exc
                     time.sleep(sleep_s)
                     continue
                 raise  # non-retriable or exhausted retries: propagate

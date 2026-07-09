@@ -83,6 +83,37 @@ def test_done_alone_still_works_when_outside_question():
     assert result.actions[0].content == "finished"
 
 
+def test_xml_escaped_close_tag_round_trips_in_edit_body():
+    result = parse(
+        '<edit path="page.html" escape="xml">before &lt;/edit&gt; after</edit>'
+    )
+    assert len(result.actions) == 1
+    assert result.actions[0].content == "before </edit> after"
+
+
+def test_unescaped_duplicate_close_is_rejected_instead_of_truncated():
+    result = parse('<edit path="x">foo</edit>bar</edit>')
+    assert result.actions == []
+
+
+def test_xml_entity_allows_quote_in_attribute_value():
+    result = parse('<read path="odd&quot;name.txt"/>')
+    assert result.actions[0].path == 'odd"name.txt'
+
+
+def test_generic_tool_envelope_parses_json_arguments():
+    result = parse(
+        '<tool name="str_replace" escape="xml">'
+        '{"path":"x","old":"&lt;/edit&gt;","new":"ok"}'
+        '</tool>'
+    )
+    assert result.actions[0].kind == "tool"
+    assert result.actions[0].tool_name == "str_replace"
+    assert result.actions[0].arguments == {
+        "path": "x", "old": "</edit>", "new": "ok",
+    }
+
+
 # --- 0.2.2: parse-based terminator detection --------------------------------
 
 

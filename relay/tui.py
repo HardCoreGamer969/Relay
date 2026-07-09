@@ -679,7 +679,17 @@ class Command:
 def _run_active(app) -> bool:
     """Whether a run is in flight (used by ``enabled`` predicates)."""
     runner = getattr(app, "_runner", None)
-    return runner is not None and getattr(runner, "is_running", False)
+    # ``EngineRunner`` records its terminal outcome before invoking the UI's
+    # ``on_finished`` callback.  The worker thread can remain alive for a tiny
+    # tail while that callback returns, but it cannot mutate the transcript or
+    # execute more work once ``outcome`` is set.  Treat that settled tail as
+    # inactive so a user who interrupts, stops, and immediately runs ``/clear``
+    # does not hit a silent no-op race.
+    return (
+        runner is not None
+        and getattr(runner, "is_running", False)
+        and getattr(runner, "outcome", None) is None
+    )
 
 
 def _parse_inline_command(text: str) -> tuple[str, str] | None:

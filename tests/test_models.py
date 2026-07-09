@@ -419,10 +419,7 @@ def test_request_timeout_is_passed_explicitly(monkeypatch):
 
 
 def test_request_timeout_default_is_explicit_and_bounded(monkeypatch):
-    """Without an env override, the timeout is the SDK default (600s) but
-    is now passed EXPLICITLY rather than relying on the SDK's implicit
-    default. The fact that it's a kwarg at all is the fix -- the v0.0.31
-    bug was a fully implicit 600s."""
+    """Without an override, Relay avoids the SDK's historical 600s stall."""
     seen: dict = {}
 
     class _Completions:
@@ -440,4 +437,4 @@ def test_request_timeout_default_is_explicit_and_bounded(monkeypatch):
         "brain", [{"role": "user", "content": "hi"}], models=cfg, ledger=Ledger(), client=_Client()
     )
     assert "timeout" in seen
-    assert seen["timeout"] == 600.0
+    assert seen["timeout"] == 120.0

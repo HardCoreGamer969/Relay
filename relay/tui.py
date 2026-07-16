@@ -1135,6 +1135,8 @@ COMMANDS: list[Command] = [
             run=lambda app: app._cmd_cost()),
     Command("why", "Why", "Harness flight recorder for the last/current run (zero tokens)", "ops",
             run=lambda app: app._cmd_why()),
+    Command("memory", "Memory", "List / pin / forget durable shared findings", "ops",
+            run=lambda app: app._cmd_memory()),
     Command("log", "Log", "Export a debug log (.md) to share when reporting an issue", "ops",
             run=lambda app: app._cmd_log()),
     Command("clear", "Clear", "Clear the stream + start a fresh session", "ops",
@@ -2748,6 +2750,38 @@ class RelayTuiApp(App):
         text = redact_secrets(HarnessReport(**kwargs).to_text())
         for line in text.splitlines():
             self._write_activity(line)
+
+    def _cmd_memory(self) -> None:
+        """A3: list durable shared memory; offer pin/forget for the first entries."""
+        from relay.durable_memory import list_entries, pin_entry, forget_entry
+
+        root = self._session.working_dir
+        entries = list_entries(root)
+        options = [
+            {
+                "title": f"{e.id}: {e.summary}" + (" [pinned]" if "pinned" in e.tags else ""),
+                "value": e.id,
+                "category": "entries",
+                "description": e.detail[:120],
+            }
+            for e in entries[:20]
+        ]
+        if not options:
+            options = [{"title": "(empty)", "value": "__empty__", "category": "entries",
+                        "description": "No durable shared findings yet"}]
+        else:
+            first = entries[0]
+            options.append({
+                "title": f"Pin {first.id}", "value": "__pin__", "category": "actions",
+                "description": "Keep this entry across budget trim",
+                "on_select": (lambda v, eid=first.id: pin_entry(root, eid) and self._write_activity(f"[memory] pinned {eid}")),
+            })
+            options.append({
+                "title": f"Forget {first.id}", "value": "__forget__", "category": "actions",
+                "description": "Remove from durable shared store",
+                "on_select": (lambda v, eid=first.id: forget_entry(root, eid) and self._write_activity(f"[memory] forgot {eid}")),
+            })
+        self.push_screen(SelectDialog(title="Durable shared memory", options=options))
 
     def _toggle_cost_counter(self) -> None:
         """Show/hide the status-line per-goal counter (the /cost toggle)."""

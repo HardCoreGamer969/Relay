@@ -51,6 +51,7 @@ from relay.config import (
 )
 from relay.conversation import DEFAULT_MAX_ROUNDS, ConversationResult, plan_conversationally
 from relay.envelope import CostEnvelope
+from relay.durable_memory import capture_bus_shared, merge_shared_into_bus
 from relay.memory import MemoryBus
 from relay.orchestrator import (
     STATUS_CANCELLED,
@@ -457,6 +458,7 @@ class Session(WorkingDirSession):
         super().__init__(launch_root)
         self.transcript = Transcript()
         self.memory = MemoryBus()
+        merge_shared_into_bus(self.memory, self.working_dir)
         self.goal: str | None = None
         self.last_plan: Plan | None = None
         self.revisions = 0
@@ -467,9 +469,11 @@ class Session(WorkingDirSession):
         """Full-session reset (``/clear``): wipe conversation, memory, plan, queue,
         and recall history, and start fresh. Distinct from STOP, which abandons the
         plan but keeps all of this. The working DIR is left as-is (it is a workspace
-        location, not conversation/memory/plan)."""
+        location, not conversation/memory/plan). Durable shared memory is re-loaded
+        from disk (A3) so pinned findings survive ``/clear``."""
         self.transcript = Transcript()
         self.memory = MemoryBus()
+        merge_shared_into_bus(self.memory, self.working_dir)
         self.goal = None
         self.last_plan = None
         self.revisions = 0
@@ -601,6 +605,7 @@ class EngineRunner:
         # (tests) gets fresh ones, unchanged from before.
         self.transcript = transcript if transcript is not None else Transcript()
         self.memory = memory if memory is not None else MemoryBus()
+        merge_shared_into_bus(self.memory, self.project_root)
         self.outcome: RunOutcome | None = None
         self._on_finished = on_finished
         self._run_kwargs = dict(run_kwargs or {})  # extra run_planned knobs (tests)
@@ -717,6 +722,10 @@ class EngineRunner:
         except Exception as exc:  # noqa: BLE001 -- the UI must hear about ANY failure
             outcome = RunOutcome(status=STATUS_ERROR,
                                  error=f"{exc.__class__.__name__}: {exc}")
+        try:
+            capture_bus_shared(self.memory, self.project_root)
+        except OSError:
+            pass
         self.outcome = outcome
         self._on_finished(outcome)
 
@@ -757,5 +766,9 @@ class EngineRunner:
         except Exception as exc:  # noqa: BLE001 -- the UI must hear about ANY failure
             outcome = RunOutcome(status=STATUS_ERROR,
                                  error=f"{exc.__class__.__name__}: {exc}")
+        try:
+            capture_bus_shared(self.memory, self.project_root)
+        except OSError:
+            pass
         self.outcome = outcome
         self._on_finished(outcome)

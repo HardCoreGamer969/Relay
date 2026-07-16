@@ -273,6 +273,14 @@ def run(
 
     _print_telemetry(ledger)
     _print_receipt(envelope, ledger, status=getattr(result, "status", ""))
+    # A3: persist shared findings/directives for the next run in this project.
+    try:
+        from relay.durable_memory import capture_bus_shared
+        mem = getattr(result, "memory", None)
+        if mem is not None:
+            capture_bus_shared(mem, root)
+    except OSError:
+        pass
     if not no_log:
         _save_run(goal=goal, mode=mode, result=result, ledger=ledger, cfg=cfg,
                   wall_time_s=wall_time_s, root=root)
@@ -577,6 +585,51 @@ def _runs_table(records, limit: int) -> Table:
             str(rec.steps),
         )
     return table
+
+
+@app.command()
+def memory(
+    action: str = typer.Argument(
+        "list",
+        help="list | pin <id> | forget <id>",
+    ),
+    entry_id: str = typer.Argument("", help="Entry id for pin/forget."),
+    root: str = typer.Option(".", "--root", help="Project root for .relay/memory.json."),
+) -> None:
+    """Manage durable shared findings/directives (A3). Never touches brain-private memory."""
+    from relay.durable_memory import forget_entry, list_entries, pin_entry
+
+    act = (action or "list").strip().lower()
+    if act == "list":
+        entries = list_entries(root)
+        if not entries:
+            console.print("[dim](no durable shared memory yet)[/dim]")
+            return
+        table = Table(title="Durable shared memory")
+        table.add_column("Id")
+        table.add_column("Kind")
+        table.add_column("Summary", overflow="fold")
+        table.add_column("Tags")
+        for e in entries:
+            table.add_row(e.id, e.kind, e.summary, ",".join(e.tags) or "-")
+        console.print(table)
+        return
+    if act == "pin":
+        if not entry_id:
+            console.print("[red]pin requires an entry id[/red]")
+            raise typer.Exit(1)
+        ok = pin_entry(root, entry_id)
+        console.print("[green]pinned[/green]" if ok else f"[yellow]not found: {entry_id}[/yellow]")
+        raise typer.Exit(0 if ok else 1)
+    if act == "forget":
+        if not entry_id:
+            console.print("[red]forget requires an entry id[/red]")
+            raise typer.Exit(1)
+        ok = forget_entry(root, entry_id)
+        console.print("[green]forgot[/green]" if ok else f"[yellow]not found: {entry_id}[/yellow]")
+        raise typer.Exit(0 if ok else 1)
+    console.print(f"[red]unknown action {action!r}; use list|pin|forget[/red]")
+    raise typer.Exit(1)
 
 
 @app.command()

@@ -8,6 +8,9 @@
 > **This folder** = what makes Relay feel unlike Claude Code / Codex / OpenCode.
 >
 > Do not merge the two roadmaps. Cross-link blockers only.
+>
+> **Router v2 (Phase E):** deepen the model-router brand —
+> [`router-v2/MASTER.md`](router-v2/MASTER.md) + [`router-v2/PROGRESS.md`](router-v2/PROGRESS.md).
 
 **Roadmap home for differentiation work.** Status lives in the table below.
 

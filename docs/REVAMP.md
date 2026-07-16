@@ -408,6 +408,11 @@ rendered-output diffs (the mirror buffers make this assertable).
 
 ## TUI sequencing
 
+> **Product cockpit plan (locked decisions + U0–U6):**  
+> [`docs/features/tui-revamp/MASTER.md`](features/tui-revamp/MASTER.md)  
+> folds T1–T5 into stages U0–U6 with IDE density, website brand, and anim kill switch.
+> Prefer that folder for status; this section remains the engineering rationale.
+
 ```
 T1 (split)  ──►  T2 (foundations)  ──►  T3 (rendering)  ──►  T5 (polish)
                         │

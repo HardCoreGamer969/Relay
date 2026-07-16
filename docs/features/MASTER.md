@@ -11,6 +11,9 @@
 >
 > **Router v2 (Phase E):** deepen the model-router brand —
 > [`router-v2/MASTER.md`](router-v2/MASTER.md) + [`router-v2/PROGRESS.md`](router-v2/PROGRESS.md).
+>
+> **TUI revamp (Phase U):** IDE cockpit + website brand —
+> [`tui-revamp/MASTER.md`](tui-revamp/MASTER.md) + [`tui-revamp/DECISIONS.md`](tui-revamp/DECISIONS.md).
 
 **Roadmap home for differentiation work.** Status lives in the table below.
 

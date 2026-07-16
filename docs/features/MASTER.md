@@ -46,7 +46,7 @@ Work top to bottom. Skip a row only with a written reason in **Notes**.
 
 | Phase | # | Feature | Doc | Status | Blockers / notes |
 |-------|---|----------|-----|--------|------------------|
-| A1 | 7 | Cost Envelope Contracts | [07](07-cost-envelope.md) | planned | Partial: `--max-cost`, step ceilings exist |
+| A1 | 7 | Cost Envelope Contracts | [07](07-cost-envelope.md) | designing | Decisions locked in feature doc; awaiting final open questions + go-ahead to code |
 | A2 | 12 | Explain the Harness (`/why`) | [12](12-explain-harness.md) | planned | Events exist; no aggregation yet |
 | A3 | 9 | Finding-Driven Memory | [09](09-finding-memory.md) | planned | Stage 1 pools exist; persist TBD |
 | B1 | 2 | Assumption Profiles | [02](02-assumption-profiles.md) | planned | Dial exists; named profiles do not |

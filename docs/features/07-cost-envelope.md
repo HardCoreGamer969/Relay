@@ -28,12 +28,13 @@ Other agents feel open-ended. Relay already bounds loops. Productize budgets as
 |---|--------|----------|
 | 1 | Default cost ceiling | **Opt-in.** Steps stay default 50; cost stays off unless flag/env/config sets it. Unbounded cost is stated explicitly in preflight when unset. |
 | 2 | Preflight timing | **Start + post-plan snapshot** (see below). |
-| 3 | Envelope scope | **Configurable:** `all` (planning + execution) or `execution` (orchestrator/solo loop only). |
+| 3 | Envelope scope | **Configurable:** `all` (planning + execution) or `execution` (executor/solo loop only). **Cost-only knob** — does not change step-ceiling semantics; help text must say so. Default `all` when `max_cost` is set. |
 | 4 | Breach handoff | **No extra model call in v1.** Deterministic receipt + remaining plan steps / solo state. Spending more to apologize for a spend limit fights the brand. |
-| 5 | Warning thresholds | Defaults **50 / 80 / 90 / 99**; user-configurable; **realtime** adjustable in TUI. |
+| 5 | Warning thresholds | Defaults **50 / 80 / 90 / 99**; user-configurable; **realtime** adjustable in TUI (**session-only** — does not write config). |
 | 6 | “Wasted” metric | **Brain $ on replan/review that did not yield a completed step** (see measurement). |
 | 7 | Solo | **Yes** — same envelope applies to `--solo` (easier skill ceiling). |
-| 8 | Surfaces | **CLI + TUI together** (preflight, warnings, receipt, `/cost` remaining, wire `max_cost` into bridge). |
+| 8 | Surfaces | **CLI + TUI together.** Keep slash command **`/cost`**; panel title “Envelope” when ceilings exist. |
+| 9 | Branching | Land on `cursor/features-revamp-af89`; spin feature sub-branches only if needed, then merge back into the revamp branch. |
 
 ### Preflight timing (decision #2 detail)
 
@@ -53,9 +54,10 @@ Solo has only (1).
 
 Config sketch (names TBD while implementing):
 
-- CLI: `--envelope-scope all|execution`
+- CLI: `--envelope-scope all|execution` — help text: **affects cost ceiling only**;
+  step ceilings keep their existing semantics
 - Env: `RELAY_ENVELOPE_SCOPE`
-- Config: `envelope.scope` (or top-level `envelope_scope`)
+- Config: `envelope_scope` (top-level, same style as `max_cost`)
 - Precedence: CLI > env > config > default `all`
 
 ### Warning thresholds (decision #5 detail)
@@ -63,7 +65,9 @@ Config sketch (names TBD while implementing):
 - Defaults: `0.50, 0.80, 0.90, 0.99` of each *active* dimension (cost and/or step ceiling).
 - Fire **once per threshold per dimension per run** at the same boundary seam as the hard stop (after a call/step settles, before the next begins).
 - Config: e.g. `RELAY_ENVELOPE_WARN=0.5,0.8,0.9,0.99` or config list; invalid entries fall back to defaults.
-- TUI realtime: `/cost` (or `/envelope`) can edit thresholds and ceilings for the **current run**; takes effect on the next boundary check. Does not rewrite user config unless the user explicitly saves (v1: session-only unless we add “save” — see open question).
+- TUI realtime: `/cost` can edit thresholds and ceilings for the **current run**
+  only (session-only). Takes effect on the next boundary check. Does **not**
+  rewrite user config/env; next run still loads from flag/env/config.
 
 ### Wasted brain $ (decision #6 detail)
 
@@ -99,9 +103,10 @@ Keep **finish current step/turn, then halt** — no mid-`call_model` abort in v1
 ### TUI
 
 - Wire `resolve_max_cost()` (+ scope, thresholds) into bridge/runner (parity with CLI)
+- Keep slash command **`/cost`**; panel title “Envelope” when ceilings exist
 - Status / `/cost`: spent, remaining, ceilings, scope, next threshold
 - Warning lines in the activity stream
-- Realtime adjust thresholds (and ceilings) for the in-flight run
+- Realtime adjust thresholds and ceilings for the in-flight run (**session-only**)
 - Same receipt at goal end
 
 ### Solo
@@ -133,7 +138,7 @@ Keep **finish current step/turn, then halt** — no mid-`call_model` abort in v1
 - [ ] Hard stop still finishes current step/turn; statuses + non-zero exit where CLI already does
 - [ ] Receipt: brain vs hands $, wasted brain $ (defined above), $/completed-step when computable, envelope outcome
 - [ ] Solo respects `max_cost` + warnings
-- [ ] TUI: `max_cost` wired; `/cost` shows remaining; realtime threshold edit affects next check
+- [ ] TUI: `max_cost` wired; `/cost` shows remaining (panel title “Envelope” when ceilings set); session-only realtime edits affect next check; no config write
 - [ ] Hermetic tests; no live network
 
 ---
@@ -145,31 +150,25 @@ Keep **finish current step/turn, then halt** — no mid-`call_model` abort in v1
 - LLM “what I’d do next” handoff on breach
 - Assumption profiles setting default envelopes (B1)
 - Counterfactual “$ saved vs premium” (router / bake-off later)
-- Persisting TUI realtime envelope edits to disk (unless we affirmatively add save — see below)
+- Persisting TUI realtime envelope edits to disk (session-only)
 
 ---
 
-## Open questions (narrow)
+## Implementation slices
 
-1. **TUI realtime edits — session-only or “save to config”?**  
-   Recommendation: **session-only in v1** (simple, no foot-guns); document that config/env still set the next run’s defaults.
-
-2. **Scope default when only step ceiling is set (cost unbounded)?**  
-   Warnings still apply to the step dimension; scope only affects whether *planning* model calls count toward **cost**. Steps in planned mode are already executor-scoped. Confirm: scope knob is **cost-scoped only** (name it that way in help text).
-
-3. **Naming:** `/cost` vs new `/envelope` for the richer panel?  
-   Recommendation: keep **`/cost`** as the command (users know it); panel title “Envelope” when ceilings exist.
-
----
-
-## Implementation slices (still no code until you say go)
+Work lands on `cursor/features-revamp-af89`. If a slice needs isolation, branch
+*from* that branch and merge back — do not invent a parallel roadmap.
 
 | Slice | Deliverable |
 |-------|-------------|
 | S1 | Resolvers: scope + warn thresholds; preflight string helper; unit tests |
 | S2 | Planned path: warnings + receipt; scope `execution` preserves today’s cost seam; scope `all` checks during planning |
 | S3 | Solo path: cost ceiling + warnings + receipt fields |
-| S4 | TUI/bridge wire-up + `/cost` remaining + realtime threshold/ceiling session edits |
-| S5 | Runlog fields + polish copy; update this doc checkboxes + MASTER status when shipped |
+| S4 | TUI/bridge wire-up + `/cost` remaining + realtime threshold/ceiling **session-only** edits |
+| S5 | Runlog fields + polish copy; tick acceptance criteria; MASTER → `shipped` |
 
-Suggested PR shape: one PR for S1–S3 (engine + CLI), follow-up PR for S4–S5 if the TUI diff gets large — or one PR if you prefer a single A1 land. **Your call before coding.**
+---
+
+## Ready to code when you say go
+
+Design is locked. First coding step = **S1** (pure resolvers + preflight helper + tests; no orchestrator behavior change yet).

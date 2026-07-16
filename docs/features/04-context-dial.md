@@ -1,8 +1,11 @@
 # 04 — Hands Context Dial
 
-**Phase:** B3 · **Status:** planned · **Depends on:** A2 helpful for proving “narrow wins”; pairs with B4 router
+**Phase:** B3 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Depends on:** A2 helpful for proving “narrow wins”; pairs with B4 router
 
-[← Master plan](MASTER.md)
+## Blockers
+
+- None
 
 ---
 

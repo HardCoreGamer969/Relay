@@ -1,8 +1,12 @@
 # 13 — Model Router (brand-defining)
 
-**Phase:** B4 · **Status:** planned · **Depends on:** A1 cost envelope, A2 `/why` (to explain routes), B2 escalation classes useful for triggers; static `call_model(role, …)` seam already exists
+**Phase:** B4 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Depends on:** A1 cost envelope, A2 `/why`, B2 escalation classes; `call_model(role, …)` seam exists
 
-[← Master plan](MASTER.md)
+## Blockers
+
+- None hard beyond A1/A2/B2 for a solid v1
+- Catalog tier tables may later lean on [REVAMP Phase 4](../REVAMP.md) catalog de-rot — not a v1 gate
 
 ---
 

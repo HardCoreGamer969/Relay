@@ -1,8 +1,11 @@
 # 03 — Plan Time-Travel / Fork Studio
 
-**Phase:** D2 · **Status:** planned · **Depends on:** durable checkpoints / `RunState`-shaped resume (REVAMP); benefits from A2 `/why`
+**Phase:** D2 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Depends on:** A2 `/why` (helpful); durable checkpoints
 
-[← Master plan](MASTER.md)
+## Blockers
+
+- Hard: `RunState` / session resume — [REVAMP Phase 2](../REVAMP.md)
 
 ---
 

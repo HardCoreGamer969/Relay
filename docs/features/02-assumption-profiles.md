@@ -1,8 +1,11 @@
 # 02 — Assumption Profiles
 
-**Phase:** B1 · **Status:** planned · **Depends on:** existing assumption dial (no hard infra blockers)
+**Phase:** B1 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Depends on:** existing assumption dial (no hard infra blockers)
 
-[← Master plan](MASTER.md)
+## Blockers
+
+- None
 
 ---
 

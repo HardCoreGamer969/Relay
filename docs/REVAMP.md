@@ -5,6 +5,12 @@
 > tests/CI/docs/website quality stack). Every finding cited below carries a
 > `file:line` reference valid as of commit `ad36ecf`.
 
+> **Product differentiation** (bake-off, assumption profiles, model router, etc.)
+> lives in [`features/MASTER.md`](features/MASTER.md) — a sibling roadmap, not a
+> section of this file. This plan stays engineering: bugs, structure, parity
+> hygiene. When a features-doc item needs infra from here, link it; do not
+> duplicate designs across the two trees.
+
 ---
 
 ## The verdict: don't rewrite — refactor in place

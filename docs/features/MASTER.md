@@ -1,118 +1,66 @@
 # Relay Features Revamp — Master Plan
 
-> Differentiation roadmap: the 12 product features plus the brand-defining
-> **Model Router** (#13). This is *not* the engineering refactor in
-> [`../REVAMP.md`](../REVAMP.md) — that doc covers quality, structure, and
-> parity hygiene (streaming, resume, native tool-calling). **This** doc is
-> what makes Relay feel unlike Claude Code, Codex, or OpenCode.
+> Product differentiation roadmap (12 features + brand-defining **Model Router**).
+>
+> **Sibling, not child, of the engineering revamp:**
+> [`../REVAMP.md`](../REVAMP.md) = quality, structure, parity hygiene
+> (streaming, resume, native tool-calling, TUI split).
+> **This folder** = what makes Relay feel unlike Claude Code / Codex / OpenCode.
+>
+> Do not merge the two roadmaps. Cross-link blockers only.
 
-**Status:** planning only — no implementation yet.
-**Branch intent:** `features-revamp` (git: `cursor/features-revamp-af89`).
-
----
-
-## On this doc layout
-
-| File | Job |
-|------|-----|
-| `MASTER.md` (this file) | Big picture, identity, phased order, dependency graph, progress table |
-| `NN-<slug>.md` | One feature: problem, surface, hooks, acceptance, open questions |
-
-**Why this shape works:** a single mega-doc becomes unreadable once designs grow;
-thirteen orphan docs with no index lose the order and dependencies. Master =
-navigation + sequencing; feature files = depth. Keep the master thin: do **not**
-duplicate full designs here — link out and update status in the table below.
-
-**Optional later (not created yet):** a `STATUS.md` only if the table in this
-file gets noisy; a mermaid export for the website. Avoid a third layer until
-you feel pain.
-
-**Relation to `REVAMP.md`:** ship parity items from REVAMP when a feature
-needs them (e.g. durable `RunState` before plan fork). Do not block the whole
-differentiation roadmap on finishing REVAMP Phase 3.
+**Planning only — no implementation yet.**
 
 ---
 
-## Identity wedge
+## Doc rules (keep this system healthy)
 
-Most agents compete on *one smart model that does everything*. Relay competes
-on **orchestration as the product**:
+| Rule | Detail |
+|------|--------|
+| Master is thin | This file = identity, **one** roadmap table, dependency sketch, non-goals. No feature designs here. |
+| Feature files hold depth | `NN-<slug>.md` = problem, surface, hooks, acceptance, open questions. |
+| Status lives once | Update the **Status** column below only. Feature docs do not carry a status field. |
+| Ship note in the feature doc | When shipped, add `Shipped: vX.Y.Z` at the top of that feature file; flip Status here to `shipped`. |
+| No third layer | Do not add `STATUS.md`, per-phase masters, or website mirrors until this table is genuinely painful. |
+| REVAMP stays separate | If a feature needs infra (e.g. `RunState`), note it in **Blockers** and link REVAMP — do not copy REVAMP tasks here. |
 
-- Brain / hands with **narrow executor context**
-- **Every-model** text protocol (OpenRouter-first)
-- User-owned **judgment** (assumption dial → profiles → product firewall)
-- **Honest budgets** (steps, cost, escalations) with receipts
-- **Model routing** — spend smart across roles mid-run, not “pick one chat model”
-
-Lead marketing with bake-offs, assumption profiles, plan forks, the
-product-decision firewall, protocol fitness, and the router. Treat streaming /
-MCP / prettier markdown as hygiene, not the story.
+Status values: `planned` · `designing` · `in progress` · `shipped` · `blocked` · `dropped`.
 
 ---
 
-## Feature index
+## Identity
 
-| # | Feature | Doc | Role |
-|---|---------|-----|------|
-| 1 | Model Bake-Off (`relay duel`) | [01-bake-off.md](01-bake-off.md) | Proof of the architecture |
-| 2 | Assumption Profiles | [02-assumption-profiles.md](02-assumption-profiles.md) | Judgment as product |
-| 3 | Plan Time-Travel / Fork Studio | [03-plan-fork.md](03-plan-fork.md) | Git for intent |
-| 4 | Hands Context Dial | [04-context-dial.md](04-context-dial.md) | Amnesia as a feature |
-| 5 | Product-Decision Firewall | [05-product-firewall.md](05-product-firewall.md) | Refuse invented product calls |
-| 6 | Adversarial Reviewer | [06-adversarial-reviewer.md](06-adversarial-reviewer.md) | Planner + skeptic |
-| 7 | Cost Envelope Contracts | [07-cost-envelope.md](07-cost-envelope.md) | Budgets with receipts |
-| 8 | Protocol Fitness Lab | [08-protocol-lab.md](08-protocol-lab.md) | Every-model moat, measured |
-| 9 | Finding-Driven Memory | [09-finding-memory.md](09-finding-memory.md) | Curated decisions, not chat sludge |
-| 10 | Orchestra Mode | [10-orchestra.md](10-orchestra.md) | One brain, many narrow hands |
-| 11 | Diff-as-Interface | [11-diff-interface.md](11-diff-interface.md) | Step-scoped accept / rewind |
-| 12 | Explain the Harness (`/why`) | [12-explain-harness.md](12-explain-harness.md) | Debuggable autonomy |
-| **13** | **Model Router** | [13-model-router.md](13-model-router.md) | **Brand-defining** |
+Most agents compete on one smart model that does everything. Relay competes on
+**orchestration as the product**: narrow hands, every-model protocol, user-owned
+judgment, honest budgets, and **model routing** (spend smart across roles).
 
-Skipped from the creative list (by choice): local-first swarm without cloud,
-teaching/ghost-hands mode, constraint cards as a standalone feature (fold
-constraint cards into #5 / #9 when useful).
+Lead with bake-offs, profiles, plan forks, product firewall, protocol fitness,
+and the router. Treat streaming / MCP / prettier markdown as REVAMP hygiene,
+not the story.
 
 ---
 
-## Recommended build order
+## Roadmap (build order)
 
-Order optimizes for: (1) leverage what already exists, (2) unlock later
-features, (3) ship visible identity early without boiling the ocean.
+Work top to bottom. Skip a row only with a written reason in **Notes**.
 
-### Phase A — Honest foundation (ship first)
+| Phase | # | Feature | Doc | Status | Blockers / notes |
+|-------|---|----------|-----|--------|------------------|
+| A1 | 7 | Cost Envelope Contracts | [07](07-cost-envelope.md) | planned | Partial: `--max-cost`, step ceilings exist |
+| A2 | 12 | Explain the Harness (`/why`) | [12](12-explain-harness.md) | planned | Events exist; no aggregation yet |
+| A3 | 9 | Finding-Driven Memory | [09](09-finding-memory.md) | planned | Stage 1 pools exist; persist TBD |
+| B1 | 2 | Assumption Profiles | [02](02-assumption-profiles.md) | planned | Dial exists; named profiles do not |
+| B2 | 5 | Product-Decision Firewall | [05](05-product-firewall.md) | planned | Escalations exist; no typed taxonomy |
+| B3 | 4 | Hands Context Dial | [04](04-context-dial.md) | planned | Narrow hands hardcoded today |
+| B4 | **13** | **Model Router** (brand) | [13](13-model-router.md) | planned | Static role→model binding today |
+| C1 | 1 | Model Bake-Off (`relay duel`) | [01](01-bake-off.md) | planned | Needs A1 receipts; `provider` on CallRecord → [REVAMP §4](../REVAMP.md) |
+| C2 | 8 | Protocol Fitness Lab | [08](08-protocol-lab.md) | planned | Pairs with C1 |
+| D1 | 6 | Adversarial Reviewer | [06](06-adversarial-reviewer.md) | planned | Investigation loop exists; reviewer fail-open → REVAMP |
+| D2 | 3 | Plan Fork / Time-Travel | [03](03-plan-fork.md) | planned | Needs `RunState` / resume → [REVAMP Phase 2](../REVAMP.md) |
+| D3 | 11 | Diff-as-Interface | [11](11-diff-interface.md) | planned | Stronger with D2 checkpoints |
+| D4 | 10 | Orchestra Mode | [10](10-orchestra.md) | planned | Needs A3, B2, stable step boundaries |
 
-Small surface area; amplifies existing telemetry, budgets, and memory Stage 1.
-
-| Order | # | Feature | Why here |
-|------:|---|----------|----------|
-| A1 | 7 | Cost Envelope Contracts | Extends `--max-cost` / step ceilings into contracts + receipts |
-| A2 | 12 | Explain the Harness | Flight recorder; makes every later feature debuggable |
-| A3 | 9 | Finding-Driven Memory | Persist shared pool across runs; feeds firewall, orchestra, router |
-
-### Phase B — Judgment + brand (identity)
-
-| Order | # | Feature | Why here |
-|------:|---|----------|----------|
-| B1 | 2 | Assumption Profiles | Productize the existing 1–5 dial |
-| B2 | 5 | Product-Decision Firewall | Typed escalations; profiles become meaningful |
-| B3 | 4 | Hands Context Dial | Expose narrowness; telemetry for “amnesia wins” |
-| B4 | **13** | **Model Router** | Brand wedge; needs cost honesty + escalation types |
-
-### Phase C — Proof (show the world)
-
-| Order | # | Feature | Why here |
-|------:|---|----------|----------|
-| C1 | 1 | Model Bake-Off | Needs solid cost/role telemetry from A/B |
-| C2 | 8 | Protocol Fitness Lab | Public “Relay fitness” for OpenRouter slugs; pairs with duel |
-
-### Phase D — Deep orchestration (harder infrastructure)
-
-| Order | # | Feature | Why here |
-|------:|---|----------|----------|
-| D1 | 6 | Adversarial Reviewer | Extends investigation loop; optional second brain |
-| D2 | 3 | Plan Fork / Time-Travel | Needs checkpoints / resume-shaped `RunState` |
-| D3 | 11 | Diff-as-Interface | Step-scoped diffs + rewind on stable step boundaries |
-| D4 | 10 | Orchestra Mode | Hardest; needs memory, firewall, conflict detection |
+**Out of roadmap (intentionally skipped):** local-first remote swarm, teaching/ghost-hands, standalone constraint cards (fold into #5 / #9 if needed).
 
 ```text
 A1 Cost envelope ──┐
@@ -125,60 +73,25 @@ A3 Finding memory ─┘         │                        │
                                     ▼                             ▼
                                C1 Bake-off                   C2 Protocol lab
                                     │
-                    D1 Adversarial reviewer
-                    D2 Plan fork
-                    D3 Diff-as-interface
-                    D4 Orchestra
+                    D1 Adversarial → D2 Plan fork → D3 Diff interface → D4 Orchestra
 ```
 
 ---
 
-## Progress tracker
+## Non-goals
 
-Update status as work starts. Values: `planned` · `designing` · `in progress` · `shipped` · `dropped`.
-
-| Phase | # | Feature | Status | Notes |
-|-------|---|----------|--------|-------|
-| A1 | 7 | Cost Envelope | planned | Partial: `--max-cost`, step ceilings exist |
-| A2 | 12 | Explain Harness | planned | Events exist; no `/why` aggregation yet |
-| A3 | 9 | Finding Memory | planned | Stage 1 pools exist; persist + Stage 2 read TBD |
-| B1 | 2 | Assumption Profiles | planned | Dial exists; named profiles do not |
-| B2 | 5 | Product Firewall | planned | Escalations exist; no typed taxonomy |
-| B3 | 4 | Context Dial | planned | Narrow hands hardcoded today |
-| B4 | 13 | Model Router | planned | Static role→model binding today |
-| C1 | 1 | Bake-Off | planned | Per-role telemetry seed exists |
-| C2 | 8 | Protocol Lab | planned | — |
-| D1 | 6 | Adversarial Reviewer | planned | Investigation/reviewer primitive exists |
-| D2 | 3 | Plan Fork | planned | Needs RunState/checkpoints (REVAMP) |
-| D3 | 11 | Diff Interface | planned | No-op honesty / step boundaries help |
-| D4 | 10 | Orchestra | planned | — |
-
----
-
-## Non-goals for this revamp
-
-- Cloning Claude Code / Codex / OpenCode feature checklists as the roadmap
-- Building a Relay cloud/SaaS control plane
+- Cloning Claude Code / Codex / OpenCode checklists as the roadmap
+- A Relay cloud/SaaS control plane
 - Replacing the text-protocol moat with native-only tool-calling (native FC
-  may be added *with* tag fallback per REVAMP — not instead of it)
-- Teaching/ghost-hands and remote local-swarm (interesting; out of scope here)
+  *with* tag fallback may land via REVAMP — not instead of the protocol)
+- Teaching mode / remote swarm (interesting; not this folder)
 
 ---
 
-## How to use these docs day-to-day
+## Day-to-day
 
-1. Pick the next `planned` row in Phase order (do not skip A→B→C without a reason).
-2. Open that feature’s `NN-*.md`; refine design until acceptance criteria are crisp.
-3. Implement on a focused PR; link the feature doc in the PR body.
-4. Flip status in this table; note ship version in the feature doc.
-5. If a feature needs REVAMP infrastructure, add a one-line blocker note here
-   and a cross-link — do not fork a second roadmap.
-
----
-
-## Source
-
-Proposals distilled from product research against Relay’s existing DNA
-(brain/hands, narrow context, assumption dial, text protocol, bake-off
-telemetry seed, bounded autonomy). Creative alternatives not selected for
-this roadmap are listed above under “Skipped.”
+1. Take the first non-`shipped` / non-`dropped` row in phase order.
+2. Open its `NN-*.md`; tighten acceptance criteria before coding.
+3. One focused PR per feature (or a thin vertical slice); link the feature doc.
+4. Flip **Status** in the table above; on ship, add `Shipped: vX.Y.Z` to the feature doc.
+5. New REVAMP dependency → one line in **Blockers / notes**, not a new doc.

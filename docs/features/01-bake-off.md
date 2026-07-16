@@ -1,8 +1,12 @@
 # 01 — Model Bake-Off (`relay duel`)
 
-**Phase:** C1 · **Status:** planned · **Depends on:** A1 cost receipts, solid per-role telemetry (ideally B4 router metrics)
+**Phase:** C1 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Depends on:** A1 cost receipts; solid per-role telemetry (ideally B4 router metrics)
 
-[← Master plan](MASTER.md)
+## Blockers
+
+- Optional: `provider` on `CallRecord` — [REVAMP Phase 4](../REVAMP.md) bake-off telemetry
+- Worktree / isolation story must be decided before parallel duels
 
 ---
 

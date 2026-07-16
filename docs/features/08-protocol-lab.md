@@ -1,8 +1,11 @@
 # 08 — Protocol Fitness Lab
 
-**Phase:** C2 · **Status:** planned · **Depends on:** stable protocol; pairs with C1 bake-off; benefits from A2 harness traces
+**Phase:** C2 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Depends on:** stable protocol; pairs with C1; benefits from A2 traces
 
-[← Master plan](MASTER.md)
+## Blockers
+
+- None hard; live probes must stay budget-capped and opt-in
 
 ---
 

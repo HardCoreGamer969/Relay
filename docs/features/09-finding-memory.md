@@ -1,8 +1,11 @@
 # 09 — Finding-Driven Memory
 
-**Phase:** A3 · **Status:** planned · **Depends on:** three-pool MemoryBus Stage 1 (exists); Stage 2 hands read still deferred but not required for v1 persist
+**Phase:** A3 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Depends on:** three-pool MemoryBus Stage 1 (exists). Hands Stage 2 read not required for v1 persist.
 
-[← Master plan](MASTER.md)
+## Blockers
+
+- None hard for durable shared pool; Stage 2 hands private read remains deferred
 
 ---
 

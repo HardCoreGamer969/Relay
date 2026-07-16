@@ -1,8 +1,11 @@
 # 07 — Cost Envelope Contracts
 
-**Phase:** A1 · **Status:** planned · **Depends on:** existing `--max-cost` / step ceilings (extend, don’t reinvent)
+**Phase:** A1 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Depends on:** existing `--max-cost` / step ceilings (extend, don’t reinvent)
 
-[← Master plan](MASTER.md)
+## Blockers
+
+- None
 
 ---
 

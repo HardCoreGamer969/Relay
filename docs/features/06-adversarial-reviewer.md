@@ -1,8 +1,11 @@
 # 06 — Adversarial Reviewer
 
-**Phase:** D1 · **Status:** planned · **Depends on:** investigation/reviewer loop; stronger with B2 firewall + B4 router (cheap skeptic model)
+**Phase:** D1 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Depends on:** investigation/reviewer loop; stronger with B2 firewall + B4 router
 
-[← Master plan](MASTER.md)
+## Blockers
+
+- Soft: reviewer fail-open / investigation terminator correctness — see [REVAMP](../REVAMP.md) confirmed bugs / Phase 0 follow-ups if still open
 
 ---
 

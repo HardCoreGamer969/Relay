@@ -1,8 +1,12 @@
 # 11 — Diff-as-Interface / Surgical Commit Mode
 
-**Phase:** D3 · **Status:** planned · **Depends on:** reliable step boundaries; stronger with D2 checkpoints; benefits from apply_patch honesty already shipped
+**Phase:** D3 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Depends on:** reliable step boundaries; stronger with D2 checkpoints
 
-[← Master plan](MASTER.md)
+## Blockers
+
+- Soft: shared checkpoint machinery with #3 — prefer landing D2 first or extracting a common checkpoint primitive
+- v1 likely requires a clean git repo (document; don’t half-implement shadow copies)
 
 ---
 

@@ -1,8 +1,11 @@
 # 05 — Product-Decision Firewall
 
-**Phase:** B2 · **Status:** planned · **Depends on:** B1 profiles (can stub taxonomy first); A3 memory for pinned decisions
+**Phase:** B2 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Depends on:** B1 profiles (taxonomy can stub first); A3 memory for pinned decisions
 
-[← Master plan](MASTER.md)
+## Blockers
+
+- None hard; protocol tag extensions stay in-repo
 
 ---
 

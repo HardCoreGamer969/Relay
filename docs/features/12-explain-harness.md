@@ -1,8 +1,11 @@
 # 12 — Explain the Harness (`/why`)
 
-**Phase:** A2 · **Status:** planned · **Depends on:** existing event stream / transcript (aggregate, don’t reinvent)
+**Phase:** A2 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Depends on:** existing event stream / transcript (aggregate, don’t reinvent)
 
-[← Master plan](MASTER.md)
+## Blockers
+
+- None — must stay zero new model tokens
 
 ---
 

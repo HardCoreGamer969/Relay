@@ -1,8 +1,12 @@
 # 10 — Orchestra Mode
 
-**Phase:** D4 · **Status:** planned · **Depends on:** A3 memory, B2 firewall, stable step boundaries; ideally D2 forks for contested slices
+**Phase:** D4 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Depends on:** A3 memory, B2 firewall, stable step boundaries; ideally D2 forks
 
-[← Master plan](MASTER.md)
+## Blockers
+
+- Soft: bridge cancel/join under concurrency must stay money-leak safe ([`bridge.py`](../../relay/bridge.py) invariants)
+- Isolation model (leases vs worktrees) must be chosen before coding
 
 ---
 

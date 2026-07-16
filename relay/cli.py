@@ -260,6 +260,49 @@ def run(
         "objections block continue or force a replan. Default: RELAY_SKEPTIC / "
         "config review.adversarial (off).",
     ),
+    confirm_diff: bool | None = typer.Option(
+        None,
+        "--confirm-diff/--no-confirm-diff",
+        help="After each successful step, show a unified diff of touched paths "
+        "and require accept/reject before continuing (D3). Default: "
+        "RELAY_CONFIRM_DIFF / config diff.confirm (off).",
+    ),
+    commit_per_step: bool | None = typer.Option(
+        None,
+        "--commit-per-step/--no-commit-per-step",
+        help="After each accepted step, git-commit touched paths with a message "
+        "from the step instruction (requires a git repo). Default: "
+        "RELAY_COMMIT_PER_STEP / config diff.commit_per_step (off).",
+    ),
+    orchestra: int = typer.Option(
+        1,
+        "--orchestra",
+        help="Max parallel hands workers for disjoint-file steps (D4). "
+        "1 = serial (default). Overlapping path claims serialize.",
+    ),
+    save_fork: str = typer.Option(
+        "",
+        "--save-fork",
+        help="After the plan is committed, save it as a named fork under "
+        ".relay/forks/<name>.json (D2).",
+    ),
+    resume: str = typer.Option(
+        "",
+        "--resume",
+        help="Resume from a checkpoint id (or 'latest') under .relay/checkpoints/ "
+        "(D2). Skips planning; executes remaining pending steps.",
+    ),
+    fork_load: str = typer.Option(
+        "",
+        "--fork",
+        help="Load a named plan fork from .relay/forks/ and execute it "
+        "(skips planning conversation).",
+    ),
+    no_checkpoint: bool = typer.Option(
+        False,
+        "--no-checkpoint",
+        help="Disable automatic step-boundary checkpoints under .relay/checkpoints/.",
+    ),
 ) -> None:
     """Run the agent against a goal.
 
@@ -300,11 +343,17 @@ def run(
     router = ModelRouter.from_resolve(route or None, root=root)
     cfg, _route_changes = router.bind(cfg)
     from relay.skeptic import resolve_skeptic
+    from relay.diff_iface import resolve_confirm_diff, resolve_commit_per_step
     skeptic_on = resolve_skeptic(skeptic)
+    confirm_diff_on = resolve_confirm_diff(confirm_diff)
+    commit_per_step_on = resolve_commit_per_step(commit_per_step)
     console.print(
         f"[dim]profile={active_profile.name} ({active_profile.description}) · "
         f"dial={dial} · hands-context={context_mode} · route={router.route.name}"
-        f"{' · skeptic' if skeptic_on else ''}[/dim]"
+        f"{' · skeptic' if skeptic_on else ''}"
+        f"{' · confirm-diff' if confirm_diff_on else ''}"
+        f"{' · commit-per-step' if commit_per_step_on else ''}"
+        f"{f' · orchestra={orchestra}' if orchestra > 1 else ''}[/dim]"
     )
     start = time.perf_counter()
     if solo:
@@ -320,6 +369,13 @@ def run(
             plan_only=plan_only, envelope=envelope,
             hands_context_mode=context_mode, model_router=router,
             skeptic=skeptic_on,
+            confirm_diff=confirm_diff_on,
+            commit_per_step=commit_per_step_on,
+            orchestra_workers=orchestra,
+            save_fork_as=save_fork or None,
+            resume_checkpoint=resume or None,
+            fork_name=fork_load or None,
+            auto_checkpoint=not no_checkpoint,
         )
     wall_time_s = time.perf_counter() - start
 
@@ -389,7 +445,14 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
                  envelope: CostEnvelope | None = None,
                  hands_context_mode: str | None = None,
                  model_router: ModelRouter | None = None,
-                 skeptic: bool = False):
+                 skeptic: bool = False,
+                 confirm_diff: bool = False,
+                 commit_per_step: bool = False,
+                 orchestra_workers: int = 1,
+                 save_fork_as: str | None = None,
+                 resume_checkpoint: str | None = None,
+                 fork_name: str | None = None,
+                 auto_checkpoint: bool = True):
     """Conversational planning -> commit -> the two-role autonomous loop.
 
     Both phases share ONE transcript, so a mid-run escalation appears as the next
@@ -404,13 +467,79 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
             f"[bold]{goal}[/bold]\nroot={root}\nbrain={cfg.brain}\nhands={cfg.hands}\n"
             f"bash policy={bash_policy}  supervision={'on' if supervise else 'off'}  "
             f"assume={dial}  hands-context={ctx}  route={route_name}"
-            f"{'  skeptic=on' if skeptic else ''}\n{env.preflight_text()}",
+            f"{'  skeptic=on' if skeptic else ''}"
+            f"{'  confirm-diff' if confirm_diff else ''}"
+            f"{'  commit-per-step' if commit_per_step else ''}"
+            f"{f'  orchestra={orchestra_workers}' if orchestra_workers > 1 else ''}\n"
+            f"{env.preflight_text()}",
             title="Relay run (brain + hands)",
             border_style="cyan",
         )
     )
 
     transcript = Transcript()  # the one continuous thread across planning + execution
+
+    # D2: resume from checkpoint or load a named fork (skip planning conversation).
+    committed = None
+    if resume_checkpoint:
+        from relay.plan_fork import load_checkpoint, plan_for_resume
+        try:
+            cp = load_checkpoint(root, resume_checkpoint)
+        except FileNotFoundError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        committed = plan_for_resume(cp)
+        goal = goal or cp.goal or goal
+        console.print(
+            f"[dim]resuming checkpoint {cp.id} "
+            f"(cursor={cp.cursor}, completed={len(cp.completed_indices)})[/dim]"
+        )
+    elif fork_name:
+        from relay.plan_fork import load_fork, plan_for_resume
+        try:
+            fork = load_fork(root, fork_name)
+        except (FileNotFoundError, ValueError) as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        committed = plan_for_resume(fork)
+        goal = goal or fork.goal or goal
+        console.print(f"[dim]loaded fork {fork.name} ({len(committed.steps)} step(s))[/dim]")
+
+    if committed is not None:
+        def _on_exec_event(event: Event) -> None:
+            _print_event(event)
+            if event.kind == "envelope_warn":
+                console.print(f"[yellow]{event.message}[/yellow]")
+
+        try:
+            from relay.catalog import get_catalog
+            catalog = get_catalog()
+            result = run_planned(
+                goal, root, models=cfg, ledger=ledger, client=None,
+                approver=approver, auto_approve=auto_approve,
+                supervise=supervise, user_decision=_interactive_user_decision,
+                assumption_level=dial, committed_plan=committed,
+                on_event=_on_exec_event, transcript=transcript,
+                max_total_steps=max_total_steps, max_cost=max_cost,
+                catalog=catalog,
+                bash_timeout_s=bash_timeout_s,
+                envelope=env,
+                hands_context_mode=hands_context_mode,
+                model_router=model_router,
+                skeptic=skeptic,
+                confirm_diff=confirm_diff,
+                commit_per_step=commit_per_step,
+                orchestra_workers=orchestra_workers,
+                save_fork_as=save_fork_as,
+                auto_checkpoint=auto_checkpoint,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _print_run_error(exc)
+            raise typer.Exit(code=1)
+        _print_planned_status(result)
+        if show_transcript:
+            _print_transcript(result.transcript_compacted or result.transcript or transcript)
+        return result
 
     def _on_conv_event(kind, message, payload):
         _print_conv_event(kind, message, payload)
@@ -450,6 +579,13 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
         console.print(Panel(body, title=f"Planned plan ({len(steps)} step(s), NOT executed)",
                             border_style="magenta"))
         console.print("[dim](--plan-only: no files were written, no executor calls made)[/dim]")
+        if save_fork_as:
+            from relay.plan_fork import save_fork
+            try:
+                fork = save_fork(root, save_fork_as, conversation.plan, goal=goal, notes="plan-only")
+                console.print(f"[green]fork saved:[/green] {fork.name}")
+            except ValueError as exc:
+                console.print(f"[red]fork save failed:[/red] {exc}")
         return PlannedTaskResult(goal=goal, plan=conversation.plan, status=STATUS_DECLINED,
                                  ledger=ledger, transcript=transcript, envelope=env)
 
@@ -476,6 +612,11 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
             hands_context_mode=hands_context_mode,
             model_router=model_router,
             skeptic=skeptic,
+            confirm_diff=confirm_diff,
+            commit_per_step=commit_per_step,
+            orchestra_workers=orchestra_workers,
+            save_fork_as=save_fork_as,
+            auto_checkpoint=auto_checkpoint,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)
@@ -894,6 +1035,142 @@ def memory(
         raise typer.Exit(0 if ok else 1)
     console.print(f"[red]unknown action {action!r}; use list|pin|forget[/red]")
     raise typer.Exit(1)
+
+
+@app.command()
+def fork(
+    action: str = typer.Argument(
+        "list",
+        help="list | save <name> | load <name>",
+    ),
+    name: str = typer.Argument("", help="Fork name for save/load."),
+    root: str = typer.Option(".", "--root", help="Project root for .relay/forks/."),
+    from_checkpoint: str = typer.Option(
+        "",
+        "--from-checkpoint",
+        help="When saving: source checkpoint id (default: latest).",
+    ),
+    goal: str = typer.Option("", "--goal", "-g", help="Goal metadata when saving from checkpoint."),
+) -> None:
+    """Named plan forks under .relay/forks/ (D2). Save/load alternate plan futures."""
+    from relay.plan_fork import (
+        fork_from_checkpoint,
+        list_forks,
+        load_fork,
+    )
+
+    act = (action or "list").strip().lower()
+    if act == "list":
+        rows = list_forks(root)
+        if not rows:
+            console.print("[dim](no forks yet)[/dim]")
+            return
+        table = Table(title="Plan forks")
+        table.add_column("Name")
+        table.add_column("Steps", justify="right")
+        table.add_column("Created")
+        table.add_column("Goal", overflow="fold")
+        for row in rows:
+            table.add_row(
+                row["name"], str(row["steps"]), row.get("created_at", ""),
+                (row.get("goal") or "")[:60],
+            )
+        console.print(table)
+        return
+    if act == "save":
+        if not name:
+            console.print("[red]save requires a fork name[/red]")
+            raise typer.Exit(1)
+        cid = from_checkpoint or "latest"
+        try:
+            record = fork_from_checkpoint(root, name, cid, notes="cli save")
+        except FileNotFoundError:
+            console.print(
+                "[red]no checkpoint to fork from; run once first, "
+                "or pass --from-checkpoint <id>[/red]"
+            )
+            raise typer.Exit(1)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        console.print(
+            f"[green]fork saved:[/green] {record.name} "
+            f"({len(record.to_plan().steps)} step(s))"
+        )
+        return
+    if act == "load":
+        if not name:
+            console.print("[red]load requires a fork name[/red]")
+            raise typer.Exit(1)
+        try:
+            record = load_fork(root, name)
+        except (FileNotFoundError, ValueError) as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        plan = record.to_plan()
+        body = "\n".join(
+            f"{s.index}. [{s.status}] {s.instruction}" for s in plan.steps
+        ) or "(empty)"
+        console.print(Panel(
+            body,
+            title=f"Fork {record.name} ({len(plan.steps)} step(s))",
+            border_style="magenta",
+        ))
+        console.print(
+            f"[dim]resume with: relay run -g \"{record.goal or goal or '...'}\" "
+            f"--fork {record.name} --root {root}[/dim]"
+        )
+        return
+    console.print(f"[red]unknown action {action!r}; use list|save|load[/red]")
+    raise typer.Exit(1)
+
+
+@app.command()
+def rewind(
+    step_id: str = typer.Argument(
+        "",
+        help="Step id to restore files for (e.g. 1 or step-1). Omit with --checkpoint.",
+    ),
+    root: str = typer.Option(".", "--root", help="Project root."),
+    checkpoint: str = typer.Option(
+        "",
+        "--checkpoint",
+        help="Checkpoint id (or 'latest') to inspect / restore plan cursor from (D2).",
+    ),
+) -> None:
+    """Rewind a step's touched files via git, or show a checkpoint cursor (D2/D3)."""
+    from relay.diff_iface import rewind_step_files
+    from relay.plan_fork import load_checkpoint
+
+    if checkpoint:
+        try:
+            cp = load_checkpoint(root, checkpoint)
+        except FileNotFoundError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        console.print(
+            f"[green]checkpoint {cp.id}[/green] cursor={cp.cursor} "
+            f"completed={cp.completed_indices} status={cp.status}"
+        )
+        console.print(
+            f"[dim]resume: relay run -g \"{cp.goal or '...'}\" "
+            f"--resume {cp.id} --root {root}[/dim]"
+        )
+        if not step_id:
+            return
+    if not step_id:
+        console.print("[red]provide a step id (e.g. step-1) or --checkpoint <id>[/red]")
+        raise typer.Exit(1)
+    try:
+        paths = rewind_step_files(
+            root, step_id, checkpoint_id=checkpoint or None,
+        )
+    except (RuntimeError, ValueError) as exc:
+        console.print(f"[red]rewind failed:[/red] {exc}")
+        raise typer.Exit(1)
+    console.print(
+        f"[green]restored[/green] step {step_id}: {', '.join(paths)}"
+    )
 
 
 @app.command()

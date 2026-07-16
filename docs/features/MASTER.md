@@ -81,9 +81,9 @@ Work top to bottom. Skip a row only with a written reason in **Notes**.
 | C1 | 1 | Model Bake-Off (`relay duel`) | [01](01-bake-off.md) | shipped | Sequential same-tree + git restore; `.relay/duels/` scorecards |
 | C2 | 8 | Protocol Fitness Lab | [08](08-protocol-lab.md) | shipped | Offline fixture grading; exit 0/2/3 fit/weak/unfit |
 | D1 | 6 | Adversarial Reviewer | [06](06-adversarial-reviewer.md) | shipped | `--skeptic` plan pass; purpose=skeptic cost; block/replan/dismiss |
-| D2 | 3 | Plan Fork / Time-Travel | [03](03-plan-fork.md) | planned | Needs `RunState` / resume → [REVAMP Phase 2](../REVAMP.md) |
-| D3 | 11 | Diff-as-Interface | [11](11-diff-interface.md) | planned | Stronger with D2 checkpoints |
-| D4 | 10 | Orchestra Mode | [10](10-orchestra.md) | planned | Needs A3, B2, stable step boundaries |
+| D2 | 3 | Plan Fork / Time-Travel | [03](03-plan-fork.md) | shipped | Forks + checkpoints; thin resume via committed_plan cursor (full RunState → REVAMP) |
+| D3 | 11 | Diff-as-Interface | [11](11-diff-interface.md) | shipped | `--confirm-diff` / `--commit-per-step` / `rewind <step>` (git) |
+| D4 | 10 | Orchestra Mode | [10](10-orchestra.md) | shipped | `--orchestra N`; leases; hands-N telemetry on one ledger |
 
 **Out of roadmap (intentionally skipped):** local-first remote swarm, teaching/ghost-hands, standalone constraint cards (fold into #5 / #9 if needed).
 

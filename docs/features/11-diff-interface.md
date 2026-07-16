@@ -1,12 +1,13 @@
 # 11 — Diff-as-Interface / Surgical Commit Mode
 
+**Shipped:** features-revamp (`--confirm-diff` / `--commit-per-step` / `relay rewind <step>`)  
 **Phase:** D3 · **Status:** [MASTER roadmap table](MASTER.md) only  
 **Depends on:** reliable step boundaries; stronger with D2 checkpoints
 
 ## Blockers
 
-- Soft: shared checkpoint machinery with #3 — prefer landing D2 first or extracting a common checkpoint primitive
-- v1 likely requires a clean git repo (document; don’t half-implement shadow copies)
+- Soft: shared checkpoint machinery with #3 — landed with D2
+- v1 git rewind requires a clean git repo (documented; no shadow-copy fallback)
 
 ---
 
@@ -20,29 +21,28 @@ Feels like reviewing a junior’s PR *per task*, not one mega-diff at the end. A
 
 ## User surface
 
-- After each step (or on `--confirm-diff`): show unified diff of touched paths
-- Accept / reject / edit-request → continue / replan
-- `--commit-per-step` with message from step text
-- `relay rewind <step-id>` using checkpoints (git preferred)
+- `--confirm-diff` / `RELAY_CONFIRM_DIFF` / config `diff.confirm` — after each successful step, unified diff of touched paths; accept/reject via `user_decision`
+- Reject → step failed with reason → brain replan
+- `--commit-per-step` / `RELAY_COMMIT_PER_STEP` — git commit message from step instruction (requires git)
+- `relay rewind <step-id>` — `git checkout --` touched paths from checkpoint metadata; fails clearly outside a git repo
 
 ## Hooks into existing code
 
-- Tool touch-path reporting / `_StepOutcome`
-- Read-before-edit / content hashes
-- Run checkpoints (shared need with plan fork #3)
-- TUI present_prompt chokepoint for accept/reject
+- `relay/diff_iface.py` — diffs, confirm, commit, rewind
+- Orchestrator `_confirm_then_settle` after supervised accept
+- D2 checkpoints store `step_touches` for rewind lookup
 
 ## Acceptance criteria
 
-- [ ] Step completion can require explicit diff accept when enabled
-- [ ] Reject returns control to brain replan with rejection reason
-- [ ] Rewind restores files for that step’s touches (documented git requirement)
-- [ ] Tests cover accept/reject without needing a real LLM
+- [x] Step completion can require explicit diff accept when enabled
+- [x] Reject returns control to brain replan with rejection reason
+- [x] Rewind restores files for that step’s touches (documented git requirement)
+- [x] Tests cover accept/reject without needing a real LLM
 
 ## Open questions
 
-- Require clean git repo for v1, or support a Relay-side shadow copy?
-- Brain auto-accept on mechanical steps vs always ask?
+- Require clean git repo for v1, or support a Relay-side shadow copy? → **git required for rewind/commit-per-step; hermetic diffs use before-snapshots**
+- Brain auto-accept on mechanical steps vs always ask? → always ask when `--confirm-diff`
 
 ## Out of scope (v1)
 

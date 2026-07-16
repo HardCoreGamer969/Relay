@@ -6,6 +6,7 @@ of Relay's model-comparison features later, so it is not optional even now.
 
 from __future__ import annotations
 
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -51,34 +52,46 @@ class RoleSummary:
 
 @dataclass
 class Ledger:
-    """Collects :class:`CallRecord`s and aggregates them."""
+    """Collects :class:`CallRecord`s and aggregates them.
+
+    Thread-safe for orchestra workers (D4) that share one ledger across hands-N
+    roles; aggregation still lands on a single ledger (per-worker cost is visible
+    via ``by_role()`` keys like ``hands-2``).
+    """
 
     records: list[CallRecord] = field(default_factory=list)
     # Count of model messages that contained no valid action (a first-class
     # model-quality signal: parse-failure rate, surfaced in the summary output).
     parse_failures: int = 0
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def add(self, record: CallRecord) -> CallRecord:
-        self.records.append(record)
+        with self._lock:
+            self.records.append(record)
         return record
 
     def record_parse_failure(self) -> int:
         """Increment and return the running parse-failure count."""
-        self.parse_failures += 1
-        return self.parse_failures
+        with self._lock:
+            self.parse_failures += 1
+            return self.parse_failures
 
     def total_cost(self) -> float | None:
         """Sum of known costs, or None if no call reported a cost."""
-        costs = [r.cost_usd for r in self.records if r.cost_usd is not None]
-        return sum(costs) if costs else None
+        with self._lock:
+            costs = [r.cost_usd for r in self.records if r.cost_usd is not None]
+            return sum(costs) if costs else None
 
     def total_time(self) -> float:
-        return sum(r.latency_s for r in self.records)
+        with self._lock:
+            return sum(r.latency_s for r in self.records)
 
     def by_role(self) -> dict[str, RoleSummary]:
         """Aggregate calls/tokens/cost/time per role."""
+        with self._lock:
+            records = list(self.records)
         summaries: dict[str, RoleSummary] = {}
-        for r in self.records:
+        for r in records:
             s = summaries.get(r.role)
             if s is None:
                 summaries[r.role] = RoleSummary(

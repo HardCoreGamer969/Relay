@@ -449,7 +449,12 @@ class ModelConfig:
     hands_thinking: bool = False
 
     def for_role(self, role: str) -> str:
-        """Resolve the model slug for ``role``, raising on unknown roles."""
+        """Resolve the model slug for ``role``, raising on unknown roles.
+
+        Orchestra workers may use ``hands-N`` / ``brain-N`` suffixes; those
+        canonicalize to the base role for model selection while telemetry keeps
+        the full role string on the :class:`~relay.telemetry.CallRecord`.
+        """
         return self._pick(role, {"brain": self.brain, "hands": self.hands})
 
     def provider_for_role(self, role: str) -> str:
@@ -461,12 +466,23 @@ class ModelConfig:
         return self._pick(role, {"brain": self.brain_thinking, "hands": self.hands_thinking})
 
     @staticmethod
-    def _pick(role: str, mapping: dict):
-        if role not in mapping:
-            raise ValueError(
-                f"Unknown role {role!r}. Valid roles: {', '.join(ROLES)}."
-            )
-        return mapping[role]
+    def canonical_role(role: str) -> str:
+        """Map ``hands-2`` → ``hands``; unknown roles raise."""
+        if role in ROLES:
+            return role
+        if isinstance(role, str) and "-" in role:
+            base = role.split("-", 1)[0]
+            if base in ROLES and role[len(base) + 1 :].isdigit():
+                return base
+        raise ValueError(
+            f"Unknown role {role!r}. Valid roles: {', '.join(ROLES)} "
+            "(or hands-N / brain-N orchestra workers)."
+        )
+
+    @classmethod
+    def _pick(cls, role: str, mapping: dict):
+        key = cls.canonical_role(role)
+        return mapping[key]
 
 
 _TRUE = ("1", "true", "yes", "on")

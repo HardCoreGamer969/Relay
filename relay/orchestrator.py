@@ -23,12 +23,18 @@ from __future__ import annotations
 
 import platform
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from relay.config import ModelConfig, load_models, resolve_hands_context_mode
 from relay.context import resolve_context_window
+from relay.diff_iface import (
+    commit_step_changes,
+    confirm_step_diff,
+    read_file_or_none,
+)
 from relay.envelope import CostEnvelope, brain_cost_since
 from relay.explain import explain_events
 from relay.loop import (
@@ -46,6 +52,14 @@ from relay.memory import (
     texts_near_duplicate,
 )
 from relay.models import call_model
+from relay.orchestra import (
+    PathLease,
+    WorkerResult,
+    hands_role_for_worker,
+    run_parallel_steps,
+    select_disjoint_batch,
+)
+from relay.plan_fork import save_checkpoint, save_fork
 from relay.planner import (
     Plan,
     PlanStep,
@@ -319,9 +333,11 @@ class _StepOutcome:
     calls: int = 0             # executor model-calls consumed
     transcript: list[str] = field(default_factory=list)  # what the executor did
     touched_paths: list[str] = field(default_factory=list)  # files actually written this step
+    before_snapshots: dict[str, str | None] = field(default_factory=dict)
     unresolved: bool = False   # a product-decision escalation could not be resolved
     unresolved_question: str = ""
     cancelled: bool = False    # the user cancelled between executor calls (clean stop)
+    contested_path: str | None = None  # orchestra lease conflict
 
 
 @dataclass
@@ -345,6 +361,8 @@ class _Disposition:
     calls: int = 0
     # Brain $ on review that did not yield an accepted step (follow-up exhaustion).
     wasted_brain_usd: float = 0.0
+    touched_paths: list[str] = field(default_factory=list)
+    before_snapshots: dict[str, str | None] = field(default_factory=dict)
 
 
 def _executor_step_prompt(
@@ -468,6 +486,8 @@ def _run_executor_step(
     hands_context_mode: str = "needle",
     step_summaries: str = "",
     wide_transcript: str = "",
+    path_lease: PathLease | None = None,
+    lease_owner: str | None = None,
 ) -> _StepOutcome:
     """Run the hands in a fresh, narrow context until done/blocked/budget/question.
 
@@ -481,6 +501,9 @@ def _run_executor_step(
     of waiting for the whole step. The in-flight call is NEVER torn down (its tokens
     are already committed); we simply stop before the next one (the soonest SAFE stop,
     preserving the money-leak guard).
+
+    ``path_lease`` / ``lease_owner`` (D4 orchestra): before a write, claim the path;
+    a contested claim ends the step without writing.
     """
     messages: list[dict[str, str]] = [
         {"role": "system", "content": EXECUTOR_SYSTEM_PROMPT},
@@ -492,14 +515,29 @@ def _run_executor_step(
     ]
     transcript: list[str] = []
     touched: list[str] = []  # files actually written this step (seed the reviewer to read them)
+    before_snaps: dict[str, str | None] = {}
     consecutive_parse_failures = 0
     calls = 0
+    owner = lease_owner or hands_role
     # Read-tracking for the read-before-edit guard. ``run_planned`` passes a shared
     # run-scoped map (a read in an earlier step stays valid while the file is
     # unchanged); a direct call gets a fresh per-step map. The guard is enforced in
     # ``guarded_execute_action`` below.
     if reads is None:
         reads = {}
+
+    def _snapshot_before(path: str) -> None:
+        if path in before_snaps:
+            return
+        before_snaps[path] = read_file_or_none(tools.project_root, path)
+
+    def _claim_paths(paths: list[str]) -> str | None:
+        if path_lease is None or not paths:
+            return None
+        ok, contested = path_lease.try_claim(owner, paths)
+        if ok:
+            return None
+        return contested
 
     for _ in range(max(max_steps, 0)):
         # Fast cancel: poll BEFORE issuing the next call. A cancel that arrived during
@@ -508,7 +546,7 @@ def _run_executor_step(
         if cancel_check is not None and cancel_check():
             return _StepOutcome(
                 False, cancelled=True, failure_reason="cancelled by user",
-                calls=calls, transcript=transcript,
+                calls=calls, transcript=transcript, before_snapshots=before_snaps,
             )
         reply = call_model(hands_role, messages, models=models, ledger=ledger, client=client).text
         calls += 1
@@ -524,7 +562,7 @@ def _run_executor_step(
             if consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
                 return _StepOutcome(
                     False, failure_reason="executor produced no valid actions (parse-failure abort)",
-                    calls=calls, transcript=transcript,
+                    calls=calls, transcript=transcript, before_snapshots=before_snaps,
                 )
             messages.append({"role": "user", "content": _specific_parse_failure_nudge(reply)})
             continue
@@ -557,11 +595,13 @@ def _run_executor_step(
                 return _StepOutcome(
                     False, failure_reason=f"blocked: {reason}", calls=calls,
                     transcript=transcript, touched_paths=touched,
+                    before_snapshots=before_snaps,
                 )
             if action.kind == "done":
                 return _StepOutcome(
                     True, summary=action.content or "step complete", calls=calls,
                     transcript=transcript, touched_paths=touched,
+                    before_snapshots=before_snaps,
                 )
             if action.kind == "question":
                 question = action.content or ""
@@ -570,6 +610,7 @@ def _run_executor_step(
                     return _StepOutcome(
                         False, failure_reason=f"executor asked a question but no resolver was available: {question}",
                         calls=calls, transcript=transcript, touched_paths=touched,
+                        before_snapshots=before_snaps,
                     )
                 try:
                     resolution = resolve_question(question, qclass)
@@ -580,7 +621,7 @@ def _run_executor_step(
                     return _StepOutcome(
                         False, failure_reason=f"unresolved escalation: {question}", calls=calls,
                         transcript=transcript, unresolved=True, unresolved_question=question,
-                        touched_paths=touched,
+                        touched_paths=touched, before_snapshots=before_snaps,
                     )
                 answer_obs = f"[question]\nANSWER: {resolution.answer}"
                 observations.append(answer_obs)
@@ -592,6 +633,27 @@ def _run_executor_step(
                     "is complete, <question> if you need info, or <blocked> if stuck -- do not plan."
                 )
                 continue
+            # D2/D3/D4: snapshot + lease before mutating writes.
+            write_paths: list[str] = []
+            if action.kind in ("edit", "write") and action.path:
+                write_paths = [action.path]
+            elif action.kind == "apply_patch":
+                try:
+                    from relay.tools import parse_patch as _pp
+                    for _sec in _pp(action.content or ""):
+                        write_paths.append(_sec.move_to or _sec.path)
+                except Exception:  # noqa: BLE001 — lease best-effort; execute still runs
+                    pass
+            for _wp in write_paths:
+                _snapshot_before(_wp)
+            contested = _claim_paths(write_paths)
+            if contested is not None:
+                return _StepOutcome(
+                    False,
+                    failure_reason=f"orchestra path conflict on {contested!r} (serializing)",
+                    calls=calls, transcript=transcript, touched_paths=touched,
+                    before_snapshots=before_snaps, contested_path=contested,
+                )
             observation = guarded_execute_action(tools, action, reads)
             if emit is not None:
                 emit("exec_action", describe_action(action), {"kind": action.kind, "observation": observation})
@@ -626,7 +688,8 @@ def _run_executor_step(
 
     return _StepOutcome(
         False, failure_reason=f"step not completed within {max_steps} executor steps",
-        calls=calls, transcript=transcript,
+        calls=calls, transcript=transcript, before_snapshots=before_snaps,
+        touched_paths=touched,
     )
 
 
@@ -775,6 +838,11 @@ def run_planned(
     model_router: ModelRouter | None = None,
     skeptic: bool = False,
     max_skeptic_steps: int = 4,
+    auto_checkpoint: bool = True,
+    confirm_diff: bool = False,
+    commit_per_step: bool = False,
+    orchestra_workers: int = 1,
+    save_fork_as: str | None = None,
 ) -> PlannedTaskResult:
     """Drive the autonomous two-role planner/executor loop.
 
@@ -818,6 +886,13 @@ def run_planned(
     or a ``user_decision`` dismiss; otherwise the run ends ``skeptic_blocked``.
     Skeptic model calls are tagged ``purpose="skeptic"`` on the ledger.
 
+    ``auto_checkpoint`` (D2) writes plan cursor + completed steps under
+    ``.relay/checkpoints/`` after each successful step. ``confirm_diff`` /
+    ``commit_per_step`` (D3) gate step completion on a unified-diff accept and
+    optional git commit. ``orchestra_workers`` (D4) runs disjoint-file steps in
+    parallel (max N); overlapping claims serialize. ``save_fork_as`` names a plan
+    fork written after the plan is committed.
+
     Note: a single step's executor ceiling is ``max_executor_steps *
     (1 + max_followups_per_step)`` (each supervised follow-up re-runs the
     executor with its own budget); ``max_total_steps`` is the hard global cap.
@@ -827,6 +902,7 @@ def run_planned(
     the reviewer has its own ``max_review_steps`` budget. Answer/evolve are likewise
     brain calls and excluded from the executor budget.
     """
+    orchestra_workers = max(1, int(orchestra_workers or 1))
     ledger = ledger if ledger is not None else Ledger()
     memory = _ensure_bus(memory)  # v0.0.29: the run's memory is the three-pool bus
     transcript = transcript if transcript is not None else Transcript()
@@ -1054,6 +1130,18 @@ def run_planned(
                     },
                 )
                 return finalize(plan)
+    # D2: optional named fork right after the plan is committed (pre-execution).
+    if save_fork_as:
+        try:
+            fork = save_fork(project_root, save_fork_as, plan, goal=goal, notes="pre-execution")
+            emit("fork_saved", f"fork saved: {fork.name}", {"name": fork.name, "steps": len(plan.steps)})
+        except ValueError as exc:
+            emit("fork_save_failed", str(exc), {"name": save_fork_as})
+
+    # D2/D3: accumulate per-step touches across the run for checkpoints / rewind.
+    step_touches: dict[str, list[str]] = {}
+    step_befores: dict[str, dict[str, str | None]] = {}
+
     # Instructions of steps that have already dead-ended this run. The repetition
     # breaker (v0.0.21) compares each newly-pending step against these: a replan
     # that re-issues a near-identical already-failed step is the loop signature.
@@ -1164,11 +1252,20 @@ def run_planned(
             if outcome.cancelled:
                 return _Disposition("cancelled", records=records)
             if outcome.unresolved:
-                return _Disposition("unresolved", unresolved_question=outcome.unresolved_question, records=records)
+                return _Disposition(
+                    "unresolved", unresolved_question=outcome.unresolved_question, records=records,
+                    touched_paths=outcome.touched_paths, before_snapshots=dict(outcome.before_snapshots),
+                )
             if not outcome.success:
-                return _Disposition("failed", failure_reason=outcome.failure_reason, records=records)
+                return _Disposition(
+                    "failed", failure_reason=outcome.failure_reason, records=records,
+                    touched_paths=outcome.touched_paths, before_snapshots=dict(outcome.before_snapshots),
+                )
             if not supervise:
-                return _Disposition("done", summary=outcome.summary, records=records)
+                return _Disposition(
+                    "done", summary=outcome.summary, records=records,
+                    touched_paths=outcome.touched_paths, before_snapshots=dict(outcome.before_snapshots),
+                )
 
             before_review = len(ledger.records)
             review = review_step(
@@ -1183,10 +1280,17 @@ def run_planned(
             records.extend(review.records)
 
             if review.verdict == "accept":
-                return _Disposition("done", summary=outcome.summary, records=records)
+                return _Disposition(
+                    "done", summary=outcome.summary, records=records,
+                    touched_paths=outcome.touched_paths, before_snapshots=dict(outcome.before_snapshots),
+                )
 
             if review.verdict == "revise_plan":
-                return _Disposition("revise", summary=outcome.summary, revise_reason=review.reason or "review", records=records)
+                return _Disposition(
+                    "revise", summary=outcome.summary, revise_reason=review.reason or "review",
+                    records=records, touched_paths=outcome.touched_paths,
+                    before_snapshots=dict(outcome.before_snapshots),
+                )
 
             # follow_up
             if followups_used >= max_followups_per_step:
@@ -1224,6 +1328,247 @@ def run_planned(
         for warn in envelope.drain_warnings(ledger=ledger, steps_used=executor_calls):
             emit("envelope_warn", warn["message"], warn)
 
+    def _confirm_then_settle(
+        step: PlanStep,
+        summary: str,
+        *,
+        touched: list[str] | None = None,
+        befores: dict[str, str | None] | None = None,
+        remember_summary: bool = True,
+        provenance: str | None = None,
+    ) -> str | None:
+        """Confirm-diff, mark done, commit, checkpoint.
+
+        Returns a failure reason when confirm_diff rejects (caller should replan);
+        otherwise None. Marks the step done only after accept.
+        """
+        touched = list(touched or [])
+        befores = dict(befores or {})
+        if confirm_diff:
+            if user_decision is None:
+                return "diff confirm required but no user_decision callback"
+            accepted, reason = confirm_step_diff(
+                root=project_root,
+                step_index=step.index,
+                instruction=step.instruction,
+                touched_paths=touched,
+                before_snapshots=befores,
+                user_decision=user_decision,
+            )
+            emit(
+                "diff_confirm",
+                f"step {step.index} diff {'accepted' if accepted else 'rejected'}",
+                {"index": step.index, "accepted": accepted, "reason": reason, "paths": touched},
+            )
+            if not accepted:
+                return reason
+        plan.mark_done(step, summary)
+        envelope.note_completed_step()
+        if remember_summary:
+            remember(
+                "fact", f"Step {step.index} done: {summary}", summary,
+                provenance=provenance or f"step{step.index}",
+            )
+        emit(
+            "step_done", f"step {step.index} done: {summary}",
+            {"index": step.index, "outcome": summary},
+        )
+        if commit_per_step and touched:
+            try:
+                sha = commit_step_changes(
+                    project_root,
+                    step_index=step.index,
+                    instruction=step.instruction,
+                    touched_paths=touched,
+                )
+                if sha:
+                    emit(
+                        "step_committed",
+                        f"step {step.index} committed {sha[:12]}",
+                        {"index": step.index, "commit": sha, "paths": touched},
+                    )
+            except RuntimeError as exc:
+                emit("step_commit_failed", str(exc), {"index": step.index})
+        if touched:
+            step_touches[str(step.index)] = list(touched)
+            step_befores[str(step.index)] = dict(befores)
+        if auto_checkpoint:
+            try:
+                cp = save_checkpoint(
+                    project_root, plan, goal=goal,
+                    step_touches=step_touches, step_befores=step_befores,
+                    status="running",
+                )
+                emit(
+                    "checkpoint",
+                    f"checkpoint {cp.id} (cursor={cp.cursor})",
+                    {"id": cp.id, "cursor": cp.cursor, "completed": list(cp.completed_indices)},
+                )
+            except OSError as exc:
+                emit("checkpoint_failed", str(exc), {})
+        return None
+
+    def _run_orchestra_batch(batch: list[PlanStep], step_budget: int) -> bool:
+        """Run a disjoint batch in parallel. Returns True to continue the outer loop."""
+        nonlocal executor_calls, escalations, plan
+        lease = PathLease()
+        mem_lock = threading.Lock()
+
+        def make_worker(step: PlanStep, slot: int):
+            role = hands_role_for_worker(slot)
+
+            def work() -> WorkerResult:
+                worker_tools = Tools(
+                    Path(project_root), approver=approver, auto_approve=auto_approve,
+                    bash_timeout_s=bash_timeout_s,
+                )
+
+                def record_finding(note: str) -> None:
+                    with mem_lock:
+                        remember(
+                            "fact", f"Finding: {note}", f"finding: {note}",
+                            provenance=f"step{step.index} {role}-finding", pool=POOL_SHARED,
+                        )
+
+                outcome = _run_executor_step(
+                    step, plan, goal, worker_tools, hands_role=role, models=models,
+                    ledger=ledger, client=client, max_steps=step_budget, emit=None,
+                    cancel_check=cancel_check, reads={}, on_finding=record_finding,
+                    shared_context="", hands_context_mode="needle",
+                    path_lease=lease, lease_owner=role,
+                )
+                return WorkerResult(
+                    step_index=step.index,
+                    success=outcome.success and not outcome.cancelled and not outcome.unresolved,
+                    summary=outcome.summary,
+                    failure_reason=(
+                        "cancelled" if outcome.cancelled
+                        else (outcome.unresolved_question or outcome.failure_reason)
+                    ),
+                    touched_paths=list(outcome.touched_paths),
+                    before_snapshots=dict(outcome.before_snapshots),
+                    calls=outcome.calls,
+                    worker_role=role,
+                    cancelled=outcome.cancelled,
+                    contested_path=outcome.contested_path,
+                )
+
+            return step, work
+
+        emit(
+            "orchestra_batch",
+            f"orchestra: {len(batch)} parallel step(s) (max {orchestra_workers})",
+            {"indices": [s.index for s in batch], "workers": orchestra_workers},
+        )
+        items = [make_worker(s, i + 1) for i, s in enumerate(batch)]
+        results = run_parallel_steps(
+            items, max_workers=orchestra_workers, cancel_check=cancel_check,
+        )
+        by_index = {r.step_index: r for r in results}
+        if cancel_check is not None and cancel_check():
+            result.status = STATUS_CANCELLED
+            emit("status", "run cancelled during orchestra batch", {"status": STATUS_CANCELLED})
+            return False
+        if any(r.cancelled for r in results):
+            result.status = STATUS_CANCELLED
+            emit("status", "run cancelled during orchestra batch", {"status": STATUS_CANCELLED})
+            return False
+
+        failure: WorkerResult | None = None
+        for step in batch:
+            wr = by_index.get(step.index)
+            if wr is None:
+                continue
+            executor_calls += wr.calls
+            emit(
+                "orchestra_worker",
+                f"{wr.worker_role} step {step.index}: "
+                f"{'ok' if wr.success else 'fail'}",
+                {
+                    "role": wr.worker_role,
+                    "index": step.index,
+                    "success": wr.success,
+                    "calls": wr.calls,
+                    "contested_path": wr.contested_path,
+                },
+            )
+            if wr.success:
+                reject = _confirm_then_settle(
+                    step, wr.summary or "orchestra step complete",
+                    touched=wr.touched_paths, befores=wr.before_snapshots,
+                    provenance=f"step{step.index} {wr.worker_role}",
+                )
+                if reject:
+                    plan.mark_failed(step, reject)
+                    dead_ended_instructions.append(step.instruction)
+                    failure = WorkerResult(
+                        step_index=step.index, success=False, failure_reason=reject,
+                        worker_role=wr.worker_role,
+                    )
+                    break
+            else:
+                failure = wr
+                break
+
+        if failure is None:
+            for step in batch:
+                wr = by_index.get(step.index)
+                if wr is not None and not wr.success and step.status == "pending":
+                    failure = wr
+                    break
+
+        if failure is not None:
+            step = next((s for s in batch if s.index == failure.step_index), None)
+            if step is not None and step.status == "pending":
+                plan.mark_failed(step, failure.failure_reason)
+                dead_ended_instructions.append(step.instruction)
+                emit(
+                    "step_failed",
+                    f"step {step.index} failed: {failure.failure_reason}",
+                    {"index": step.index, "reason": failure.failure_reason, "orchestra": True},
+                )
+            if failure.contested_path:
+                emit(
+                    "orchestra_conflict",
+                    f"overlapping path claim: {failure.contested_path}",
+                    {"path": failure.contested_path, "index": failure.step_index},
+                )
+            if escalations >= max_escalations:
+                result.status = STATUS_ESCALATION_LIMIT
+                emit(
+                    "status",
+                    "stopped: stuck on a step after repeated recovery attempts",
+                    {"status": STATUS_ESCALATION_LIMIT, "escalations": escalations},
+                )
+                return False
+            escalations += 1
+            result.escalations = escalations
+            failed_step = next((s for s in plan.steps if s.index == failure.step_index), step)
+            emit(
+                "escalation",
+                f"escalation {escalations}: replanning after orchestra step {failure.step_index}",
+                {"n": escalations, "failed_index": failure.step_index, "reason": failure.failure_reason},
+            )
+            before_replan = len(ledger.records)
+            revised = replan(
+                goal, plan, failed_step, failure.failure_reason, plan.completed_outcomes(),
+                models=models, ledger=ledger, client=client, brain_role=brain_role,
+                memory=memory, memory_budget_tokens=mem_budget,
+            )
+            envelope.add_wasted_brain(brain_cost_since(ledger, before_replan))
+            if revised is None:
+                result.status = STATUS_ABORTED_BY_BRAIN
+                emit("status", "brain aborted: goal deemed unreachable", {"status": STATUS_ABORTED_BY_BRAIN})
+                return False
+            plan = _adopt_revision(plan, revised)
+            result.plan = plan
+            emit(
+                "replanned",
+                f"revised plan adopted: {len(plan.remaining())} new step(s)",
+                {"steps": [s.instruction for s in plan.steps if s.status == "pending"]},
+            )
+        return True
+
     while True:
         # Coarse cancellation: polled at the step boundary, before any work or
         # model call for the next step is spent. Mid-step interruption is
@@ -1237,6 +1582,17 @@ def run_planned(
         step = plan.next_pending()
         if step is None:
             result.status = STATUS_COMPLETED
+            if auto_checkpoint:
+                try:
+                    cp = save_checkpoint(
+                        project_root, plan, goal=goal,
+                        step_touches=step_touches, step_befores=step_befores,
+                        status=STATUS_COMPLETED,
+                    )
+                    emit("checkpoint", f"checkpoint {cp.id} (complete)",
+                         {"id": cp.id, "cursor": cp.cursor, "status": STATUS_COMPLETED})
+                except OSError:
+                    pass
             emit("status", "all steps complete", {"status": STATUS_COMPLETED})
             break
 
@@ -1289,6 +1645,14 @@ def run_planned(
             )
             break
 
+        # D4: try a disjoint parallel batch before falling back to serial.
+        if orchestra_workers > 1:
+            batch = select_disjoint_batch(plan.remaining(), max_workers=orchestra_workers)
+            if batch:
+                if not _run_orchestra_batch(batch, step_budget):
+                    break
+                continue
+
         emit("step_start", f"step {step.index}: {step.instruction}",
              {"index": step.index, "instruction": step.instruction})
 
@@ -1312,12 +1676,42 @@ def run_planned(
             break
 
         if disposition.kind == "done":
-            plan.mark_done(step, disposition.summary)
-            envelope.note_completed_step()
-            remember("fact", f"Step {step.index} done: {disposition.summary}", disposition.summary,
-                     provenance=f"step{step.index}")
-            emit("step_done", f"step {step.index} done: {disposition.summary}",
-                 {"index": step.index, "outcome": disposition.summary})
+            reject = _confirm_then_settle(
+                step, disposition.summary,
+                touched=disposition.touched_paths,
+                befores=disposition.before_snapshots,
+            )
+            if reject:
+                plan.mark_failed(step, reject)
+                dead_ended_instructions.append(step.instruction)
+                emit("step_failed", f"step {step.index} failed: {reject}",
+                     {"index": step.index, "reason": reject})
+                if escalations >= max_escalations:
+                    result.status = STATUS_ESCALATION_LIMIT
+                    emit("status", "stopped: stuck on a step after repeated recovery attempts",
+                         {"status": STATUS_ESCALATION_LIMIT, "escalations": escalations})
+                    break
+                escalations += 1
+                result.escalations = escalations
+                emit("escalation", f"escalation {escalations}: replanning after step {step.index}",
+                     {"n": escalations, "failed_index": step.index, "reason": reject})
+                before_replan = len(ledger.records)
+                revised = replan(
+                    goal, plan, step, reject, plan.completed_outcomes(),
+                    models=models, ledger=ledger, client=client, brain_role=brain_role,
+                    memory=memory, memory_budget_tokens=mem_budget,
+                )
+                envelope.add_wasted_brain(brain_cost_since(ledger, before_replan))
+                if revised is None:
+                    result.status = STATUS_ABORTED_BY_BRAIN
+                    emit("status", "brain aborted: goal deemed unreachable",
+                         {"status": STATUS_ABORTED_BY_BRAIN})
+                    break
+                plan = _adopt_revision(plan, revised)
+                result.plan = plan
+                emit("replanned", f"revised plan adopted: {len(plan.remaining())} new step(s)",
+                     {"steps": [s.instruction for s in plan.steps if s.status == "pending"]})
+                continue
             continue
 
         if disposition.kind == "revise":

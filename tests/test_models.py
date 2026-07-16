@@ -64,6 +64,8 @@ def test_role_resolves_to_right_model_slug():
     cfg = ModelConfig(brain="vendor/brain-model", hands="vendor/hands-model")
     assert cfg.for_role("brain") == "vendor/brain-model"
     assert cfg.for_role("hands") == "vendor/hands-model"
+    assert cfg.for_role("hands-2") == "vendor/hands-model"
+    assert ModelConfig.canonical_role("hands-3") == "hands"
     with pytest.raises(ValueError):
         cfg.for_role("unknown-role")
 

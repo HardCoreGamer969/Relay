@@ -9,7 +9,8 @@
 >
 > Do not merge the two roadmaps. Cross-link blockers only.
 
-**Planning only — no implementation yet.**
+**Planning only — no implementation yet.**  
+*(A1 design is locked; coding starts on go-ahead.)*
 
 ---
 
@@ -25,6 +26,31 @@
 | REVAMP stays separate | If a feature needs infra (e.g. `RunState`), note it in **Blockers** and link REVAMP — do not copy REVAMP tasks here. |
 
 Status values: `planned` · `designing` · `in progress` · `shipped` · `blocked` · `dropped`.
+
+---
+
+## Branching & commit rules
+
+Home branch for this roadmap: **`cursor/features-revamp-af89`** (the features
+revamp branch). All differentiation work eventually lands here.
+
+| Rule | Detail |
+|------|--------|
+| Default land here | Design docs, feature slices, and fixes for this roadmap commit to `cursor/features-revamp-af89` and push often. |
+| Sub-branch when useful | For a large or risky feature/slice, branch *from* the revamp branch (e.g. `cursor/a1-cost-envelope-af89`), implement there, then **merge back into** `cursor/features-revamp-af89`. Do not open a parallel long-lived roadmap branch. |
+| Name pattern | Keep the `cursor/<descriptive-name>-af89` form for any sub-branch. |
+| Commit as you go | Prefer small, descriptive commits (design lock, S1, S2, …) over one giant dump. Push before / after test passes on a slice. |
+| One feature focus | Finish or clearly pause a feature (status + notes) before starting the next phase row, unless a blocker forces a detour. |
+| Link the doc | PR / commit messages for implementation should reference `docs/features/NN-*.md` (and update MASTER status when status changes). |
+| Don’t mix roadmaps | Engineering-only REVAMP work stays on its own track; if a features slice needs a REVAMP prerequisite, note the blocker here and land the infra where that work belongs, then resume the feature. |
+| No drive-by refactors | Keep commits scoped to the active feature/slice; unrelated cleanup is out of scope unless it unblocks the slice. |
+
+```text
+main
+  └── cursor/features-revamp-af89          ← roadmap home (docs + features)
+        ├── cursor/a1-cost-envelope-af89   ← optional sub-branch → merge back
+        └── cursor/<feature>-af89          ← optional sub-branch → merge back
+```
 
 ---
 

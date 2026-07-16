@@ -1125,6 +1125,8 @@ COMMANDS: list[Command] = [
             run=lambda app: app._cmd_runs()),
     Command("assume", "Assume", "Set the assumption level for this session", "ops",
             run=lambda app: app._cmd_assume()),
+    Command("profile", "Profile", "Set assumption profile (surgeon/contractor/intern/chaos)", "ops",
+            run=lambda app: app._cmd_profile()),
     Command("cwd", "Working dir", "Show / set the session working directory", "ops",
             run=lambda app: app._cmd_cwd(), enabled=lambda app: not _run_active(app)),
     Command("redirect", "Redirect", "Steer now: redirect the work (or /redirect <input>)", "ops",
@@ -2618,6 +2620,35 @@ class RelayTuiApp(App):
 
     def _set_assume(self, level: str) -> None:
         self._assumption_level = level
+        self._update_status()
+
+    def _cmd_profile(self) -> None:
+        """B1: pick a named assumption profile for this session (session-only)."""
+        from relay.profiles import PROFILES, get_profile
+
+        options = []
+        for name in PROFILES:
+            p = get_profile(name)
+            assert p is not None
+            options.append({
+                "title": name,
+                "value": name,
+                "category": "profile",
+                "description": f"{p.description} (dial={p.assumption_level})",
+                "on_select": (lambda v, n=name: self._set_profile(n)),
+            })
+        self.push_screen(SelectDialog(title="Assumption profile", options=options))
+
+    def _set_profile(self, name: str) -> None:
+        from relay.profiles import get_profile
+
+        p = get_profile(name)
+        if p is None:
+            return
+        self._assumption_level = p.assumption_level
+        self._write_activity(
+            f"[profile] {p.name} · dial={p.assumption_level} · {p.description}"
+        )
         self._update_status()
 
     def _cmd_cwd(self) -> None:

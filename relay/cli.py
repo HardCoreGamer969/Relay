@@ -28,11 +28,14 @@ from relay.config import (
     resolve_bash_timeout,
     resolve_envelope_scope,
     resolve_envelope_warn,
+    resolve_hands_context_mode,
     resolve_max_cost,
     resolve_max_total_steps,
 )
 from relay.context import resolve_context_window
 from relay.envelope import CostEnvelope
+from relay.profiles import resolve_profile
+from relay.router import ModelRouter
 from relay.providers import (
     DEFAULT_PROVIDER,
     DISCOVERY_LIST,
@@ -213,6 +216,27 @@ def run(
         help="Assumption dial: 1 (assume freely) .. 5 (follow the letter) or 'auto'. "
         "Overrides RELAY_ASSUMPTION_LEVEL for this run.",
     ),
+    profile: str = typer.Option(
+        "",
+        "--profile",
+        help="Assumption profile (surgeon|contractor|intern|chaos). Sets dial + "
+        "defaults; --assume still wins for the dial. Overrides RELAY_PROFILE / "
+        ".relay/profile.json / config.",
+    ),
+    hands_context: str = typer.Option(
+        "",
+        "--hands-context",
+        help="Hands context dial: needle (default) | findings | summary | wide. "
+        "wide is debug-only and still never receives brain reasoning. "
+        "Overrides RELAY_HANDS_CONTEXT_MODE.",
+    ),
+    route: str = typer.Option(
+        "",
+        "--route",
+        help="Model route profile: economy | balanced | premium. Sets brain/hands "
+        "defaults; RELAY_BRAIN_MODEL / RELAY_HANDS_MODEL / config still win. "
+        "Overrides RELAY_ROUTE / .relay/route.json.",
+    ),
     show_transcript: bool = typer.Option(
         False, "--show-transcript",
         help="After the run, print the (compacted) continuous conversation thread "
@@ -239,9 +263,16 @@ def run(
     cfg = load_models()
     ledger = Ledger()
     approver = None if auto_approve else _interactive_approver
-    dial = resolve_assumption_level(override=assume or None)
-    ceiling = resolve_max_total_steps(override=max_total_steps)  # 50 by default; flag/env/config can raise
-    cost_ceiling = resolve_max_cost(override=max_cost)
+    active_profile = resolve_profile(profile or None, root=root)
+    dial = resolve_assumption_level(override=assume or active_profile.assumption_level)
+    confirm_plan = confirm_plan or active_profile.confirm_plan
+    supervise_flag = (not no_supervise) and active_profile.supervise
+    ceiling = resolve_max_total_steps(
+        override=max_total_steps if max_total_steps is not None else active_profile.max_total_steps_hint
+    )
+    cost_ceiling = resolve_max_cost(
+        override=max_cost if max_cost is not None else active_profile.max_cost_hint
+    )
     scope = resolve_envelope_scope(override=envelope_scope or None)
     warn_thresholds = resolve_envelope_warn(override=envelope_warn or None)
     bash_timeout = resolve_bash_timeout()
@@ -256,6 +287,13 @@ def run(
         scope=scope,
         warn_thresholds=warn_thresholds,
     )
+    context_mode = resolve_hands_context_mode(hands_context or None)
+    router = ModelRouter.from_resolve(route or None, root=root)
+    cfg, _route_changes = router.bind(cfg)
+    console.print(
+        f"[dim]profile={active_profile.name} ({active_profile.description}) · "
+        f"dial={dial} · hands-context={context_mode} · route={router.route.name}[/dim]"
+    )
     start = time.perf_counter()
     if solo:
         result = _run_solo(
@@ -265,9 +303,10 @@ def run(
     else:
         result = _run_planned(
             goal, root, cfg, ledger, auto_approve, approver, confirm_plan,
-            supervise=not no_supervise, dial=dial, show_transcript=show_transcript,
+            supervise=supervise_flag, dial=dial, show_transcript=show_transcript,
             max_total_steps=ceiling, max_cost=cost_ceiling, bash_timeout_s=bash_timeout,
             plan_only=plan_only, envelope=envelope,
+            hands_context_mode=context_mode, model_router=router,
         )
     wall_time_s = time.perf_counter() - start
 
@@ -334,7 +373,9 @@ def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver, 
 def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, *,
                  supervise=True, dial="auto", show_transcript=False, max_total_steps=None,
                  max_cost=None, bash_timeout_s=120.0, plan_only=False,
-                 envelope: CostEnvelope | None = None):
+                 envelope: CostEnvelope | None = None,
+                 hands_context_mode: str | None = None,
+                 model_router: ModelRouter | None = None):
     """Conversational planning -> commit -> the two-role autonomous loop.
 
     Both phases share ONE transcript, so a mid-run escalation appears as the next
@@ -342,11 +383,13 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
     """
     bash_policy = "auto-approve" if auto_approve else "interactive approval"
     env = envelope or CostEnvelope(max_cost=max_cost, max_steps=max_total_steps)
+    ctx = hands_context_mode or resolve_hands_context_mode()
+    route_name = model_router.route.name if model_router is not None else "-"
     console.print(
         Panel(
             f"[bold]{goal}[/bold]\nroot={root}\nbrain={cfg.brain}\nhands={cfg.hands}\n"
             f"bash policy={bash_policy}  supervision={'on' if supervise else 'off'}  "
-            f"assume={dial}\n{env.preflight_text()}",
+            f"assume={dial}  hands-context={ctx}  route={route_name}\n{env.preflight_text()}",
             title="Relay run (brain + hands)",
             border_style="cyan",
         )
@@ -415,6 +458,8 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
             catalog=catalog,
             bash_timeout_s=bash_timeout_s,
             envelope=env,
+            hands_context_mode=hands_context_mode,
+            model_router=model_router,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)

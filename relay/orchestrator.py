@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from relay.config import ModelConfig, load_models
+from relay.config import ModelConfig, load_models, resolve_hands_context_mode
 from relay.context import resolve_context_window
 from relay.envelope import CostEnvelope, brain_cost_since
 from relay.explain import explain_events
@@ -56,6 +56,7 @@ from relay.planner import (
     review_step,
 )
 from relay.protocol import parse
+from relay.router import EVENT_ROUTE_CHANGE, ModelRouter
 from relay.telemetry import Ledger
 from relay.tools import Tools
 from relay.transcript import Transcript, compact_transcript, record_decision, render_for_brain
@@ -108,7 +109,8 @@ Work the current step ONE action at a time, using these EXACT tags:
   <mkdir path="relative/path"/>             (create a directory + parents; no shell)
   <webfetch url="https://..."/>             (fetch a URL as readable text)
   <bash>command</bash>
-  <question>a question you need answered to proceed</question>
+  <question class="product|tech|mechanical">a question you need answered to proceed</question>
+                                             (label the class; unlabeled is treated as product)
   <finding>a bug, security issue, or wrong assumption to flag for the planner</finding>
   <done>one-line summary of what THIS step accomplished</done>
   <blocked>reason you cannot complete this step</blocked>
@@ -133,8 +135,9 @@ Rules:
 - Some destructive bash commands are refused by policy ("BLOCKED by policy: ...")
   or need approval ("DENIED ..."); adapt rather than re-emitting them verbatim.
 - Stay scoped to YOUR current step. Do NOT do later steps.
-- If you need information to proceed, emit <question>...</question>; the planner
-  will answer it (or get an answer) and you will see "ANSWER: ..." -- then continue.
+- If you need information to proceed, emit
+  <question class="product|tech|mechanical">...</question> (unlabeled → product);
+  the planner will answer it (or get an answer) and you will see "ANSWER: ..." -- then continue.
 - If you DISCOVER something the planner should know -- a bug, a security issue, or
   that a file is not structured the way this step assumed -- emit
   <finding>...</finding>. This does NOT end your step and you do NOT wait for a
@@ -349,19 +352,22 @@ def _executor_step_prompt(
     *,
     extra_instruction: str | None = None,
     shared_context: str = "",
+    hands_context_mode: str = "needle",
+    step_summaries: str = "",
+    wide_transcript: str = "",
 ) -> str:
-    """Build the executor's NARROW per-step context.
+    """Build the executor's per-step context (hands context dial, B3).
 
-    Deliberately excludes the full plan, the brain's reasoning, and prior steps'
-    raw transcripts -- only the current instruction plus one-line carry-over.
-    ``extra_instruction`` carries a reviewer follow-up for a corrective attempt.
+    Modes:
+      - ``needle`` (default): current step + one-line carry-over only
+      - ``findings``: needle + shared findings/directives
+      - ``summary``: findings + compact prior-step summaries
+      - ``wide``: summary + more prior hands/decision transcript (debug)
 
-    ``shared_context`` (v0.0.29) is the SHARED memory slice -- the brain's
-    authoritative directives + the hands' own prior findings. It is the ONLY memory
-    the hands sees: never the brain's reasoning pool, and (Stage 1) not yet its own
-    hands pool. So the narrow-context principle holds -- no brain reasoning leaks --
-    while the hands gains the curated directives it must honor.
+    Hard invariant: never include the brain's private reasoning pool, even in
+    ``wide``.
     """
+    mode = (hands_context_mode or "needle").strip().lower()
     lines = [f"Overall goal (context only): {goal}", ""]
     carry = plan.completed_outcomes()
     if carry:
@@ -369,12 +375,22 @@ def _executor_step_prompt(
         for _index, _instruction, outcome in carry:
             lines.append(f"- {outcome}")
         lines.append("")
-    if shared_context:
+    if mode in ("findings", "summary", "wide") and shared_context:
         lines.append(
             "STANDING CONTEXT (directives + findings established so far -- honor "
             "these; do not re-derive or contradict them):"
         )
         lines.append(shared_context)
+        lines.append("")
+    if mode in ("summary", "wide") and step_summaries:
+        lines.append("PRIOR STEP SUMMARIES:")
+        lines.append(step_summaries)
+        lines.append("")
+    if mode == "wide" and wide_transcript:
+        lines.append(
+            "WIDE CONTEXT (debug; prior hands/decision turns only — never brain reasoning):"
+        )
+        lines.append(wide_transcript)
         lines.append("")
     lines.append(f"YOUR CURRENT STEP: {step.instruction}")
     if extra_instruction:
@@ -383,10 +399,50 @@ def _executor_step_prompt(
     lines.append("")
     lines.append(
         "Do ONLY this step, one action at a time. Emit <done>one-line result</done> "
-        "when THIS step is complete, <question>...</question> if you need info, or "
+        "when THIS step is complete, "
+        '<question class="product|tech|mechanical">...</question> if you need info '
+        "(label the class; unlabeled is treated as product), or "
         "<blocked>reason</blocked> if you are stuck. Begin."
     )
     return "\n".join(lines)
+
+
+def _prior_step_summaries(plan: Plan) -> str:
+    """Compact instruction+outcome lines for summary/wide modes."""
+    lines = []
+    for step in plan.steps:
+        if step.status == "done":
+            lines.append(f"- [{step.index}] {step.instruction} → {step.outcome or 'done'}")
+        elif step.status == "failed":
+            lines.append(f"- [{step.index}] {step.instruction} → FAILED: {step.outcome or ''}")
+    return "\n".join(lines)
+
+
+def _wide_hands_transcript(transcript: Transcript | None, *, max_chars: int = 4000) -> str:
+    """Prior hands/user/decision turns only — never brain planning/reasoning.
+
+    Hard invariant for the hands context dial: even ``wide`` must not leak the
+    brain's private deliberation into the executor prompt.
+    """
+    if transcript is None or not getattr(transcript, "turns", None):
+        return ""
+    allowed_speakers = {"hands", "user", "executor"}
+    allowed_phases = {"decision", "execution", "escalation", "result"}
+    chunks: list[str] = []
+    for turn in transcript.turns:
+        speaker = (getattr(turn, "speaker", "") or "").lower()
+        phase = (getattr(turn, "phase", "") or "").lower()
+        # Include user decisions and hands execution; skip brain planning/review.
+        if speaker == "brain" and phase not in ("escalation", "decision", "result"):
+            continue
+        if speaker in allowed_speakers or phase in allowed_phases:
+            text = (getattr(turn, "text", "") or "").strip()
+            if text:
+                chunks.append(f"[{speaker}/{phase}] {text}")
+    joined = "\n".join(chunks)
+    if len(joined) > max_chars:
+        return joined[-max_chars:]
+    return joined
 
 
 def _run_executor_step(
@@ -401,12 +457,15 @@ def _run_executor_step(
     client: Any | None,
     max_steps: int,
     emit: Callable[[str, str, dict], None] | None = None,
-    resolve_question: Callable[[str], _QuestionResolution] | None = None,
+    resolve_question: Callable[..., _QuestionResolution] | None = None,
     extra_instruction: str | None = None,
     cancel_check: Callable[[], bool] | None = None,
     reads: dict[str, str] | None = None,
     on_finding: Callable[[str], None] | None = None,
     shared_context: str = "",
+    hands_context_mode: str = "needle",
+    step_summaries: str = "",
+    wide_transcript: str = "",
 ) -> _StepOutcome:
     """Run the hands in a fresh, narrow context until done/blocked/budget/question.
 
@@ -424,7 +483,9 @@ def _run_executor_step(
     messages: list[dict[str, str]] = [
         {"role": "system", "content": EXECUTOR_SYSTEM_PROMPT},
         {"role": "user", "content": _executor_step_prompt(
-            goal, step, plan, extra_instruction=extra_instruction, shared_context=shared_context,
+            goal, step, plan, extra_instruction=extra_instruction,
+            shared_context=shared_context, hands_context_mode=hands_context_mode,
+            step_summaries=step_summaries, wide_transcript=wide_transcript,
         )},
     ]
     transcript: list[str] = []
@@ -502,12 +563,17 @@ def _run_executor_step(
                 )
             if action.kind == "question":
                 question = action.content or ""
+                qclass = getattr(action, "question_class", None)
                 if resolve_question is None:
                     return _StepOutcome(
                         False, failure_reason=f"executor asked a question but no resolver was available: {question}",
                         calls=calls, transcript=transcript, touched_paths=touched,
                     )
-                resolution = resolve_question(question)
+                try:
+                    resolution = resolve_question(question, qclass)
+                except TypeError:
+                    # Older callables that only accept the question string.
+                    resolution = resolve_question(question)
                 if resolution.unresolved:
                     return _StepOutcome(
                         False, failure_reason=f"unresolved escalation: {question}", calls=calls,
@@ -697,6 +763,8 @@ def run_planned(
     transcript: Transcript | None = None,
     cancel_check: Callable[[], bool] | None = None,
     bash_timeout_s: float | None = 120.0,
+    hands_context_mode: str | None = None,
+    model_router: ModelRouter | None = None,
 ) -> PlannedTaskResult:
     """Drive the autonomous two-role planner/executor loop.
 
@@ -763,6 +831,11 @@ def run_planned(
     result.envelope = envelope
 
     cfg = models if models is not None else load_models()
+    route_changes: list = []
+    if model_router is not None:
+        cfg, route_changes = model_router.bind(cfg)
+    models = cfg
+    context_mode = resolve_hands_context_mode(hands_context_mode)
     # v0.0.29: resolve BOTH actor windows and budget each pool to its own (passing
     # provider + catalog so a catalog model gets its real window instead of the 8192
     # default). The hands reads RELAY_HANDS_CONTEXT for its manual override, never the
@@ -784,6 +857,18 @@ def run_planned(
         result.events.append(event)
         if on_event is not None:
             on_event(event)
+
+    for change in route_changes:
+        emit(
+            EVENT_ROUTE_CHANGE,
+            f"route {change.route}: {change.role} {change.from_model}→{change.to_model} ({change.reason})",
+            change.as_payload(),
+        )
+    emit(
+        "hands_context_mode",
+        f"hands context mode: {context_mode}",
+        {"mode": context_mode},
+    )
 
     def remember(
         kind: str, detail: str, summary: str, *, provenance: str, pool: str = POOL_BRAIN, tags=None
@@ -862,11 +947,13 @@ def run_planned(
     # that re-issues a near-identical already-failed step is the loop signature.
     dead_ended_instructions: list[str] = []
 
-    def make_question_resolver(step: PlanStep) -> Callable[[str], _QuestionResolution]:
+    def make_question_resolver(step: PlanStep) -> Callable[..., _QuestionResolution]:
         """Resolve an executor question: brain self-answers, or escalates to the user."""
 
-        def resolve(question: str) -> _QuestionResolution:
-            emit("executor_question", question, {"index": step.index, "question": question})
+        def resolve(question: str, question_class: str | None = None) -> _QuestionResolution:
+            emit("executor_question", question, {
+                "index": step.index, "question": question, "question_class": question_class,
+            })
             # Give the brain a window-bounded slice of the conversation so far, so an
             # escalation reads as a continuation of the dialogue, not a fresh prompt.
             convo_ctx = render_for_brain(
@@ -876,6 +963,7 @@ def run_planned(
                 question, goal, plan, step, memory, models=models, ledger=ledger,
                 client=client, memory_budget_tokens=mem_budget, brain_role=brain_role,
                 assumption_level=assumption_level, conversation_context=convo_ctx,
+                question_class=question_class,
             )
             for kind, detail, summary in resolution.records:
                 remember(kind, detail, summary, provenance=f"step{step.index} brain")
@@ -888,7 +976,8 @@ def run_planned(
                     provenance=f"step{step.index} self-answer", pool=POOL_SHARED,
                 )
                 emit("brain_self_answered", question,
-                     {"question": question, "answer": resolution.answer, "reasoning": resolution.reasoning})
+                     {"question": question, "answer": resolution.answer,
+                      "reasoning": resolution.reasoning, "question_class": resolution.question_class})
                 return _QuestionResolution(answer=resolution.answer)
 
             # Escalation: the brain's product question is the next turn of the SAME
@@ -896,7 +985,8 @@ def run_planned(
             transcript.record("brain", "escalation", resolution.question_for_user,
                               refs=[f"step{step.index}"])
             emit("brain_escalated", resolution.question_for_user,
-                 {"question": resolution.question_for_user, "reasoning": resolution.reasoning})
+                 {"question": resolution.question_for_user, "reasoning": resolution.reasoning,
+                  "question_class": resolution.question_class, "index": step.index})
             if user_decision is None:
                 return _QuestionResolution(answer=None, unresolved=True)
             answer = user_decision(resolution.question_for_user)
@@ -936,16 +1026,21 @@ def run_planned(
         def hands_shared() -> str:
             # The SHARED slice the hands gets (Stage 1: shared only). Rendered fresh
             # before each executor invocation so a directive/finding written during the
-            # step is visible on the next (follow-up) attempt.
+            # step is visible on the next (follow-up) attempt. Needle mode skips this
+            # in the prompt assembler; we still compute it cheaply for findings+.
             return memory.hands_context(
                 step.instruction, memory.hands_budget, client=client, models=models, ledger=ledger
             )
+
+        summaries = _prior_step_summaries(plan) if context_mode in ("summary", "wide") else ""
+        wide_tx = _wide_hands_transcript(transcript) if context_mode == "wide" else ""
 
         outcome = _run_executor_step(
             step, plan, goal, tools, hands_role=hands_role, models=models, ledger=ledger,
             client=client, max_steps=step_budget, emit=emit, resolve_question=resolver,
             cancel_check=cancel_check, reads=reads, on_finding=record_finding,
-            shared_context=hands_shared(),
+            shared_context=hands_shared(), hands_context_mode=context_mode,
+            step_summaries=summaries, wide_transcript=wide_tx,
         )
         executor_calls += outcome.calls
         followups_used = 0
@@ -999,6 +1094,7 @@ def run_planned(
                 client=client, max_steps=step_budget, emit=emit, resolve_question=resolver,
                 extra_instruction=review.followup, cancel_check=cancel_check, reads=reads,
                 on_finding=record_finding, shared_context=hands_shared(),
+                hands_context_mode=context_mode, step_summaries=summaries, wide_transcript=wide_tx,
             )
             executor_calls += outcome.calls
 
@@ -1177,9 +1273,21 @@ def run_planned(
              {"n": escalations, "failed_index": step.index, "reason": disposition.failure_reason})
 
         before_replan = len(ledger.records)
+        replan_models = models
+        if model_router is not None:
+            replan_models, route_change = model_router.models_for_replan(
+                models, envelope=envelope, ledger=ledger,
+            )
+            if route_change is not None:
+                emit(
+                    EVENT_ROUTE_CHANGE,
+                    f"route {route_change.route}: {route_change.role} "
+                    f"{route_change.from_model}→{route_change.to_model} ({route_change.reason})",
+                    route_change.as_payload(),
+                )
         revised = replan(
             goal, plan, step, disposition.failure_reason, plan.completed_outcomes(),
-            models=models, ledger=ledger, client=client, brain_role=brain_role,
+            models=replan_models, ledger=ledger, client=client, brain_role=brain_role,
             memory=memory, memory_budget_tokens=mem_budget,
         )
         envelope.add_wasted_brain(brain_cost_since(ledger, before_replan))

@@ -33,7 +33,7 @@ class _Client:
 
     def __init__(self, *, hands=None, escalate=True):
         self._hands = list(hands or [
-            "<question>do we need OAuth login?</question>",
+            '<question class="mechanical">do we need OAuth login?</question>',
             '<edit path="login.py">x</edit>\n<done>added login</done>',
         ])
         self._hands_i = 0

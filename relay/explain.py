@@ -24,6 +24,7 @@ class HarnessReport:
     open_questions: list[str] = field(default_factory=list)
     escalations: list[str] = field(default_factory=list)
     envelope_warnings: list[str] = field(default_factory=list)
+    route_changes: list[str] = field(default_factory=list)
     terminal_reason: str | None = None
     step_summaries: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -59,6 +60,11 @@ class HarnessReport:
             lines.append("## Envelope warnings")
             for w in self.envelope_warnings:
                 lines.append(f"- {w}")
+        if self.route_changes:
+            lines.append("")
+            lines.append("## Route changes")
+            for r in self.route_changes:
+                lines.append(f"- {r}")
         if self.escalations:
             lines.append("")
             lines.append("## Escalations")
@@ -101,6 +107,7 @@ _BRAIN_KINDS = frozenset(
         "brain_escalated",
         "escalation",
         "scope_assessed",
+        "route_change",
     }
 )
 
@@ -154,10 +161,16 @@ def explain_events(
 
         if kind == "executor_question":
             q = payload.get("question") or message
-            open_q.append(q)
+            qclass = payload.get("question_class") or "product"
+            idx = payload.get("index")
+            label = f"[step {idx}] ({qclass}) {q}" if idx is not None else f"({qclass}) {q}"
+            open_q.append(label)
         if kind == "brain_escalated":
             q = payload.get("question") or message
-            open_q.append(q)
+            qclass = payload.get("question_class") or "product"
+            idx = payload.get("index")
+            label = f"[step {idx}] ({qclass}) {q}" if idx is not None else f"({qclass}) {q}"
+            open_q.append(label)
             report.escalations.append(message or q)
         if kind == "user_decided":
             # Resolved — drop matching open questions by clearing list on decision.
@@ -166,6 +179,8 @@ def explain_events(
             report.escalations.append(message)
         if kind == "envelope_warn":
             report.envelope_warnings.append(message)
+        if kind == "route_change":
+            report.route_changes.append(message or str(payload))
 
         if kind == "step_start":
             idx = payload.get("index")

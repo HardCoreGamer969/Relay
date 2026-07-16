@@ -158,7 +158,7 @@ def test_full_loop_in_the_tui_one_box_one_thread(tmp_path):
 
     async def main():
         client = _ArcClient(hands=[
-            "<question>do we need OAuth login?</question>",
+            '<question class="mechanical">do we need OAuth login?</question>',
             '<edit path="login.py">x</edit>\n<done>added login</done>',
         ])
         app = _app(tmp_path, client)

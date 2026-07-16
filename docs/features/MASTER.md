@@ -9,8 +9,7 @@
 >
 > Do not merge the two roadmaps. Cross-link blockers only.
 
-**Planning only — no implementation yet.**  
-*(A1 design is locked; coding starts on go-ahead.)*
+**Roadmap home for differentiation work.** Status lives in the table below.
 
 ---
 
@@ -74,11 +73,11 @@ Work top to bottom. Skip a row only with a written reason in **Notes**.
 |-------|---|----------|-----|--------|------------------|
 | A1 | 7 | Cost Envelope Contracts | [07](07-cost-envelope.md) | shipped | CostEnvelope + scope/warn + CLI/TUI/solo/runlog |
 | A2 | 12 | Explain the Harness (`/why`) | [12](12-explain-harness.md) | shipped | `explain_events` + `/why` + `runs --explain` |
-| A3 | 9 | Finding-Driven Memory | [09](09-finding-memory.md) | planned | Stage 1 pools exist; persist TBD |
-| B1 | 2 | Assumption Profiles | [02](02-assumption-profiles.md) | planned | Dial exists; named profiles do not |
-| B2 | 5 | Product-Decision Firewall | [05](05-product-firewall.md) | planned | Escalations exist; no typed taxonomy |
-| B3 | 4 | Hands Context Dial | [04](04-context-dial.md) | planned | Narrow hands hardcoded today |
-| B4 | **13** | **Model Router** (brand) | [13](13-model-router.md) | planned | Static role→model binding today |
+| A3 | 9 | Finding-Driven Memory | [09](09-finding-memory.md) | shipped | `.relay/memory.json` + pin/forget |
+| B1 | 2 | Assumption Profiles | [02](02-assumption-profiles.md) | shipped | builtins + `--profile` / TUI `/profile` |
+| B2 | 5 | Product-Decision Firewall | [05](05-product-firewall.md) | shipped | class= + dial×class matrix; unlabeled→product |
+| B3 | 4 | Hands Context Dial | [04](04-context-dial.md) | shipped | needle/findings/summary/wide; never brain pool |
+| B4 | **13** | **Model Router** (brand) | [13](13-model-router.md) | shipped | economy/balanced/premium + replan bump/freeze |
 | C1 | 1 | Model Bake-Off (`relay duel`) | [01](01-bake-off.md) | planned | Needs A1 receipts; `provider` on CallRecord → [REVAMP §4](../REVAMP.md) |
 | C2 | 8 | Protocol Fitness Lab | [08](08-protocol-lab.md) | planned | Pairs with C1 |
 | D1 | 6 | Adversarial Reviewer | [06](06-adversarial-reviewer.md) | planned | Investigation loop exists; reviewer fail-open → REVAMP |

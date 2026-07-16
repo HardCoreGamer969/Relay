@@ -21,6 +21,7 @@ from typing import Any, Callable, Sequence
 
 from relay.config import ModelConfig, assumption_directive
 from relay.context import DEFAULT_CONTEXT_WINDOW
+from relay.firewall import classify_question, may_auto_answer
 from relay.investigation import investigate
 from relay.loop import describe_action, execute_action
 from relay.memory import MemoryBus, PlanMemory, memory_budget
@@ -425,6 +426,8 @@ class Resolution:
     question_for_user: str = ""  # the precise product question to escalate
     reasoning: str = ""  # why this is self-answerable or a product decision (logged)
     records: list[tuple[str, str, str]] = field(default_factory=list)
+    question_class: str = "product"  # product | tech | mechanical (B2 firewall)
+
 
 
 _REVIEW_SYSTEM = """\
@@ -456,12 +459,13 @@ _REVIEW_GRAMMAR = (
 
 _ANSWER_SYSTEM = """\
 You are the PLANNER (the "brain"). The EXECUTOR asked a question mid-step. Decide
-whether you can answer it YOURSELF -- a TECHNICAL question decidable from the
-goal, the plan, the code, and established memory -- or whether it is a genuine
-PRODUCT DECISION only the user can make (what to build, scope, a user-visible
-preference). Answer it yourself when you legitimately can. When GENUINELY UNSURE,
-ESCALATE: a needless escalation is a mild annoyance, but answering a product
-decision yourself silently builds the wrong thing.
+whether you can answer it YOURSELF -- a TECHNICAL or MECHANICAL question decidable
+from the goal, the plan, the code, and established memory -- or whether it is a
+genuine PRODUCT DECISION only the user can make (what to build, scope, a
+user-visible preference). The product-decision firewall has already filtered
+questions that must escalate; when you see this prompt you MAY self-answer.
+When GENUINELY UNSURE, ESCALATE: a needless escalation is a mild annoyance, but
+answering a product decision yourself silently builds the wrong thing.
 
 If a "conversation so far" is provided, you are continuing ONE ongoing dialogue
 with the user. Phrase any escalation as a natural continuation of it -- you may
@@ -715,22 +719,38 @@ def answer_or_escalate(
     brain_role: str = "brain",
     assumption_level: str = "auto",
     conversation_context: str = "",
+    question_class: str | None = None,
 ) -> Resolution:
     """Classify an executor question: self_answer (technical) or escalate (product).
 
+    **Product-decision firewall (B2):** questions are typed ``product`` | ``tech`` |
+    ``mechanical``. Unlabeled questions fail closed as ``product``. Product never
+    auto-answers regardless of dial. Tech may auto under permissive dials (1–2);
+    mechanical usually auto (blocked only at dial 5).
+
     Reads a window-aware memory slice so self-answers stay consistent with earlier
     decisions. The **assumption dial** (``assumption_level``) biases the
-    self-answer-vs-escalate threshold globally: a low dial assumes more (escalates
-    rarely), a high dial asks more, ``auto`` is the brain's normal-mode judgment.
-    Still biased to ``escalate`` when the reply is unparseable/ambiguous, because a
-    wrong self-answer silently builds the wrong thing.
+    self-answer-vs-escalate threshold for classes that *may* auto. Still biased to
+    ``escalate`` when the reply is unparseable/ambiguous, because a wrong
+    self-answer silently builds the wrong thing.
 
     ``conversation_context`` is a window-bounded slice of the continuous transcript
     (the dialogue so far). When present, the brain phrases an escalation as the next
     turn of that conversation -- a continuation, not a context-less popup.
     """
+    qclass, cleaned = classify_question(question, explicit=question_class)
+    if not may_auto_answer(qclass, assumption_level):
+        return Resolution(
+            kind="escalate",
+            question_for_user=cleaned or question,
+            reasoning=(
+                f"firewall: class={qclass} cannot auto-answer at dial={assumption_level}"
+            ),
+            question_class=qclass,
+        )
+
     mem_ctx = _memory_context(
-        memory, question, memory_budget_tokens, client=client, models=models, ledger=ledger
+        memory, cleaned, memory_budget_tokens, client=client, models=models, ledger=ledger
     )
     memory_block = (
         f"Relevant memory (facts/decisions already established):\n{mem_ctx}\n\n" if mem_ctx else ""
@@ -743,8 +763,9 @@ def answer_or_escalate(
     user = (
         f"Goal: {goal}\n\n"
         f"Current step: [{step.index}] {step.instruction}\n\n"
+        f"Question class: {qclass}\n\n"
         f"{convo_block}"
-        f"The executor asks: {question}\n\n"
+        f"The executor asks: {cleaned}\n\n"
         f"{memory_block}"
         f"{_ANSWER_GRAMMAR}"
     )
@@ -755,7 +776,18 @@ def answer_or_escalate(
         ledger=ledger,
         client=client,
     ).text
-    return _parse_resolution(reply, question)
+    resolution = _parse_resolution(reply, cleaned)
+    resolution.question_class = qclass
+    # Hard invariant: product never leaves as self_answer even if the model tries.
+    if qclass == "product" and resolution.kind == "self_answer":
+        return Resolution(
+            kind="escalate",
+            question_for_user=cleaned or question,
+            reasoning="firewall: product class forced escalate (model attempted self_answer)",
+            question_class=qclass,
+            records=resolution.records,
+        )
+    return resolution
 
 
 def _parse_resolution(text: str, question: str) -> Resolution:

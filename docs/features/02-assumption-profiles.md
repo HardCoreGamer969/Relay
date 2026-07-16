@@ -1,6 +1,7 @@
 # 02 — Assumption Profiles
 
 **Phase:** B1 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Shipped:** features-revamp (builtins + CLI `--profile` / TUI `/profile` / `.relay/profile.json`)  
 **Depends on:** existing assumption dial (no hard infra blockers)
 
 ## Blockers
@@ -30,10 +31,10 @@ Each profile maps to dial level + defaults for confirm-plan, supervise, max step
 
 ## User surface
 
-- `relay config set-profile contractor` / env `RELAY_PROFILE`
-- Repo file: `.relay/profile.toml` (or yaml) overrides user default
+- `relay run --profile surgeon` / env `RELAY_PROFILE`
+- Repo file: `.relay/profile.json` overrides user default
 - TUI: `/profile` shows active profile + underlying dial
-- `relay run --profile surgeon`
+- `--assume` still wins for the dial when set
 
 ## Hooks into existing code
 
@@ -43,15 +44,15 @@ Each profile maps to dial level + defaults for confirm-plan, supervise, max step
 
 ## Acceptance criteria
 
-- [ ] Four built-in profiles resolve to deterministic dial + flag defaults
-- [ ] Precedence documented: CLI > repo file > user config > env > default
-- [ ] TUI/CLI show which profile is active for a run
-- [ ] Tests cover resolution precedence and unknown profile errors
+- [x] Four built-in profiles resolve to deterministic dial + flag defaults
+- [x] Precedence documented: CLI > repo file > env > user config > default
+- [x] TUI/CLI show which profile is active for a run
+- [x] Tests cover resolution precedence and unknown profile fallthrough
 
 ## Open questions
 
-- Can users define custom profiles in v1, or builtins only?
-- Does changing profile mid-run (TUI) apply only to the next escalation?
+- Can users define custom profiles in v1, or builtins only? **v1: builtins only.**
+- Does changing profile mid-run (TUI) apply only to the next escalation? **Session-only until next run.**
 
 ## Out of scope (v1)
 

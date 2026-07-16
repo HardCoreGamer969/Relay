@@ -390,7 +390,8 @@ def test_answer_self_answer(monkeypatch):
     )
     plan = _one_step_plan()
     res = answer_or_escalate("which db module?", "g", plan, plan.steps[0], PlanMemory(),
-                             models=CFG, client=object())
+                             models=CFG, client=object(), question_class="tech",
+                             assumption_level="1")
     assert res.kind == "self_answer"
     assert res.answer == "reuse the existing db.py module"
     assert res.records == [("decision", "reuse db.py", "reuse db")]
@@ -403,16 +404,17 @@ def test_answer_escalate(monkeypatch):
     )
     plan = _one_step_plan()
     res = answer_or_escalate("auth approach?", "g", plan, plan.steps[0], PlanMemory(),
-                             models=CFG, client=object())
+                             models=CFG, client=object(), question_class="product")
     assert res.kind == "escalate"
-    assert res.question_for_user == "Should the app support OAuth login?"
+    assert res.question_for_user == "auth approach?"  # firewall short-circuits product
 
 
 def test_answer_unparseable_biases_to_escalate(monkeypatch):
     monkeypatch.setattr(planner_mod, "call_model", _FakeBrain("hmm, not totally sure about this"))
     plan = _one_step_plan()
     res = answer_or_escalate("the original question", "g", plan, plan.steps[0], PlanMemory(),
-                             models=CFG, client=object())
+                             models=CFG, client=object(), question_class="mechanical",
+                             assumption_level="1")
     assert res.kind == "escalate"
     assert res.question_for_user == "the original question"  # falls back to the executor's question
 
@@ -420,7 +422,8 @@ def test_answer_unparseable_biases_to_escalate(monkeypatch):
 def test_answer_self_answer_without_answer_tag_escalates(monkeypatch):
     monkeypatch.setattr(planner_mod, "call_model", _FakeBrain("<decision>self_answer</decision>"))
     plan = _one_step_plan()
-    res = answer_or_escalate("q", "g", plan, plan.steps[0], PlanMemory(), models=CFG, client=object())
+    res = answer_or_escalate("q", "g", plan, plan.steps[0], PlanMemory(), models=CFG,
+                             client=object(), question_class="mechanical", assumption_level="1")
     assert res.kind == "escalate"  # claimed self-answer but gave none -> conservative escalate
 
 
@@ -438,7 +441,8 @@ def test_answer_reads_prior_decision_from_memory(monkeypatch):
     monkeypatch.setattr(planner_mod, "call_model", fake)
     plan = Plan.from_instructions(["build the storage layer"])
     res = answer_or_escalate("what storage backend should I use?", "build app", plan, plan.steps[0],
-                             mem, models=CFG, client=object(), memory_budget_tokens=4000)
+                             mem, models=CFG, client=object(), memory_budget_tokens=4000,
+                             question_class="tech", assumption_level="1")
     assert "SQLite" in captured["prompt"]  # window-aware read delivered the prior decision
     assert res.kind == "self_answer" and "SQLite" in res.answer
 
@@ -487,20 +491,24 @@ def test_dial_threaded_into_answer_prompt(monkeypatch):
     brain = _DialHonoringBrain()
     monkeypatch.setattr(planner_mod, "call_model", brain)
     plan = _one_step_plan()
+    # mechanical @ dial 1 may auto → brain is consulted with the dial directive
     answer_or_escalate("q?", "g", plan, plan.steps[0], PlanMemory(),
-                       models=CFG, client=object(), assumption_level="5")
-    assert "ASSUMPTION DIAL = 5" in brain.prompts[0]  # the dial reaches the prompt
+                       models=CFG, client=object(), assumption_level="1",
+                       question_class="mechanical")
+    assert "ASSUMPTION DIAL = 1" in brain.prompts[0]  # the dial reaches the prompt
 
 
 def test_dial_biases_answer_decision(monkeypatch):
     monkeypatch.setattr(planner_mod, "call_model", _DialHonoringBrain())
     plan = _one_step_plan()
 
+    # tech × dial matrix: permissive auto-answers; cautious firewall-escalates
     low = answer_or_escalate("q?", "g", plan, plan.steps[0], PlanMemory(),
-                             models=CFG, client=object(), assumption_level="1")
+                             models=CFG, client=object(), assumption_level="1",
+                             question_class="tech")
     high = answer_or_escalate("q?", "g", plan, plan.steps[0], PlanMemory(),
-                              models=CFG, client=object(), assumption_level="5")
+                              models=CFG, client=object(), assumption_level="5",
+                              question_class="tech")
 
-    assert low.kind == "self_answer"   # low dial -> the brain assumes
-    assert high.kind == "escalate"     # high dial -> the brain asks the user
-
+    assert low.kind == "self_answer"   # tech @ dial 1 -> may auto
+    assert high.kind == "escalate"     # tech @ dial 5 -> firewall forces escalate

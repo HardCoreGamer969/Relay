@@ -91,6 +91,45 @@ def assumption_directive(level: str) -> str:
     return _ASSUMPTION_DIRECTIVES.get(level, _ASSUMPTION_DIRECTIVES["auto"])
 
 
+# --- hands context dial (B3) ------------------------------------------------
+
+# How much context the hands sees. Default ``needle`` preserves the narrow-hands
+# architecture promise. ``wide`` is debug-only and still never receives brain
+# reasoning (hard invariant).
+HANDS_CONTEXT_MODES = ("needle", "findings", "summary", "wide")
+DEFAULT_HANDS_CONTEXT_MODE = "needle"
+
+
+def resolve_hands_context_mode(override: str | None = None, config: dict | None = None) -> str:
+    """Resolve hands context mode: override > env > config > ``needle``.
+
+    ``RELAY_HANDS_CONTEXT_MODE`` (not ``RELAY_HANDS_CONTEXT``, which sizes the
+    hands *window*). Invalid values fall through.
+    """
+    config = config if config is not None else store.load_config()
+    for candidate in (
+        override,
+        os.environ.get("RELAY_HANDS_CONTEXT_MODE"),
+        (config.get("hands_context_mode") if isinstance(config, dict) else None),
+    ):
+        if candidate is None:
+            continue
+        value = str(candidate).strip().lower()
+        if value in HANDS_CONTEXT_MODES:
+            return value
+    return DEFAULT_HANDS_CONTEXT_MODE
+
+
+def hands_context_mode_summary(mode: str) -> str:
+    """One-line help text for a hands-context mode."""
+    return {
+        "needle": "current step + one-line carry-over only (default; narrow hands)",
+        "findings": "needle + shared findings/directives",
+        "summary": "findings + compact prior-step summaries",
+        "wide": "debug: more prior-step transcript (never brain reasoning; not recommended default)",
+    }.get(mode, hands_context_mode_summary(DEFAULT_HANDS_CONTEXT_MODE))
+
+
 # --- the global step ceiling (v0.0.21) --------------------------------------
 
 # The autonomous loop's one comprehensible top-level safety net: the total number

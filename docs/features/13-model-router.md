@@ -1,6 +1,7 @@
 # 13 — Model Router (brand-defining)
 
 **Phase:** B4 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Shipped:** features-revamp (`relay/router.py` + replan bump/freeze + `route_change` events)  
 **Depends on:** A1 cost envelope, A2 `/why`, B2 escalation classes; `call_model(role, …)` seam exists
 
 ## Blockers
@@ -23,10 +24,11 @@ The seam `call_model(role, …)` already makes provider/model a config concern. 
 
 ## Core behavior (v1)
 
-1. **Static policy** — named routes: e.g. `economy` (Haiku hands, mid brain), `balanced`, `premium` (big brain, mid hands).
-2. **Escalation triggers** — on replan, repeated_step risk, protocol parse failures, or `tech`/`product` escalations: optionally bump **brain** model one tier for the next planning call only.
-3. **De-escalation** — after a clean streak of steps, return to default hands/brain binding.
-4. **Hard invariants** — hands never silently become the brain; router never bypasses cost envelope; every route change is a trace event for `/why`.
+1. **Static policy** — named routes: `economy` | `balanced` (default) | `premium` mapping brain/hands slugs.
+2. **Escalation triggers** — on replan: optionally bump **brain** model one tier for that call only.
+3. **De-escalation** — deferred (v1 keeps bumps call-scoped; no sticky bump state).
+4. **Hard invariants** — hands never silently become the brain; router never bypasses cost envelope; every route change is a `route_change` event for `/why`.
+5. **Freeze** — at ≥80% of the cost envelope, bumps freeze (`bump_frozen`).
 
 ## Non-goals (keep the brand sharp)
 
@@ -36,50 +38,48 @@ The seam `call_model(role, …)` already makes provider/model a config concern. 
 
 ## User surface
 
-- `relay config set-route economy|balanced|premium` + repo `.relay/route.toml`
-- `relay run --route economy`
-- TUI: status shows `brain: slug→slug` when a bump happens; `/route` inspects policy
-- Receipt: $ saved vs “premium-everything” counterfactual estimate (honest about being approximate)
-- `/why` explains the last route change
+- `relay run --route economy` / env `RELAY_ROUTE` / `.relay/route.json`
+- Explicit `RELAY_BRAIN_MODEL` / `RELAY_HANDS_MODEL` / config role models beat the router
+- `/why` includes route change reasons (no new LLM calls)
+- (TUI `/route`, counterfactual $ saved deferred)
 
 ## Hooks into existing code
 
-- `models.py` `call_model(role, …)` — resolution becomes policy-aware per call
-- `config.py` / env precedence — insert route defaults beneath explicit overrides
-- Orchestrator escalation / replan seams — emit `RouteChange` events
-- Telemetry `CallRecord` — store resolved model + reason code (`default`, `replan_bump`, …)
-- Catalog fitness (#8) and duel (#1) later feed route recommendations
+- `relay/router.py` — thin policy layer before/around `call_model` via per-call `ModelConfig`
+- `config.py` / env precedence — route defaults beneath explicit overrides
+- Orchestrator replan seam — emit `route_change` events
+- Explain harness — `route_changes` section
 
-## Policy sketch (draft)
+## Policy sketch (v1 shipped)
 
 | Event | Action |
 |-------|--------|
-| Run start | Bind models from route profile |
-| Replan after hands `<blocked>` | Brain bump one tier for replan call |
-| Repeated malformed tags from hands | Hands bump or protocol nudge; count toward envelope |
-| N successful steps | Revert bumps to route defaults |
-| Cost envelope 80% | Freeze bumps; prefer cheaper bindings |
-| User `/model` override | Pin role; router may not override until unpin |
+| Run start | Bind models from route profile (under explicit overrides) |
+| Replan after hands failure | Brain bump one tier for replan call only |
+| Cost envelope 80% | Freeze bumps; prefer current bindings |
+| User env/config model override | Pin role; router may not override |
 
 ## Acceptance criteria
 
-- [ ] Route profiles resolve brain/hands models deterministically with documented precedence
-- [ ] Mid-run brain bump on replan is visible in TUI + trace + receipt
-- [ ] Explicit env/config model overrides still beat the router
-- [ ] Cost envelope can freeze escalation
-- [ ] `/why` includes route change reasons without new LLM calls
-- [ ] Tests: policy table × events with mocked catalog
+- [x] Route profiles resolve brain/hands models deterministically with documented precedence
+- [x] Mid-run brain bump on replan is visible in trace + `/why`
+- [x] Explicit env/config model overrides still beat the router
+- [x] Cost envelope can freeze escalation
+- [x] `/why` includes route change reasons without new LLM calls
+- [x] Tests: precedence + bump/freeze
 
 ## Open questions
 
-- Tier lists: maintain mapping tables in-repo vs derive from catalog pricing/context?
+- Tier lists: maintain mapping tables in-repo vs derive from catalog pricing/context? **v1: in-repo placeholders.**
 - Should skeptic (#6) use a fixed cheap model always?
-- Counterfactual “$ saved” — ship in v1 or wait for duel data?
+- Counterfactual “$ saved” — **deferred past v1.**
 
 ## Out of scope (v1)
 
 - Fully autonomous per-token bandit optimization across the whole catalog
 - Routing user chat turns (there is no general chat product)
+- Hands bump on malformed tags / clean-streak de-escalation
+- `relay config set-route` CLI helper (env + `--route` + repo file ship)
 
 ## Success metric
 

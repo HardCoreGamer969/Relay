@@ -7,6 +7,9 @@
 > registry (the generic `<tool>` JSON envelope). The full plan covers
 > Phases 0–4 plus a 5-stage TUI split; Phases 2–4 and the TUI stages remain
 > out of scope and are still follow-up work.
+>
+> For **product differentiation** features (not this engineering log), see
+> [`features/MASTER.md`](features/MASTER.md).
 
 ## TL;DR
 

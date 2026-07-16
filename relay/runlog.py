@@ -42,6 +42,7 @@ _FIELDS = (
     "totals",
     "wall_time_s",
     "envelope",
+    "harness",
 )
 
 
@@ -72,6 +73,8 @@ class RunRecord:
     wall_time_s: float = 0.0
     # A1: optional envelope snapshot (ceilings, scope, wasted brain, outcome).
     envelope: dict | None = None
+    # A2: optional harness flight-recorder snapshot (deterministic /why).
+    harness: dict | None = None
 
     def to_json_line(self) -> str:
         """Serialize to a single JSONL line (ASCII-safe, trailing newline)."""
@@ -180,6 +183,7 @@ def build_record(
         totals=totals,
         wall_time_s=round(wall_time_s, 4),
         envelope=envelope_snap,
+        harness=getattr(result, "harness", None),
     )
 
 

@@ -30,6 +30,7 @@ from typing import Any, Callable
 from relay.config import ModelConfig, load_models
 from relay.context import resolve_context_window
 from relay.envelope import CostEnvelope, brain_cost_since
+from relay.explain import explain_events
 from relay.loop import (
     MAX_CONSECUTIVE_PARSE_FAILURES,
     STATUS_COMPLETED,
@@ -289,6 +290,8 @@ class PlannedTaskResult:
     max_cost: float | None = None
     # A1: full envelope state (warnings fired, wasted brain $, scope, …).
     envelope: CostEnvelope | None = None
+    # A2: deterministic harness explanation (zero tokens), built at finalize.
+    harness: dict | None = None
     # The continuous conversation thread (planning turns, mid-run escalations,
     # decisions, the result turn). ``transcript`` is the full live thread (source
     # of truth); ``transcript_compacted`` is its post-execution readable form.
@@ -809,6 +812,16 @@ def run_planned(
         )
         emit("transcript_compacted", "transcript compacted to its readable form",
              {"turns": len(result.transcript_compacted.turns)})
+        # A2: flight recorder from events already emitted (zero new model tokens).
+        result.harness = explain_events(
+            result.events,
+            goal=goal,
+            status=result.status,
+            assumption_level=assumption_level,
+            max_total_steps=max_total_steps,
+            max_cost=result.max_cost,
+            envelope=envelope,
+        ).to_dict()
         return result
 
     # --- Plan phase --------------------------------------------------------

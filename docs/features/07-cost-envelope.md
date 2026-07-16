@@ -132,15 +132,15 @@ Keep **finish current step/turn, then halt** — no mid-`call_model` abort in v1
 
 ## Acceptance criteria
 
-- [ ] Preflight declares envelope (or explicit `cost: unbounded`) before model spend; headless/TTY_COMPATIBLE safe
-- [ ] Post-plan snapshot shows spent/remaining when planned + cost set
-- [ ] Scope `all` vs `execution` behavior covered by tests
-- [ ] Warnings at 50/80/90/99 fire once each per active dimension; custom threshold lists work
-- [ ] Hard stop still finishes current step/turn; statuses + non-zero exit where CLI already does
-- [ ] Receipt: brain vs hands $, wasted brain $ (defined above), $/completed-step when computable, envelope outcome
-- [ ] Solo respects `max_cost` + warnings
-- [ ] TUI: `max_cost` wired; `/cost` shows remaining (panel title “Envelope” when ceilings set); session-only realtime edits affect next check; no config write
-- [ ] Hermetic tests; no live network
+- [x] Preflight declares envelope (or explicit `cost: unbounded`) before model spend; headless/TTY_COMPATIBLE safe
+- [x] Post-plan snapshot shows spent/remaining when planned + cost set
+- [x] Scope `all` vs `execution` behavior covered by tests
+- [x] Warnings at 50/80/90/99 fire once each per active dimension; custom threshold lists work
+- [x] Hard stop still finishes current step/turn; statuses + non-zero exit where CLI already does
+- [x] Receipt: brain vs hands $, wasted brain $ (defined above), $/completed-step when computable, envelope outcome
+- [x] Solo respects `max_cost` + warnings
+- [x] TUI: `max_cost` wired; `/cost` shows remaining (panel title “Envelope” when ceilings set); session-only realtime edits affect next check; no config write
+- [x] Hermetic tests; no live network
 
 ---
 

@@ -1133,6 +1133,8 @@ COMMANDS: list[Command] = [
             run=lambda app: app._open_inline_dialog("queue")),
     Command("cost", "Cost", "Session + per-goal spend; toggle / reset the counter", "ops",
             run=lambda app: app._cmd_cost()),
+    Command("why", "Why", "Harness flight recorder for the last/current run (zero tokens)", "ops",
+            run=lambda app: app._cmd_why()),
     Command("log", "Log", "Export a debug log (.md) to share when reporting an issue", "ops",
             run=lambda app: app._cmd_log()),
     Command("clear", "Clear", "Clear the stream + start a fresh session", "ops",
@@ -2718,6 +2720,34 @@ class RelayTuiApp(App):
             f"[envelope] session ceiling raised to ${env.max_cost:.4f} (not saved to config)"
         )
         self._update_status()
+
+    def _cmd_why(self) -> None:
+        """A2: show the harness flight recorder for the current/last run (zero tokens)."""
+        from relay.explain import HarnessReport, explain_events
+        from relay.debug import redact_secrets
+
+        runner = self._runner
+        outcome = getattr(runner, "outcome", None) if runner is not None else None
+        result = getattr(outcome, "result", None) if outcome is not None else None
+        harness = getattr(result, "harness", None) if result is not None else None
+        if harness is None and result is not None and getattr(result, "events", None):
+            harness = explain_events(
+                result.events,
+                goal=getattr(result, "goal", ""),
+                status=getattr(result, "status", ""),
+                assumption_level=getattr(self, "_assumption_level", None),
+                max_total_steps=getattr(result, "max_total_steps", None),
+                max_cost=getattr(result, "max_cost", None),
+                envelope=getattr(result, "envelope", None),
+            ).to_dict()
+        if not harness:
+            self._write_activity("[why] no harness data yet — run a goal first")
+            return
+        fields = HarnessReport.__dataclass_fields__
+        kwargs = {k: harness[k] for k in fields if k in harness}
+        text = redact_secrets(HarnessReport(**kwargs).to_text())
+        for line in text.splitlines():
+            self._write_activity(line)
 
     def _toggle_cost_counter(self) -> None:
         """Show/hide the status-line per-goal counter (the /cost toggle)."""

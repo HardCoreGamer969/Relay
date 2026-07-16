@@ -496,6 +496,12 @@ def runs(
     root: str = typer.Option(
         ".", "--root", help="Project root whose .relay/runs.jsonl to read."
     ),
+    explain: str = typer.Option(
+        "",
+        "--explain",
+        help="Print the harness flight recorder (/why) for a run_id prefix "
+        "(deterministic, zero model tokens). Example: relay runs --explain 20260716",
+    ),
 ) -> None:
     """Show recently recorded runs from <root>/.relay/runs.jsonl."""
     path = default_log_path(root)
@@ -503,7 +509,36 @@ def runs(
     if not records:
         console.print(f"[yellow]no runs recorded yet[/yellow] (looked in {path})")
         return
+    if explain:
+        needle = explain.strip()
+        match = next((r for r in reversed(records) if r.run_id.startswith(needle)), None)
+        if match is None:
+            console.print(f"[yellow]no run matching id prefix {needle!r}[/yellow]")
+            raise typer.Exit(code=1)
+        harness = match.harness if isinstance(getattr(match, "harness", None), dict) else None
+        if not harness:
+            console.print(
+                f"[yellow]run {match.run_id} has no harness snapshot "
+                f"(older runs before A2)[/yellow]"
+            )
+            raise typer.Exit(code=1)
+        from relay.explain import HarnessReport
+
+        report = HarnessReport(**{k: harness.get(k, getattr(HarnessReport(), k)) for k in HarnessReport().__dict__})
+        # Simpler: render from dict keys we care about
+        console.print(_harness_text_from_dict(harness, run_id=match.run_id))
+        return
     console.print(_runs_table(records, limit))
+
+
+def _harness_text_from_dict(harness: dict, *, run_id: str = "") -> str:
+    from relay.explain import HarnessReport
+
+    fields = HarnessReport.__dataclass_fields__
+    kwargs = {k: harness[k] for k in fields if k in harness}
+    report = HarnessReport(**kwargs)
+    header = f"run_id: {run_id}\n" if run_id else ""
+    return header + report.to_text()
 
 
 def _fmt_ts(iso: str) -> str:

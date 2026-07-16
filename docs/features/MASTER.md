@@ -73,7 +73,7 @@ Work top to bottom. Skip a row only with a written reason in **Notes**.
 | Phase | # | Feature | Doc | Status | Blockers / notes |
 |-------|---|----------|-----|--------|------------------|
 | A1 | 7 | Cost Envelope Contracts | [07](07-cost-envelope.md) | shipped | CostEnvelope + scope/warn + CLI/TUI/solo/runlog |
-| A2 | 12 | Explain the Harness (`/why`) | [12](12-explain-harness.md) | planned | Events exist; no aggregation yet |
+| A2 | 12 | Explain the Harness (`/why`) | [12](12-explain-harness.md) | shipped | `explain_events` + `/why` + `runs --explain` |
 | A3 | 9 | Finding-Driven Memory | [09](09-finding-memory.md) | planned | Stage 1 pools exist; persist TBD |
 | B1 | 2 | Assumption Profiles | [02](02-assumption-profiles.md) | planned | Dial exists; named profiles do not |
 | B2 | 5 | Product-Decision Firewall | [05](05-product-firewall.md) | planned | Escalations exist; no typed taxonomy |

@@ -1,4 +1,6 @@
 # 01 — Call-Class Routing
+**Shipped:** router-v2 thin v1 (see PROGRESS.md)
+
 
 **Phase:** E2 · **Status:** [MASTER](MASTER.md) only  
 **Depends on:** E1 route contracts; `CallRecord.purpose` where present

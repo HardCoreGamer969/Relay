@@ -1,4 +1,6 @@
 # 12 — Orchestra × Router
+**Shipped:** router-v2 thin v1 (see PROGRESS.md)
+
 
 **Phase:** E10 · **Status:** [MASTER](MASTER.md) only  
 **Depends on:** D4 orchestra; E2 call-class

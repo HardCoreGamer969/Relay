@@ -1137,6 +1137,8 @@ COMMANDS: list[Command] = [
             run=lambda app: app._cmd_cost()),
     Command("why", "Why", "Harness flight recorder for the last/current run (zero tokens)", "ops",
             run=lambda app: app._cmd_why()),
+    Command("route", "Route", "Show the spend-broker route contract / session pin", "ops",
+            run=lambda app: app._cmd_route()),
     Command("memory", "Memory", "List / pin / forget durable shared findings", "ops",
             run=lambda app: app._cmd_memory()),
     Command("log", "Log", "Export a debug log (.md) to share when reporting an issue", "ops",
@@ -2781,6 +2783,37 @@ class RelayTuiApp(App):
         text = redact_secrets(HarnessReport(**kwargs).to_text())
         for line in text.splitlines():
             self._write_activity(line)
+
+    def _cmd_route(self) -> None:
+        """E3: spend-broker cockpit — active route, pins, freeze state."""
+        from relay.router import ModelRouter, format_broker_line
+
+        root = self._session.working_dir
+        router = getattr(self, "_model_router", None)
+        if router is None:
+            router = ModelRouter.from_resolve(None, root=root)
+            self._model_router = router
+        envelope = None
+        ledger = None
+        runner = self._runner
+        outcome = getattr(runner, "outcome", None) if runner is not None else None
+        result = getattr(outcome, "result", None) if outcome is not None else None
+        if result is not None:
+            envelope = getattr(result, "envelope", None)
+            ledger = getattr(result, "ledger", None)
+        line = format_broker_line(router, envelope, ledger)
+        self._write_activity(f"[route] {line}")
+        c = router.contract
+        if c is not None:
+            self._write_activity(
+                f"[route] brain={c.brain} hands={c.hands} "
+                f"provider={c.provider_sort} freeze@{int(c.bump_freeze_fraction * 100)}% "
+                f"frozen={router.bumps_frozen} phase={router.phase}"
+            )
+            self._write_activity(
+                f"[route] /model is an explicit override (beats the router). "
+                f"Pins: {c.pins or '{}'}"
+            )
 
     def _cmd_memory(self) -> None:
         """A3: list durable shared memory; offer pin/forget for the first entries."""

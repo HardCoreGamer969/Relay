@@ -1,4 +1,6 @@
 # 07 — Provider Micro-Routing
+**Shipped:** router-v2 thin v1 (see PROGRESS.md)
+
 
 **Phase:** E7 · **Status:** [MASTER](MASTER.md) only  
 **Depends on:** E2 call-class; OpenRouter provider extras

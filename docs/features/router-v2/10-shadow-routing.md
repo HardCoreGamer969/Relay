@@ -1,4 +1,6 @@
 # 10 — Shadow Routing
+**Shipped:** router-v2 thin v1 (see PROGRESS.md)
+
 
 **Phase:** E12 · **Status:** [MASTER](MASTER.md) only  
 **Depends on:** E2; envelope budget

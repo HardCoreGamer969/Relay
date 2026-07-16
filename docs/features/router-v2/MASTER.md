@@ -38,18 +38,18 @@ repo-learned routes. Treat provider `:floor` as a sub-layer under Relay’s poli
 
 | Phase | # | Feature | Doc | Status | Notes |
 |-------|---|----------|-----|--------|-------|
-| E1 | 8 | Route contracts | [08-route-contracts.md](08-route-contracts.md) | planned | Foundation policy artifact |
-| E2 | 1 | Call-class routing | [01-call-class-routing.md](01-call-class-routing.md) | planned | Needs E1 |
-| E3 | 3 | Envelope-as-UX | [03-envelope-ux.md](03-envelope-ux.md) | planned | Broker status line |
-| E4 | 4 | Counterfactual receipt | [04-counterfactual-receipt.md](04-counterfactual-receipt.md) | planned | $ saved vs premium |
-| E5 | 9 | Explain the spend | [09-explain-spend.md](09-explain-spend.md) | planned | Extends `/why` |
-| E6 | 6 | Cheap skeptic assassin | [06-cheap-skeptic.md](06-cheap-skeptic.md) | planned | Fixed cheap skeptic model |
-| E7 | 7 | Provider micro-routing | [07-provider-micro.md](07-provider-micro.md) | planned | `:floor` / max_price under policy |
-| E8 | 11 | Phase-aware routes | [11-phase-aware.md](11-phase-aware.md) | planned | Plan vs execute vs review |
-| E9 | 2 | Fitness-gated hands | [02-fitness-gated-hands.md](02-fitness-gated-hands.md) | planned | Uses probe fitness |
-| E10 | 12 | Orchestra × router | [12-orchestra-router.md](12-orchestra-router.md) | planned | Cheap hands, hot conductor |
-| E11 | 5 | Repo-learned route | [05-repo-learned-route.md](05-repo-learned-route.md) | planned | From duels/runlog |
-| E12 | 10 | Shadow routing | [10-shadow-routing.md](10-shadow-routing.md) | planned | Opt-in learn mode |
+| E1 | 8 | Route contracts | [08-route-contracts.md](08-route-contracts.md) | shipped | Foundation policy artifact |
+| E2 | 1 | Call-class routing | [01-call-class-routing.md](01-call-class-routing.md) | shipped | Needs E1 |
+| E3 | 3 | Envelope-as-UX | [03-envelope-ux.md](03-envelope-ux.md) | shipped | Broker status line |
+| E4 | 4 | Counterfactual receipt | [04-counterfactual-receipt.md](04-counterfactual-receipt.md) | shipped | $ saved vs premium |
+| E5 | 9 | Explain the spend | [09-explain-spend.md](09-explain-spend.md) | shipped | Extends `/why` |
+| E6 | 6 | Cheap skeptic assassin | [06-cheap-skeptic.md](06-cheap-skeptic.md) | shipped | Fixed cheap skeptic model |
+| E7 | 7 | Provider micro-routing | [07-provider-micro.md](07-provider-micro.md) | shipped | `:floor` / max_price under policy |
+| E8 | 11 | Phase-aware routes | [11-phase-aware.md](11-phase-aware.md) | shipped | Plan vs execute vs review |
+| E9 | 2 | Fitness-gated hands | [02-fitness-gated-hands.md](02-fitness-gated-hands.md) | shipped | Uses probe fitness |
+| E10 | 12 | Orchestra × router | [12-orchestra-router.md](12-orchestra-router.md) | shipped | Cheap hands, hot conductor |
+| E11 | 5 | Repo-learned route | [05-repo-learned-route.md](05-repo-learned-route.md) | shipped | From duels/runlog |
+| E12 | 10 | Shadow routing | [10-shadow-routing.md](10-shadow-routing.md) | shipped | Opt-in learn mode |
 
 ```text
 E1 Route contracts ──► E2 Call-class ──► E8 Phase-aware ──┐

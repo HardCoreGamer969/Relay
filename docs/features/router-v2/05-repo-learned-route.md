@@ -1,4 +1,6 @@
 # 05 — Repo-Learned Route
+**Shipped:** router-v2 thin v1 (see PROGRESS.md)
+
 
 **Phase:** E11 · **Status:** [MASTER](MASTER.md) only  
 **Depends on:** C1 duels; runlog; E1 contracts

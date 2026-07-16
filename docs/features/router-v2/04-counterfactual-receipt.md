@@ -1,4 +1,6 @@
 # 04 — Counterfactual Receipt
+**Shipped:** router-v2 thin v1 (see PROGRESS.md)
+
 
 **Phase:** E4 · **Status:** [MASTER](MASTER.md) only  
 **Depends on:** A1 receipt; catalog pricing when available

@@ -268,6 +268,7 @@ def call_model(
     ledger: Ledger | None = None,
     client: Any | None = None,
     purpose: str | None = None,
+    route_contract: Any | None = None,
     **kwargs: Any,
 ) -> ModelResult:
     """Call the model bound to ``role`` through its provider and record telemetry.
@@ -282,6 +283,8 @@ def call_model(
             used as-is, but the provider still drives request/cost handling.
         purpose: Optional attribution tag (e.g. ``"skeptic"``) stored on the
             :class:`~relay.telemetry.CallRecord` for separate cost accounting.
+        route_contract: Optional router v2 contract; when set, OpenRouter provider
+            micro-routing extras (``:floor`` / sort) are applied under policy.
         **kwargs: Forwarded to ``chat.completions.create`` (e.g. temperature).
     """
     models = models or load_models()
@@ -291,6 +294,19 @@ def call_model(
     client = client or build_client(provider)
 
     extra_body = dict(kwargs.pop("extra_body", {}) or {})
+    if route_contract is not None:
+        from relay.router import apply_provider_suffix, provider_routing_extras
+
+        for key, val in provider_routing_extras(
+            route_contract, provider=provider, purpose=purpose
+        ).items():
+            if key == "provider" and isinstance(val, dict):
+                existing = dict(extra_body.get("provider") or {})
+                existing.update(val)
+                extra_body["provider"] = existing
+            else:
+                extra_body.setdefault(key, val)
+        model = apply_provider_suffix(model, route_contract, provider=provider)
     if provider == DEFAULT_PROVIDER:
         # OpenRouter: ask for the actual per-generation cost in ``usage``, while
         # preserving any caller-provided extra_body / usage options. (Unchanged.)

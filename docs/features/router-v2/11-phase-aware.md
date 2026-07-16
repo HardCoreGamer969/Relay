@@ -1,4 +1,6 @@
 # 11 — Phase-Aware Routes
+**Shipped:** router-v2 thin v1 (see PROGRESS.md)
+
 
 **Phase:** E8 · **Status:** [MASTER](MASTER.md) only  
 **Depends on:** E1–E2; orchestrator phases (planning/executing)

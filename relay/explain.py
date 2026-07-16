@@ -25,6 +25,7 @@ class HarnessReport:
     escalations: list[str] = field(default_factory=list)
     envelope_warnings: list[str] = field(default_factory=list)
     route_changes: list[str] = field(default_factory=list)
+    spend: str = ""
     terminal_reason: str | None = None
     step_summaries: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -65,6 +66,9 @@ class HarnessReport:
             lines.append("## Route changes")
             for r in self.route_changes:
                 lines.append(f"- {r}")
+        if self.spend:
+            lines.append("")
+            lines.append(self.spend)
         if self.escalations:
             lines.append("")
             lines.append("## Escalations")
@@ -219,6 +223,19 @@ def explain_events(
     if not report.brain_engagements:
         report.notes.append("No brain engagement events were recorded on this run.")
     report.notes.append("Raw model prompts are never included in /why exports.")
+    # E5: spend timeline from route_change events (ledger optional — often absent here).
+    try:
+        from relay.router import explain_spend
+
+        report.spend = explain_spend(
+            [
+                {"kind": "route_change", "message": m, "payload": {}}
+                for m in report.route_changes
+            ],
+            None,
+        )
+    except Exception:  # noqa: BLE001 — /why must never fail
+        report.spend = ""
     return report
 
 

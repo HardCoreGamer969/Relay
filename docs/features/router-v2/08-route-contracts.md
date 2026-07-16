@@ -1,4 +1,6 @@
 # 08 — Route Contracts
+**Shipped:** router-v2 thin v1 (see PROGRESS.md)
+
 
 **Phase:** E1 · **Status:** [MASTER](MASTER.md) only  
 **Depends on:** B4 router v1 (`relay/router.py`)

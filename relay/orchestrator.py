@@ -488,6 +488,7 @@ def _run_executor_step(
     wide_transcript: str = "",
     path_lease: PathLease | None = None,
     lease_owner: str | None = None,
+    model_router: Any | None = None,
 ) -> _StepOutcome:
     """Run the hands in a fresh, narrow context until done/blocked/budget/question.
 
@@ -548,7 +549,30 @@ def _run_executor_step(
                 False, cancelled=True, failure_reason="cancelled by user",
                 calls=calls, transcript=transcript, before_snapshots=before_snaps,
             )
-        reply = call_model(hands_role, messages, models=models, ledger=ledger, client=client).text
+        call_models = models
+        route_contract = None
+        if model_router is not None and models is not None:
+            call_models, route_change = model_router.models_for_purpose(
+                models, "hands_step", role=hands_role
+            )
+            route_contract = getattr(model_router, "contract", None)
+            if route_change is not None and emit is not None:
+                emit(
+                    EVENT_ROUTE_CHANGE,
+                    f"route {route_change.route}: {route_change.role} "
+                    f"{route_change.from_model}→{route_change.to_model} "
+                    f"({route_change.reason})",
+                    route_change.as_payload(),
+                )
+        reply = call_model(
+            hands_role,
+            messages,
+            models=call_models,
+            ledger=ledger,
+            client=client,
+            purpose="hands_step",
+            route_contract=route_contract,
+        ).text
         calls += 1
         messages.append({"role": "assistant", "content": reply})
         parsed = parse(reply)
@@ -557,6 +581,15 @@ def _run_executor_step(
             if ledger is not None:
                 ledger.record_parse_failure()
                 consecutive_parse_failures += 1
+            if model_router is not None and models is not None:
+                fitness = model_router.note_parse_failure(models)
+                if fitness is not None and emit is not None:
+                    emit(
+                        EVENT_ROUTE_CHANGE,
+                        f"route {fitness.route}: {fitness.role} "
+                        f"{fitness.from_model}→{fitness.to_model} ({fitness.reason})",
+                        fitness.as_payload(),
+                    )
             if emit is not None:
                 emit("exec_parse_failure", "no valid action", {"snippet": " ".join(reply.split())[:200]})
             if consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
@@ -567,6 +600,15 @@ def _run_executor_step(
             messages.append({"role": "user", "content": _specific_parse_failure_nudge(reply)})
             continue
         consecutive_parse_failures = 0
+        if model_router is not None:
+            decay = model_router.note_hands_success()
+            if decay is not None and emit is not None:
+                emit(
+                    EVENT_ROUTE_CHANGE,
+                    f"route {decay.route}: {decay.role} "
+                    f"{decay.from_model}→{decay.to_model} ({decay.reason})",
+                    decay.as_payload(),
+                )
 
         observations: list[str] = []
         # Surface findings FIRST (v0.0.29), in a pre-pass independent of where they sit
@@ -955,6 +997,8 @@ def run_planned(
             f"route {change.route}: {change.role} {change.from_model}→{change.to_model} ({change.reason})",
             change.as_payload(),
         )
+    if model_router is not None:
+        model_router.set_phase("planning")
     emit(
         "hands_context_mode",
         f"hands context mode: {context_mode}",
@@ -1050,6 +1094,7 @@ def run_planned(
                 brain_role=brain_role,
                 assumption_level=assumption_level,
                 on_event=lambda kind, message, payload: emit(kind, message, payload),
+                model_router=model_router,
             )
 
         review = _run_skeptic(plan)
@@ -1241,6 +1286,7 @@ def run_planned(
             cancel_check=cancel_check, reads=reads, on_finding=record_finding,
             shared_context=hands_shared(), hands_context_mode=context_mode,
             step_summaries=summaries, wide_transcript=wide_tx,
+            model_router=model_router,
         )
         executor_calls += outcome.calls
         followups_used = 0
@@ -1311,12 +1357,21 @@ def run_planned(
                 extra_instruction=review.followup, cancel_check=cancel_check, reads=reads,
                 on_finding=record_finding, shared_context=hands_shared(),
                 hands_context_mode=context_mode, step_summaries=summaries, wide_transcript=wide_tx,
+                model_router=model_router,
             )
             executor_calls += outcome.calls
 
     # --- Execute phase -----------------------------------------------------
     # A1: for scope=execution, planning spend is excluded from the cost ceiling.
     envelope.mark_execution_start(ledger)
+    if model_router is not None:
+        phase_change = model_router.set_phase("execution")
+        if phase_change is not None:
+            emit(
+                EVENT_ROUTE_CHANGE,
+                f"route {phase_change.route}: phase→{phase_change.phase}",
+                phase_change.as_payload(),
+            )
 
     def emit_envelope_warnings() -> None:
         # Re-read live ceilings (TUI session edits may have changed them).
@@ -1436,6 +1491,7 @@ def run_planned(
                     cancel_check=cancel_check, reads={}, on_finding=record_finding,
                     shared_context="", hands_context_mode="needle",
                     path_lease=lease, lease_owner=role,
+                    model_router=model_router,
                 )
                 return WorkerResult(
                     step_index=step.index,

@@ -149,11 +149,13 @@ def review_plan_adversarially(
     brain_role: str = "brain",
     assumption_level: str = "auto",
     on_event: EventSink | None = None,
+    model_router: Any | None = None,
 ) -> SkepticReview:
     """Run a bounded read-only skeptic pass over ``plan``.
 
     Uses :func:`relay.investigation.investigate` (no edit/bash). Calls are
     recorded with ``purpose="skeptic"`` for separate cost attribution.
+    When ``model_router`` is set, the skeptic call-class (cheap) is applied (E6).
     """
     steps_block = "\n".join(
         f"{i}. {s.instruction}" for i, s in enumerate(plan.steps, 1)
@@ -168,6 +170,20 @@ def review_plan_adversarially(
     )
     system = _SKEPTIC_SYSTEM
 
+    # E6: prefer cheap skeptic call-class when a router is available.
+    skeptic_models = models
+    route_contract = None
+    if model_router is not None and models is not None:
+        skeptic_models, change = model_router.skeptic_models(models)
+        route_contract = getattr(model_router, "contract", None)
+        if change is not None and on_event is not None:
+            on_event(
+                "route_change",
+                f"route {change.route}: {change.role} "
+                f"{change.from_model}→{change.to_model} ({change.reason})",
+                change.as_payload(),
+            )
+
     def _call(role: str, messages, *, models=None, ledger=None, client=None, **kwargs):
         return call_model(
             role,
@@ -176,6 +192,7 @@ def review_plan_adversarially(
             ledger=ledger,
             client=client,
             purpose=SKEPTIC_PURPOSE,
+            route_contract=route_contract,
             **kwargs,
         )
 
@@ -188,7 +205,7 @@ def review_plan_adversarially(
         budget=max_skeptic_steps,
         tools=tools,
         brain_role=brain_role,
-        models=models,
+        models=skeptic_models,
         ledger=ledger,
         client=client,
         model_call=_call,

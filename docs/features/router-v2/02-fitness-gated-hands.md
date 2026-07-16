@@ -1,4 +1,6 @@
 # 02 — Fitness-Gated Hands
+**Shipped:** router-v2 thin v1 (see PROGRESS.md)
+
 
 **Phase:** E9 · **Status:** [MASTER](MASTER.md) only  
 **Depends on:** C2 probe fitness concepts; parse_failures telemetry

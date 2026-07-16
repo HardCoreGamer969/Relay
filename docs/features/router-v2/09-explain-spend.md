@@ -1,4 +1,6 @@
 # 09 — Explain the Spend
+**Shipped:** router-v2 thin v1 (see PROGRESS.md)
+
 
 **Phase:** E5 · **Status:** [MASTER](MASTER.md) only  
 **Depends on:** A2 `/why`; route_change events; E4 optional

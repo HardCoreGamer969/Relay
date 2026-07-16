@@ -36,7 +36,7 @@ from relay.config import (
 from relay.context import resolve_context_window
 from relay.envelope import CostEnvelope
 from relay.profiles import resolve_profile
-from relay.router import ModelRouter
+from relay.router import ModelRouter, format_broker_line
 from relay.providers import (
     DEFAULT_PROVIDER,
     DISCOVERY_LIST,
@@ -303,6 +303,18 @@ def run(
         "--no-checkpoint",
         help="Disable automatic step-boundary checkpoints under .relay/checkpoints/.",
     ),
+    shadow_route: bool | None = typer.Option(
+        None,
+        "--shadow-route/--no-shadow-route",
+        help="Log cheaper call-class choices to .relay/shadow.jsonl without dual "
+        "API calls (E12). Default: RELAY_SHADOW_ROUTE (off).",
+    ),
+    counterfactual: str = typer.Option(
+        "premium",
+        "--counterfactual",
+        help="Baseline route for end-of-run counterfactual receipt (E4). "
+        "Pass empty string to disable. Default: premium when route ≠ premium.",
+    ),
 ) -> None:
     """Run the agent against a goal.
 
@@ -340,20 +352,23 @@ def run(
         warn_thresholds=warn_thresholds,
     )
     context_mode = resolve_hands_context_mode(hands_context or None)
-    router = ModelRouter.from_resolve(route or None, root=root)
+    router = ModelRouter.from_resolve(route or None, root=root, shadow=shadow_route)
     cfg, _route_changes = router.bind(cfg)
     from relay.skeptic import resolve_skeptic
     from relay.diff_iface import resolve_confirm_diff, resolve_commit_per_step
     skeptic_on = resolve_skeptic(skeptic)
     confirm_diff_on = resolve_confirm_diff(confirm_diff)
     commit_per_step_on = resolve_commit_per_step(commit_per_step)
+    broker = format_broker_line(
+        router, envelope, None, orchestra_workers=orchestra
+    )
     console.print(
         f"[dim]profile={active_profile.name} ({active_profile.description}) · "
-        f"dial={dial} · hands-context={context_mode} · route={router.route.name}"
+        f"dial={dial} · hands-context={context_mode} · {broker}"
         f"{' · skeptic' if skeptic_on else ''}"
         f"{' · confirm-diff' if confirm_diff_on else ''}"
         f"{' · commit-per-step' if commit_per_step_on else ''}"
-        f"{f' · orchestra={orchestra}' if orchestra > 1 else ''}[/dim]"
+        f"{' · shadow' if router.shadow_enabled else ''}[/dim]"
     )
     start = time.perf_counter()
     if solo:
@@ -380,7 +395,13 @@ def run(
     wall_time_s = time.perf_counter() - start
 
     _print_telemetry(ledger)
-    _print_receipt(envelope, ledger, status=getattr(result, "status", ""))
+    cf_baseline = (counterfactual or "").strip().lower()
+    if cf_baseline and router.route.name == cf_baseline:
+        cf_baseline = ""  # skip when already on the baseline route
+    _print_receipt(
+        envelope, ledger, status=getattr(result, "status", ""),
+        counterfactual_baseline=cf_baseline or None,
+    )
     # A3: persist shared findings/directives for the next run in this project.
     try:
         from relay.durable_memory import capture_bus_shared
@@ -461,16 +482,20 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
     bash_policy = "auto-approve" if auto_approve else "interactive approval"
     env = envelope or CostEnvelope(max_cost=max_cost, max_steps=max_total_steps)
     ctx = hands_context_mode or resolve_hands_context_mode()
-    route_name = model_router.route.name if model_router is not None else "-"
+    if model_router is not None:
+        broker = format_broker_line(
+            model_router, env, None, orchestra_workers=orchestra_workers
+        )
+    else:
+        broker = "route=-"
     console.print(
         Panel(
             f"[bold]{goal}[/bold]\nroot={root}\nbrain={cfg.brain}\nhands={cfg.hands}\n"
             f"bash policy={bash_policy}  supervision={'on' if supervise else 'off'}  "
-            f"assume={dial}  hands-context={ctx}  route={route_name}"
+            f"assume={dial}  hands-context={ctx}\n{broker}"
             f"{'  skeptic=on' if skeptic else ''}"
             f"{'  confirm-diff' if confirm_diff else ''}"
-            f"{'  commit-per-step' if commit_per_step else ''}"
-            f"{f'  orchestra={orchestra_workers}' if orchestra_workers > 1 else ''}\n"
+            f"{'  commit-per-step' if commit_per_step else ''}\n"
             f"{env.preflight_text()}",
             title="Relay run (brain + hands)",
             border_style="cyan",
@@ -737,6 +762,20 @@ def runs(
         report = HarnessReport(**{k: harness.get(k, getattr(HarnessReport(), k)) for k in HarnessReport().__dict__})
         # Simpler: render from dict keys we care about
         console.print(_harness_text_from_dict(harness, run_id=match.run_id))
+        # E5: append spend section when ledger totals / route_changes exist.
+        from relay.router import explain_spend
+
+        spend = explain_spend(
+            [
+                {"kind": "route_change", "message": line, "payload": {}}
+                for line in (harness.get("route_changes") or [])
+            ],
+            None,
+        )
+        if harness.get("spend"):
+            console.print(harness["spend"])
+        elif "route_change" in spend or harness.get("route_changes"):
+            console.print(spend)
         return
     console.print(_runs_table(records, limit))
 
@@ -1757,13 +1796,86 @@ def _print_telemetry(ledger: Ledger) -> None:
     console.print(f"[{style}]parse failures: {pf}[/{style}]")
 
 
-def _print_receipt(envelope: CostEnvelope, ledger: Ledger, *, status: str) -> None:
+def _print_receipt(
+    envelope: CostEnvelope,
+    ledger: Ledger,
+    *,
+    status: str,
+    counterfactual_baseline: str | None = "premium",
+) -> None:
     """Print the A1 envelope receipt under the telemetry table."""
     for line in envelope.receipt_lines(ledger, status=status or ""):
         if line == "Receipt":
             console.print(f"[bold]{line}[/bold]")
         else:
             console.print(f"[dim]{line}[/dim]")
+    if counterfactual_baseline:
+        from relay.router import estimate_counterfactual_cost
+
+        cf = estimate_counterfactual_cost(ledger, baseline_route=counterfactual_baseline)
+        for line in cf.get("lines") or []:
+            console.print(f"[dim]  {line}[/dim]")
+
+
+# --- Route contracts (E1+) ----------------------------------------------------
+
+route_app = typer.Typer(
+    help="Inspect and set the repo route contract (.relay/route.json).",
+    no_args_is_help=True,
+)
+app.add_typer(route_app, name="route")
+
+
+@route_app.command("show")
+def route_show(
+    root: str = typer.Option(".", "--root", help="Project root."),
+) -> None:
+    """Print the resolved route contract (CLI/env/repo/defaults)."""
+    from relay.router import resolve_route_contract
+
+    contract = resolve_route_contract(None, root=root)
+    console.print_json(data=contract.to_dict())
+    if contract.unknown_keys:
+        console.print(
+            f"[yellow]unknown keys ignored: {', '.join(contract.unknown_keys)}[/yellow]"
+        )
+
+
+@route_app.command("set")
+def route_set(
+    name: str = typer.Argument(..., help="Route name: economy | balanced | premium."),
+    root: str = typer.Option(".", "--root", help="Project root."),
+) -> None:
+    """Write a builtin route contract to .relay/route.json."""
+    from relay.router import ROUTES, builtin_contract, save_route_contract
+
+    key = name.strip().lower()
+    if key not in ROUTES:
+        console.print(f"[red]unknown route {name!r}; choose from {', '.join(ROUTES)}[/red]")
+        raise typer.Exit(code=1)
+    path = save_route_contract(root, builtin_contract(key))  # type: ignore[arg-type]
+    console.print(f"[green]wrote {path}[/green] (route={key})")
+
+
+@route_app.command("recommend")
+def route_recommend(
+    root: str = typer.Option(".", "--root", help="Project root."),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Write the recommendation to .relay/route.json (never silent).",
+    ),
+) -> None:
+    """Suggest a route from duel scorecards / successful runlog (E11)."""
+    from relay.router import builtin_contract, recommend_route, save_route_contract
+
+    rec = recommend_route(root)
+    console.print(f"[bold]recommended route:[/bold] {rec['route']}")
+    for line in rec.get("evidence") or []:
+        console.print(f"  [dim]{line}[/dim]")
+    if apply:
+        path = save_route_contract(root, builtin_contract(rec["route"]))  # type: ignore[arg-type]
+        console.print(f"[green]applied → {path}[/green]")
 
 
 if __name__ == "__main__":

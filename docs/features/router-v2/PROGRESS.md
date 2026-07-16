@@ -28,6 +28,7 @@ Do not delete history; mark corrections with a new dated note.
 ### E1 — Route contracts (2026-07-16)
 
 - Status: shipped
+- Commit: f491cf7
 - Tests: `tests/test_router_v2.py` (E1 block) + v1 `tests/test_router.py`
 - Review: pass
 - Shipped:

@@ -24,6 +24,8 @@ class CallRecord:
     # OpenRouter's actual per-generation cost. None when not returned — pricing
     # must never crash a run.
     cost_usd: float | None = None
+    # Optional purpose tag (e.g. ``skeptic``) for cost attribution beyond role.
+    purpose: str | None = None
 
     @property
     def total_tokens(self) -> int:

@@ -78,9 +78,9 @@ Work top to bottom. Skip a row only with a written reason in **Notes**.
 | B2 | 5 | Product-Decision Firewall | [05](05-product-firewall.md) | shipped | class= + dial×class matrix; unlabeled→product |
 | B3 | 4 | Hands Context Dial | [04](04-context-dial.md) | shipped | needle/findings/summary/wide; never brain pool |
 | B4 | **13** | **Model Router** (brand) | [13](13-model-router.md) | shipped | economy/balanced/premium + replan bump/freeze |
-| C1 | 1 | Model Bake-Off (`relay duel`) | [01](01-bake-off.md) | planned | Needs A1 receipts; `provider` on CallRecord → [REVAMP §4](../REVAMP.md) |
-| C2 | 8 | Protocol Fitness Lab | [08](08-protocol-lab.md) | planned | Pairs with C1 |
-| D1 | 6 | Adversarial Reviewer | [06](06-adversarial-reviewer.md) | planned | Investigation loop exists; reviewer fail-open → REVAMP |
+| C1 | 1 | Model Bake-Off (`relay duel`) | [01](01-bake-off.md) | shipped | Sequential same-tree + git restore; `.relay/duels/` scorecards |
+| C2 | 8 | Protocol Fitness Lab | [08](08-protocol-lab.md) | shipped | Offline fixture grading; exit 0/2/3 fit/weak/unfit |
+| D1 | 6 | Adversarial Reviewer | [06](06-adversarial-reviewer.md) | shipped | `--skeptic` plan pass; purpose=skeptic cost; block/replan/dismiss |
 | D2 | 3 | Plan Fork / Time-Travel | [03](03-plan-fork.md) | planned | Needs `RunState` / resume → [REVAMP Phase 2](../REVAMP.md) |
 | D3 | 11 | Diff-as-Interface | [11](11-diff-interface.md) | planned | Stronger with D2 checkpoints |
 | D4 | 10 | Orchestra Mode | [10](10-orchestra.md) | planned | Needs A3, B2, stable step boundaries |

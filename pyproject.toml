@@ -34,6 +34,9 @@ relay = "relay.cli:app"
 [tool.hatch.build.targets.wheel]
 packages = ["relay"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"relay/probes" = "relay/probes"
+
 [tool.hatch.version]
 # Source of truth: `relay/__init__.py:__version__`. The wheel (and any hatch-driven
 # artifact) reads its version from here, so a forgotten `pyproject.toml` bump can

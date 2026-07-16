@@ -84,6 +84,8 @@ STATUS_CANCELLED = "cancelled"
 # the per-step / per-run call-count ceilings. Shown to the user with the
 # spent-and-limit pair so they can decide to raise and resume.
 STATUS_MAX_COST = "max_cost"
+# D1: adversarial skeptic blocked continue (unresolved objections).
+STATUS_SKEPTIC_BLOCKED = "skeptic_blocked"
 
 _EXECUTOR_SYSTEM_PROMPT_TEMPLATE = """\
 You are the EXECUTOR (the "hands") of Relay. You carry out ONE step of a larger
@@ -671,6 +673,12 @@ def friendly_terminal_message(status: str, *, max_total_steps: int | None = None
             "RELAY_MAX_COST, or the max_cost field in config.json), then re-run -- or "
             "split the goal and review the partial work that already paid for itself."
         )
+    if status == STATUS_SKEPTIC_BLOCKED:
+        return (
+            "The adversarial skeptic blocked the plan on unresolved objections. "
+            "Re-run with a revised goal, dismiss via the prompt when offered, or "
+            "disable --skeptic if you intentionally want to proceed without review."
+        )
     return None
 
 
@@ -765,6 +773,8 @@ def run_planned(
     bash_timeout_s: float | None = 120.0,
     hands_context_mode: str | None = None,
     model_router: ModelRouter | None = None,
+    skeptic: bool = False,
+    max_skeptic_steps: int = 4,
 ) -> PlannedTaskResult:
     """Drive the autonomous two-role planner/executor loop.
 
@@ -802,6 +812,11 @@ def run_planned(
     the in-flight request is never torn down (the money-leak guard). When it returns
     True the run ends with the clean terminal status ``cancelled`` (result turn +
     compaction still happen, like every other terminal path).
+
+    ``skeptic`` (D1) runs an optional read-only adversarial pass on the plan before
+    execution. Unresolved objections force one replan attempt (when revisions remain)
+    or a ``user_decision`` dismiss; otherwise the run ends ``skeptic_blocked``.
+    Skeptic model calls are tagged ``purpose="skeptic"`` on the ledger.
 
     Note: a single step's executor ceiling is ``max_executor_steps *
     (1 + max_followups_per_step)`` (each supervised follow-up re-runs the
@@ -942,6 +957,103 @@ def run_planned(
     escalations = 0
     revisions = 0
     executor_calls = 0
+
+    # --- D1 adversarial skeptic (plan-level, v1) -----------------------------
+    if skeptic:
+        from relay.skeptic import review_plan_adversarially, skeptic_cost_usd
+
+        def _run_skeptic(current: Plan):
+            return review_plan_adversarially(
+                goal,
+                current,
+                tools=tools,
+                max_skeptic_steps=max_skeptic_steps,
+                models=models,
+                ledger=ledger,
+                client=client,
+                brain_role=brain_role,
+                assumption_level=assumption_level,
+                on_event=lambda kind, message, payload: emit(kind, message, payload),
+            )
+
+        review = _run_skeptic(plan)
+        emit(
+            "skeptic_review",
+            f"skeptic: {review.verdict}"
+            + (f" ({len(review.objections)} objection(s))" if review.objections else ""),
+            {
+                "verdict": review.verdict,
+                "objections": list(review.objections),
+                "reason": review.reason,
+                "skeptic_cost_usd": skeptic_cost_usd(ledger),
+            },
+        )
+        if review.blocked:
+            resolved = False
+            # Prefer one forced replan incorporating objections (when budget remains).
+            if revisions < max_plan_revisions:
+                reason = "skeptic objections:\n- " + "\n- ".join(review.objections)
+                revised = evolve_plan(
+                    goal, plan, reason, memory, models=models, ledger=ledger,
+                    client=client, memory_budget_tokens=mem_budget, brain_role=brain_role,
+                )
+                revisions += 1
+                result.revisions = revisions
+                if revised is not None and revised.steps:
+                    # Preserve no completed steps yet (pre-execution); replace plan.
+                    plan = revised
+                    result.plan = plan
+                    emit(
+                        "skeptic_replan",
+                        f"replanned after skeptic ({len(plan.steps)} step(s))",
+                        {"steps": [s.instruction for s in plan.steps]},
+                    )
+                    review2 = _run_skeptic(plan)
+                    emit(
+                        "skeptic_review",
+                        f"skeptic (after replan): {review2.verdict}",
+                        {
+                            "verdict": review2.verdict,
+                            "objections": list(review2.objections),
+                            "reason": review2.reason,
+                            "skeptic_cost_usd": skeptic_cost_usd(ledger),
+                        },
+                    )
+                    if not review2.blocked:
+                        resolved = True
+                    else:
+                        review = review2
+                else:
+                    emit("skeptic_replan_failed", "evolve_plan returned no usable plan", {})
+
+            if not resolved and user_decision is not None:
+                prompt = (
+                    "Skeptic objections (reply 'dismiss' to proceed anyway, "
+                    "or anything else to abort):\n- "
+                    + "\n- ".join(review.objections)
+                )
+                answer = (user_decision(prompt) or "").strip().lower()
+                if answer in ("dismiss", "proceed", "continue", "ignore", "y", "yes"):
+                    emit(
+                        "skeptic_dismissed",
+                        "user dismissed skeptic objections",
+                        {"answer": answer, "objections": list(review.objections)},
+                    )
+                    resolved = True
+
+            if not resolved:
+                result.status = STATUS_SKEPTIC_BLOCKED
+                result.revisions = revisions
+                emit(
+                    "status",
+                    "blocked by unresolved skeptic objections",
+                    {
+                        "status": STATUS_SKEPTIC_BLOCKED,
+                        "objections": list(review.objections),
+                        "skeptic_cost_usd": skeptic_cost_usd(ledger),
+                    },
+                )
+                return finalize(plan)
     # Instructions of steps that have already dead-ended this run. The repetition
     # breaker (v0.0.21) compares each newly-pending step against these: a replan
     # that re-issues a near-identical already-failed step is the loop signature.

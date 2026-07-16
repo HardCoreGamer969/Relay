@@ -8,6 +8,7 @@ Every command prints telemetry, now naturally split brain vs hands.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -63,6 +64,7 @@ from relay.orchestrator import (
     STATUS_MAX_COST,
     STATUS_PLANNING_FAILED,
     STATUS_REPEATED_STEP,
+    STATUS_SKEPTIC_BLOCKED,
     STATUS_UNRESOLVED_ESCALATION,
     Event,
     PlannedTaskResult,
@@ -251,6 +253,13 @@ def run(
     no_log: bool = typer.Option(
         False, "--no-log", help="Skip persisting this run to .relay/runs.jsonl."
     ),
+    skeptic: bool | None = typer.Option(
+        None,
+        "--skeptic/--no-skeptic",
+        help="Enable the adversarial skeptic (read-only plan review). Unresolved "
+        "objections block continue or force a replan. Default: RELAY_SKEPTIC / "
+        "config review.adversarial (off).",
+    ),
 ) -> None:
     """Run the agent against a goal.
 
@@ -290,9 +299,12 @@ def run(
     context_mode = resolve_hands_context_mode(hands_context or None)
     router = ModelRouter.from_resolve(route or None, root=root)
     cfg, _route_changes = router.bind(cfg)
+    from relay.skeptic import resolve_skeptic
+    skeptic_on = resolve_skeptic(skeptic)
     console.print(
         f"[dim]profile={active_profile.name} ({active_profile.description}) · "
-        f"dial={dial} · hands-context={context_mode} · route={router.route.name}[/dim]"
+        f"dial={dial} · hands-context={context_mode} · route={router.route.name}"
+        f"{' · skeptic' if skeptic_on else ''}[/dim]"
     )
     start = time.perf_counter()
     if solo:
@@ -307,6 +319,7 @@ def run(
             max_total_steps=ceiling, max_cost=cost_ceiling, bash_timeout_s=bash_timeout,
             plan_only=plan_only, envelope=envelope,
             hands_context_mode=context_mode, model_router=router,
+            skeptic=skeptic_on,
         )
     wall_time_s = time.perf_counter() - start
 
@@ -375,7 +388,8 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
                  max_cost=None, bash_timeout_s=120.0, plan_only=False,
                  envelope: CostEnvelope | None = None,
                  hands_context_mode: str | None = None,
-                 model_router: ModelRouter | None = None):
+                 model_router: ModelRouter | None = None,
+                 skeptic: bool = False):
     """Conversational planning -> commit -> the two-role autonomous loop.
 
     Both phases share ONE transcript, so a mid-run escalation appears as the next
@@ -389,7 +403,8 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
         Panel(
             f"[bold]{goal}[/bold]\nroot={root}\nbrain={cfg.brain}\nhands={cfg.hands}\n"
             f"bash policy={bash_policy}  supervision={'on' if supervise else 'off'}  "
-            f"assume={dial}  hands-context={ctx}  route={route_name}\n{env.preflight_text()}",
+            f"assume={dial}  hands-context={ctx}  route={route_name}"
+            f"{'  skeptic=on' if skeptic else ''}\n{env.preflight_text()}",
             title="Relay run (brain + hands)",
             border_style="cyan",
         )
@@ -460,6 +475,7 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
             envelope=env,
             hands_context_mode=hands_context_mode,
             model_router=model_router,
+            skeptic=skeptic,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)
@@ -630,6 +646,209 @@ def _runs_table(records, limit: int) -> Table:
             str(rec.steps),
         )
     return table
+
+
+@app.command()
+def duel(
+    goal: str = typer.Option(
+        ..., "--goal", "-g", help="Goal to run across every brain×hands pairing."
+    ),
+    pair: list[str] = typer.Option(
+        [],
+        "--pair",
+        help="Repeatable pairing: brain=<slug>,hands=<slug>. At least two recommended.",
+    ),
+    matrix: str = typer.Option(
+        "",
+        "--matrix",
+        help="Path to a matrix file (JSON list or brain=...,hands=... lines).",
+    ),
+    root: str = typer.Option(
+        ".", "--root", help="Project root (git worktree restored between pairings)."
+    ),
+    max_total_steps: int | None = typer.Option(
+        20, "--max-total-steps", help="Per-pairing executor step ceiling (default 20)."
+    ),
+    auto_approve: bool = typer.Option(
+        True,
+        "--auto-approve/--no-auto-approve",
+        help="Auto-approve CONFIRM bash during duel runs (default on).",
+    ),
+    list_past: bool = typer.Option(
+        False, "--list", help="List persisted duel scorecards under .relay/duels/."
+    ),
+) -> None:
+    """Model bake-off: run the same goal across N brain×hands pairings (sequential).
+
+    v1 restores the worktree via git checkout between pairings when ``root`` is a
+    git repo. A dirty tree at start fails closed. Scorecards land in .relay/duels/.
+    """
+    from relay.duel import list_duels, load_matrix, parse_pair, run_duel
+
+    if list_past:
+        rows = list_duels(root)
+        if not rows:
+            console.print("[yellow]no duels recorded yet[/yellow]")
+            return
+        table = Table(title=f"Relay duels ({len(rows)})")
+        table.add_column("Id", style="cyan")
+        table.add_column("When", style="dim")
+        table.add_column("Goal", overflow="fold")
+        table.add_column("Pairs", justify="right")
+        for row in rows[:20]:
+            table.add_row(
+                str(row.get("duel_id", "")),
+                str(row.get("timestamp", ""))[:19],
+                str(row.get("goal", ""))[:60],
+                str(len(row.get("pairings") or [])),
+            )
+        console.print(table)
+        return
+
+    pairings = []
+    try:
+        for spec in pair:
+            pairings.append(parse_pair(spec))
+        if matrix:
+            pairings.extend(load_matrix(matrix))
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        console.print(f"[red]matrix error:[/red] {exc}")
+        raise typer.Exit(code=1)
+    if len(pairings) < 1:
+        console.print(
+            "[red]need at least one --pair brain=...,hands=... or --matrix file[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    console.print(
+        Panel(
+            f"[bold]{goal}[/bold]\n"
+            f"pairings={len(pairings)} (sequential)  root={root}\n"
+            "v1: same-tree; git checkout/clean between pairings when in a repo",
+            title="Relay duel",
+            border_style="magenta",
+        )
+    )
+
+    def _on_pairing(p, score) -> None:
+        cost = "-" if score.cost_usd is None else f"${score.cost_usd:.4f}"
+        console.print(
+            f"  [cyan]{p.label()}[/cyan] -> {score.status}  "
+            f"steps={score.steps}  cost={cost}  "
+            f"escalations={score.escalations}  wall={score.wall_time_s:.2f}s"
+        )
+
+    try:
+        result = run_duel(
+            goal,
+            root,
+            pairings,
+            auto_approve=auto_approve,
+            supervise=False,
+            max_total_steps=max_total_steps,
+            on_pairing=_on_pairing,
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]duel failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    table = Table(title=f"Duel scorecard {result.duel_id}")
+    table.add_column("Brain")
+    table.add_column("Hands")
+    table.add_column("Status")
+    table.add_column("Steps", justify="right")
+    table.add_column("$", justify="right")
+    table.add_column("Esc", justify="right")
+    table.add_column("Wall s", justify="right")
+    for s in result.pairings:
+        cost = "-" if s.cost_usd is None else f"{s.cost_usd:.4f}"
+        table.add_row(
+            s.brain, s.hands, s.status, str(s.steps), cost,
+            str(s.escalations), f"{s.wall_time_s:.2f}",
+        )
+    console.print(table)
+    for note in result.notes:
+        console.print(f"[dim]note: {note}[/dim]")
+    from relay.duel import default_duels_dir
+    console.print(f"[dim]saved -> {default_duels_dir(root) / (result.duel_id + '.json')}[/dim]")
+
+
+@app.command()
+def probe(
+    slug: str = typer.Argument(..., help="Model slug to grade (OpenRouter-style)."),
+    role: str = typer.Option(
+        "both",
+        "--role",
+        help="Which protocol surface to grade: brain | hands | both.",
+    ),
+    fixture: str = typer.Option(
+        "",
+        "--fixture",
+        help="Path to a transcript fixture JSON (offline grading).",
+    ),
+    fixtures_dir: str = typer.Option(
+        "",
+        "--fixtures-dir",
+        help="Directory of fixtures (default: bundled relay/probes + tests fixtures).",
+    ),
+) -> None:
+    """Protocol fitness lab: grade plan shape / tag discipline (offline fixtures).
+
+    Exit codes: 0=fit (>=70), 2=weak (40-69), 3=unfit (<40), 1=error.
+    """
+    from pathlib import Path as _Path
+
+    from relay.probe import (
+        DEFAULT_FIXTURES_DIR,
+        EXIT_ERROR,
+        probe_offline,
+    )
+
+    role_n = (role or "both").strip().lower()
+    if role_n not in ("brain", "hands", "both"):
+        console.print(f"[red]invalid --role {role!r}; use brain|hands|both[/red]")
+        raise typer.Exit(code=EXIT_ERROR)
+
+    dirs: list[_Path] = []
+    if fixtures_dir:
+        dirs.append(_Path(fixtures_dir))
+    else:
+        dirs.append(DEFAULT_FIXTURES_DIR)
+        test_fix = _Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "protocol_lab"
+        if test_fix.is_dir():
+            dirs.append(test_fix)
+
+    try:
+        if fixture:
+            result = probe_offline(slug, role=role_n, fixture=fixture)
+        else:
+            # Prefer the first directory that has fixtures.
+            chosen = next((d for d in dirs if d.is_dir() and any(d.glob("*.json"))), dirs[0])
+            result = probe_offline(slug, role=role_n, fixtures_dir=chosen)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]probe error:[/red] {exc}")
+        raise typer.Exit(code=EXIT_ERROR)
+
+    band_style = {"fit": "green", "weak": "yellow", "unfit": "red"}.get(result.band, "white")
+    console.print(
+        Panel(
+            f"[bold]{result.slug}[/bold]  role={result.role}\n"
+            f"overall=[{band_style}]{result.overall}/100 ({result.band})[/{band_style}]\n"
+            f"fixture={result.fixture or '-'}",
+            title="Relay probe",
+            border_style="cyan",
+        )
+    )
+    table = Table(title="Dimensions")
+    table.add_column("Dimension")
+    table.add_column("Score", justify="right")
+    table.add_column("Rationale", overflow="fold")
+    for dim in result.dimensions:
+        table.add_row(dim.name, str(dim.score), dim.rationale)
+    console.print(table)
+    for note in result.notes:
+        console.print(f"[dim]note: {note}[/dim]")
+    raise typer.Exit(code=result.exit_code())
 
 
 @app.command()
@@ -1094,6 +1313,16 @@ def _print_event(event: Event) -> None:
         verdict = event.payload.get("verdict", "")
         color = {"accept": "green", "follow_up": "yellow", "revise_plan": "magenta"}.get(verdict, "white")
         console.print(f"  [{color}]review: {verdict}[/{color}]")
+    elif kind == "skeptic_review":
+        verdict = event.payload.get("verdict", "")
+        color = "green" if verdict == "clear" else "yellow"
+        console.print(f"  [{color}]skeptic: {verdict}[/{color}]")
+        for obj in event.payload.get("objections") or []:
+            console.print(f"    [yellow]! {obj}[/yellow]")
+    elif kind == "skeptic_dismissed":
+        console.print("  [green]skeptic objections dismissed by user[/green]")
+    elif kind == "skeptic_replan":
+        console.print(f"  [magenta]{event.message}[/magenta]")
     elif kind == "memory_write":
         console.print(f"    [dim]memory += [{event.payload.get('kind')}] {event.payload.get('summary')}[/dim]")
     elif kind == "step_done":
@@ -1133,6 +1362,9 @@ def _print_planned_status(result) -> None:
     elif status == STATUS_MAX_COST:
         msg = friendly_terminal_message(status)
         console.print(f"\n[yellow]COST CEILING[/yellow] {msg}")
+    elif status == STATUS_SKEPTIC_BLOCKED:
+        msg = friendly_terminal_message(status)
+        console.print(f"\n[bold red]SKEPTIC BLOCKED[/bold red] {msg}")
     elif status == STATUS_DECLINED:
         console.print("\n[yellow]DECLINED[/yellow] plan not approved; nothing executed")
     else:

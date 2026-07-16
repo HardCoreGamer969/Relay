@@ -653,6 +653,69 @@ def test_no_cost_ceiling_means_no_max_cost_status(tmp_path):
         _models._extract_cost = original
 
 
+def test_envelope_warn_fires_once_at_half_cost(tmp_path):
+    """Soft 50% warn emits once when chargeable cost crosses the threshold."""
+    from relay import models as _models
+    from relay.envelope import CostEnvelope
+
+    original = _models._extract_cost
+    _models._extract_cost = lambda usage, *, provider, model: 0.001
+    warns: list = []
+    try:
+        client = RoutedClient(
+            brain=[
+                "<plan><step>create a.txt</step><step>create b.txt</step></plan>",
+            ],
+            hands=[
+                '<edit path="a.txt">A</edit>\n<done>did a</done>',
+                '<edit path="b.txt">B</edit>\n<done>did b</done>',
+            ],
+        )
+        env = CostEnvelope(
+            max_cost=0.004, max_steps=50, scope="all", warn_thresholds=(0.5, 0.99)
+        )
+        result = run_planned(
+            "g",
+            tmp_path,
+            models=CFG,
+            client=client,
+            envelope=env,
+            on_event=lambda e: warns.append(e) if e.kind == "envelope_warn" else None,
+            supervise=False,
+        )
+        assert result.status == STATUS_COMPLETED
+        assert any(e.payload.get("threshold") == 0.5 for e in warns)
+        assert sum(1 for e in warns if e.payload.get("threshold") == 0.5) == 1
+        assert result.envelope is env
+    finally:
+        _models._extract_cost = original
+
+
+def test_envelope_scope_execution_ignores_planning_spend(tmp_path):
+    """scope=execution: planning brain calls do not count toward max_cost."""
+    from relay import models as _models
+    from relay.envelope import CostEnvelope
+
+    original = _models._extract_cost
+    _models._extract_cost = lambda usage, *, provider, model: 0.001
+    try:
+        client = RoutedClient(
+            brain=[
+                "<plan><step>create a.txt</step></plan>",
+                "<verdict>accept</verdict>",
+            ],
+            hands=['<edit path="a.txt">A</edit>\n<done>did a</done>'],
+        )
+        # Planning alone would exceed 0.0015 if counted; execution-only should complete.
+        env = CostEnvelope(max_cost=0.0015, scope="execution", warn_thresholds=(0.99,))
+        result = run_planned(
+            "g", tmp_path, models=CFG, client=client, envelope=env, supervise=True
+        )
+        assert result.status == STATUS_COMPLETED
+    finally:
+        _models._extract_cost = original
+
+
 def test_max_cost_resolves_with_no_ledger_cost_unknown_is_a_noop(tmp_path):
     """If the provider never returns a cost, ledger.total_cost() is None
     -- the guard has no signal and falls through (the call-count ceiling

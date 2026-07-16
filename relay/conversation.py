@@ -36,6 +36,7 @@ from typing import Any, Callable
 
 from relay.config import ModelConfig, assumption_directive
 from relay.context import DEFAULT_CONTEXT_WINDOW
+from relay.envelope import CostEnvelope
 from relay.memory import MemoryBus, PlanMemory, memory_budget
 from relay.models import call_model
 from relay.planner import MAX_PLAN_STEPS, Plan, project_digest
@@ -184,6 +185,8 @@ class ConversationResult:
     # The continuous conversation thread (this planning dialogue's turns). The same
     # object is handed to ``run_planned`` so a mid-run escalation continues it.
     transcript: Transcript | None = None
+    # A1: set when scope=all cost envelope is hit during planning (not committed).
+    stop_reason: str | None = None
 
 
 # --- small parse helpers (deduplicated v0.0.32: delegate to protocol.py) -----
@@ -390,6 +393,7 @@ def plan_conversationally(
     brain_role: str = "brain",
     on_event: EventSink | None = None,
     transcript: Transcript | None = None,
+    envelope: CostEnvelope | None = None,
 ) -> ConversationResult:
     """Run the pre-execution planning conversation, returning a committed plan.
 
@@ -415,6 +419,29 @@ def plan_conversationally(
         if on_event is not None:
             on_event(kind, message, payload or {})
 
+    def cost_stop() -> bool:
+        """True when scope=all envelope is exhausted during planning (A1)."""
+        if envelope is None or envelope.scope != "all":
+            return False
+        if ledger is None:
+            return False
+        for warn in envelope.drain_warnings(ledger=ledger, steps_used=None):
+            emit("envelope_warn", warn["message"], warn)
+        if not envelope.hit_cost_limit(ledger):
+            return False
+        spent = envelope.chargeable_cost(ledger)
+        spent_txt = f"${spent:.4f}" if spent is not None else "unknown"
+        ceiling = envelope.max_cost
+        ceiling_txt = f"${ceiling:.4f}" if ceiling is not None else "unknown"
+        result.stop_reason = "max_cost"
+        emit(
+            "status",
+            f"stopped during planning: spent {spent_txt}, reached the cost ceiling "
+            f"({ceiling_txt}, scope={envelope.scope})",
+            {"status": "max_cost", "spent": spent, "max_cost": envelope.max_cost, "scope": envelope.scope},
+        )
+        return True
+
     digest = project_digest(project_root)
     mem_ctx = _memory_slice(memory, goal, client=client, models=models, ledger=ledger)
 
@@ -422,6 +449,8 @@ def plan_conversationally(
     assessment = _assess_scope(
         goal, digest, assumption_level, mem_ctx, models=models, ledger=ledger, client=client, brain_role=brain_role
     )
+    if cost_stop():
+        return result
     result.scope = assessment.size
     result.scope_reason = assessment.reason
     posture = _posture(assessment.size, assumption_level)
@@ -455,6 +484,8 @@ def plan_conversationally(
         goal, digest, assumption_level, answers, None, None, mem_ctx,
         models=models, ledger=ledger, client=client, brain_role=brain_role,
     )
+    if cost_stop():
+        return result
     result.plan = plan
     result.assumptions = assumptions
     result.plain_plan = _derive_plain(plan, assumptions)
@@ -507,6 +538,8 @@ def plan_conversationally(
             goal, result.plan, reaction,
             models=models, ledger=ledger, client=client, brain_role=brain_role,
         )
+        if cost_stop():
+            return result
         category = classification.category
 
         if category == "approve":
@@ -537,6 +570,8 @@ def plan_conversationally(
             # an empty plan (the brain failed to generate steps), do NOT commit an
             # empty plan -- re-present and let the user react next round instead.
             revise_plan(classification.change or reaction)
+            if cost_stop():
+                return result
             if not result.plan.steps:
                 emit("not_committed", "the revised plan was empty; nothing to commit", {})
                 if result.rounds >= max_rounds:
@@ -552,6 +587,8 @@ def plan_conversationally(
         if result.rounds >= max_rounds:
             break  # no further round to show a revision; stop without committing
         revise_plan(classification.change or reaction)
+        if cost_stop():
+            return result
         prompt = result.plain_plan
 
     emit("not_committed", f"no commit within {max_rounds} round(s)", {})

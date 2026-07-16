@@ -26,10 +26,13 @@ from relay.config import (
     load_models,
     resolve_assumption_level,
     resolve_bash_timeout,
+    resolve_envelope_scope,
+    resolve_envelope_warn,
     resolve_max_cost,
     resolve_max_total_steps,
 )
 from relay.context import resolve_context_window
+from relay.envelope import CostEnvelope
 from relay.providers import (
     DEFAULT_PROVIDER,
     DISCOVERY_LIST,
@@ -43,6 +46,7 @@ from relay.store import CONFIG_VERSION, load_config, save_config
 from relay.conversation import DEFAULT_MAX_ROUNDS, plan_conversationally
 from relay.loop import (
     STATUS_COMPLETED,
+    STATUS_MAX_COST as SOLO_STATUS_MAX_COST,
     STATUS_MAX_STEPS,
     STATUS_PARSE_FAILURE_ABORT,
     StepResult,
@@ -183,10 +187,22 @@ def run(
     ),
     max_cost: float | None = typer.Option(
         None, "--max-cost",
-        help="Hard cost ceiling (dollars) for a planned run. The run halts at "
-        "the step boundary when ledger.total_cost() crosses this value. "
-        "Default unbounded; pass 0 to disable explicitly. Overrides "
-        "RELAY_MAX_COST and config for this run.",
+        help="Hard cost ceiling (dollars). The run halts at a step/turn boundary "
+        "when chargeable spend crosses this value. Default unbounded; pass 0 to "
+        "disable. Overrides RELAY_MAX_COST and config for this run.",
+    ),
+    envelope_scope: str = typer.Option(
+        "",
+        "--envelope-scope",
+        help="Cost-envelope scope (cost ceiling only; does not change step ceilings): "
+        "'all' counts planning+execution (default), 'execution' excludes planning spend. "
+        "Overrides RELAY_ENVELOPE_SCOPE / config.",
+    ),
+    envelope_warn: str = typer.Option(
+        "",
+        "--envelope-warn",
+        help="Comma-separated warn fractions of each active ceiling "
+        "(default 0.5,0.8,0.9,0.99). Overrides RELAY_ENVELOPE_WARN / config.",
     ),
     no_supervise: bool = typer.Option(
         False, "--no-supervise",
@@ -226,46 +242,64 @@ def run(
     dial = resolve_assumption_level(override=assume or None)
     ceiling = resolve_max_total_steps(override=max_total_steps)  # 50 by default; flag/env/config can raise
     cost_ceiling = resolve_max_cost(override=max_cost)
+    scope = resolve_envelope_scope(override=envelope_scope or None)
+    warn_thresholds = resolve_envelope_warn(override=envelope_warn or None)
     bash_timeout = resolve_bash_timeout()
     _warn_if_dirty_git(root)
 
     mode = "solo" if solo else "planned"
+    # Solo uses --max-steps as the step dimension; planned uses the global ceiling.
+    step_ceiling = max_steps if solo else ceiling
+    envelope = CostEnvelope(
+        max_cost=cost_ceiling,
+        max_steps=step_ceiling,
+        scope=scope,
+        warn_thresholds=warn_thresholds,
+    )
     start = time.perf_counter()
     if solo:
-        result = _run_solo(goal, root, solo, max_steps, cfg, ledger, auto_approve, approver,
-                           bash_timeout_s=bash_timeout)
+        result = _run_solo(
+            goal, root, solo, max_steps, cfg, ledger, auto_approve, approver,
+            bash_timeout_s=bash_timeout, envelope=envelope,
+        )
     else:
         result = _run_planned(
             goal, root, cfg, ledger, auto_approve, approver, confirm_plan,
             supervise=not no_supervise, dial=dial, show_transcript=show_transcript,
             max_total_steps=ceiling, max_cost=cost_ceiling, bash_timeout_s=bash_timeout,
-            plan_only=plan_only,
+            plan_only=plan_only, envelope=envelope,
         )
     wall_time_s = time.perf_counter() - start
 
     _print_telemetry(ledger)
+    _print_receipt(envelope, ledger, status=getattr(result, "status", ""))
     if not no_log:
         _save_run(goal=goal, mode=mode, result=result, ledger=ledger, cfg=cfg,
                   wall_time_s=wall_time_s, root=root)
 
 
 def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver, *,
-               bash_timeout_s=120.0):
+               bash_timeout_s=120.0, envelope: CostEnvelope | None = None):
     """The v0.02 single-model loop, kept for comparison/debugging."""
     bash_policy = "auto-approve" if auto_approve else "interactive approval"
+    env = envelope or CostEnvelope(max_steps=max_steps)
     console.print(
         Panel(
             f"[bold]{goal}[/bold]\nroot={root}  solo role={role}  max-steps={max_steps}  "
-            f"bash policy={bash_policy}",
+            f"bash policy={bash_policy}\n{env.preflight_text()}",
             title="Relay run (solo)",
             border_style="cyan",
         )
     )
+
+    def _warn(payload: dict) -> None:
+        console.print(f"[yellow]{payload.get('message', 'envelope warn')}[/yellow]")
+
     try:
         result = run_task(
             goal, root, role=role, max_steps=max_steps, models=cfg, ledger=ledger,
             on_step=_print_step, approver=approver, auto_approve=auto_approve,
-            bash_timeout_s=bash_timeout_s,
+            bash_timeout_s=bash_timeout_s, envelope=env, on_envelope_warn=_warn,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)
@@ -277,6 +311,9 @@ def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver, 
         console.print(
             f"\n[yellow]stopped: hit max-steps ({max_steps}) without <done>[/yellow]"
         )
+    elif result.status in (SOLO_STATUS_MAX_COST, STATUS_MAX_COST):
+        msg = friendly_terminal_message(STATUS_MAX_COST, max_total_steps=max_steps)
+        console.print(f"\n[yellow]{msg or 'stopped: cost ceiling reached'}[/yellow]")
     elif result.status == STATUS_PARSE_FAILURE_ABORT:
         console.print(
             "\n[bold red]aborted: too many consecutive parse failures[/bold red]"
@@ -288,18 +325,20 @@ def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver, 
 
 def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, *,
                  supervise=True, dial="auto", show_transcript=False, max_total_steps=None,
-                 max_cost=None, bash_timeout_s=120.0, plan_only=False):
+                 max_cost=None, bash_timeout_s=120.0, plan_only=False,
+                 envelope: CostEnvelope | None = None):
     """Conversational planning -> commit -> the two-role autonomous loop.
 
     Both phases share ONE transcript, so a mid-run escalation appears as the next
     turn of the same conversation rather than a separate popup.
     """
     bash_policy = "auto-approve" if auto_approve else "interactive approval"
+    env = envelope or CostEnvelope(max_cost=max_cost, max_steps=max_total_steps)
     console.print(
         Panel(
             f"[bold]{goal}[/bold]\nroot={root}\nbrain={cfg.brain}\nhands={cfg.hands}\n"
             f"bash policy={bash_policy}  supervision={'on' if supervise else 'off'}  "
-            f"assume={dial}",
+            f"assume={dial}\n{env.preflight_text()}",
             title="Relay run (brain + hands)",
             border_style="cyan",
         )
@@ -307,25 +346,38 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
 
     transcript = Transcript()  # the one continuous thread across planning + execution
 
+    def _on_conv_event(kind, message, payload):
+        _print_conv_event(kind, message, payload)
+        if kind == "envelope_warn":
+            console.print(f"[yellow]{message}[/yellow]")
+
     # 1. Plan as a conversation (--confirm-plan = the degenerate 1-round case).
     try:
         conversation = plan_conversationally(
             goal, root, models=cfg, ledger=ledger, client=None,
             assumption_level=dial, user_turn=_interactive_user_turn,
             max_rounds=1 if confirm_plan else DEFAULT_MAX_ROUNDS,
-            on_event=_print_conv_event, transcript=transcript,
+            on_event=_on_conv_event, transcript=transcript, envelope=env,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)
         raise typer.Exit(code=1)
 
+    if conversation.stop_reason == "max_cost":
+        console.print("\n[yellow]stopped during planning: cost ceiling reached[/yellow]")
+        return PlannedTaskResult(
+            goal=goal, plan=conversation.plan, status=STATUS_MAX_COST,
+            ledger=ledger, transcript=transcript, envelope=env, max_cost=env.max_cost,
+        )
+
     if not conversation.committed or conversation.plan is None or not conversation.plan.steps:
         console.print("\n[yellow]plan not committed; nothing executed[/yellow]")
         return PlannedTaskResult(goal=goal, plan=conversation.plan, status=STATUS_DECLINED,
-                                 ledger=ledger, transcript=transcript)
+                                 ledger=ledger, transcript=transcript, envelope=env)
 
-    # --plan-only: print the committed plan and exit WITHOUT executing.
-    # Useful for reviewing what the brain would do before spending money on execution.
+    # Post-plan snapshot (spent so far / remaining) before hands execute.
+    if env.max_cost is not None or (ledger.total_cost() or 0) > 0:
+        console.print(f"[dim]{env.post_plan_snapshot(ledger)}[/dim]")
     if plan_only:
         steps = conversation.plan.steps
         body = "\n".join(f"{i}. {s.instruction}" for i, s in enumerate(steps, 1))
@@ -333,10 +385,15 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
                             border_style="magenta"))
         console.print("[dim](--plan-only: no files were written, no executor calls made)[/dim]")
         return PlannedTaskResult(goal=goal, plan=conversation.plan, status=STATUS_DECLINED,
-                                 ledger=ledger, transcript=transcript)
+                                 ledger=ledger, transcript=transcript, envelope=env)
 
     # 2. Execute the committed plan on the SAME thread (the dial keeps biasing
     #    answer_or_escalate; escalations continue the conversation above).
+    def _on_exec_event(event: Event) -> None:
+        _print_event(event)
+        if event.kind == "envelope_warn":
+            console.print(f"[yellow]{event.message}[/yellow]")
+
     try:
         from relay.catalog import get_catalog
         catalog = get_catalog()
@@ -345,10 +402,11 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
             approver=approver, auto_approve=auto_approve,
             supervise=supervise, user_decision=_interactive_user_decision,
             assumption_level=dial, committed_plan=conversation.plan,
-            on_event=_print_event, transcript=transcript,
+            on_event=_on_exec_event, transcript=transcript,
             max_total_steps=max_total_steps, max_cost=max_cost,
             catalog=catalog,
             bash_timeout_s=bash_timeout_s,
+            envelope=env,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)
@@ -1055,6 +1113,15 @@ def _print_telemetry(ledger: Ledger) -> None:
     pf = ledger.parse_failures
     style = "bold red" if pf else "dim"
     console.print(f"[{style}]parse failures: {pf}[/{style}]")
+
+
+def _print_receipt(envelope: CostEnvelope, ledger: Ledger, *, status: str) -> None:
+    """Print the A1 envelope receipt under the telemetry table."""
+    for line in envelope.receipt_lines(ledger, status=status or ""):
+        if line == "Receipt":
+            console.print(f"[bold]{line}[/bold]")
+        else:
+            console.print(f"[dim]{line}[/dim]")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 # 07 — Cost Envelope Contracts
 
 **Phase:** A1 · **Status:** [MASTER roadmap table](MASTER.md) only  
+**Shipped:** features-revamp (CostEnvelope + CLI/TUI/solo wiring)  
 **Depends on:** existing `--max-cost` / step ceilings (extend, don’t reinvent)
 
 ## Blockers

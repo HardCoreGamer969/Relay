@@ -72,7 +72,7 @@ Work top to bottom. Skip a row only with a written reason in **Notes**.
 
 | Phase | # | Feature | Doc | Status | Blockers / notes |
 |-------|---|----------|-----|--------|------------------|
-| A1 | 7 | Cost Envelope Contracts | [07](07-cost-envelope.md) | designing | Design locked; ready to code S1 on go-ahead |
+| A1 | 7 | Cost Envelope Contracts | [07](07-cost-envelope.md) | shipped | CostEnvelope + scope/warn + CLI/TUI/solo/runlog |
 | A2 | 12 | Explain the Harness (`/why`) | [12](12-explain-harness.md) | planned | Events exist; no aggregation yet |
 | A3 | 9 | Finding-Driven Memory | [09](09-finding-memory.md) | planned | Stage 1 pools exist; persist TBD |
 | B1 | 2 | Assumption Profiles | [02](02-assumption-profiles.md) | planned | Dial exists; named profiles do not |
@@ -118,6 +118,6 @@ A3 Finding memory ─┘         │                        │
 
 1. Take the first non-`shipped` / non-`dropped` row in phase order.
 2. Open its `NN-*.md`; tighten acceptance criteria before coding.
-3. One focused PR per feature (or a thin vertical slice); link the feature doc.
-4. Flip **Status** in the table above; on ship, add `Shipped: vX.Y.Z` to the feature doc.
+3. Follow **Branching & commit rules** above (revamp branch by default; sub-branch only if needed).
+4. Flip **Status** in the table above as you move `designing` → `in progress` → `shipped`; on ship, add `Shipped: vX.Y.Z` to the feature doc.
 5. New REVAMP dependency → one line in **Blockers / notes**, not a new doc.

@@ -29,6 +29,7 @@ from typing import Any, Callable
 
 from relay.config import ModelConfig, load_models
 from relay.context import resolve_context_window
+from relay.envelope import CostEnvelope, brain_cost_since
 from relay.loop import (
     MAX_CONSECUTIVE_PARSE_FAILURES,
     STATUS_COMPLETED,
@@ -286,6 +287,8 @@ class PlannedTaskResult:
     # v0.0.32: the cost ceiling (None = unbounded), so a surface can tell
     # the user how to raise it when STATUS_MAX_COST is hit.
     max_cost: float | None = None
+    # A1: full envelope state (warnings fired, wasted brain $, scope, …).
+    envelope: CostEnvelope | None = None
     # The continuous conversation thread (planning turns, mid-run escalations,
     # decisions, the result turn). ``transcript`` is the full live thread (source
     # of truth); ``transcript_compacted`` is its post-execution readable form.
@@ -332,6 +335,8 @@ class _Disposition:
     unresolved_question: str = ""
     records: list[tuple[str, str, str]] = field(default_factory=list)
     calls: int = 0
+    # Brain $ on review that did not yield an accepted step (follow-up exhaustion).
+    wasted_brain_usd: float = 0.0
 
 
 def _executor_step_prompt(
@@ -679,6 +684,7 @@ def run_planned(
     max_plan_revisions: int = 5,
     max_total_steps: int | None = None,
     max_cost: float | None = None,
+    envelope: CostEnvelope | None = None,
     context_window: int | None = None,
     catalog: Any | None = None,
     on_event: EventCallback | None = None,
@@ -741,6 +747,17 @@ def run_planned(
     result = PlannedTaskResult(goal=goal, ledger=ledger, memory=memory, transcript=transcript)
     result.max_total_steps = max_total_steps  # so a surface can tell the user how to raise it
     result.max_cost = max_cost  # so a surface can tell the user how to raise it (the cost ceiling)
+    if envelope is None:
+        envelope = CostEnvelope(max_cost=max_cost, max_steps=max_total_steps)
+    else:
+        # Keep result.max_* aligned with the live envelope (TUI may mutate it).
+        if envelope.max_cost is not None:
+            max_cost = envelope.max_cost
+            result.max_cost = max_cost
+        if envelope.max_steps is not None:
+            max_total_steps = envelope.max_steps
+            result.max_total_steps = max_total_steps
+    result.envelope = envelope
 
     cfg = models if models is not None else load_models()
     # v0.0.29: resolve BOTH actor windows and budget each pool to its own (passing
@@ -894,6 +911,7 @@ def run_planned(
         nonlocal executor_calls
         resolver = make_question_resolver(step)
         records: list[tuple[str, str, str]] = []
+        review_brain_usd = 0.0
 
         def record_finding(note: str) -> None:
             # The hands surfaced a bug/discovery -> the SHARED pool (kind "fact", so it
@@ -932,12 +950,14 @@ def run_planned(
             if not supervise:
                 return _Disposition("done", summary=outcome.summary, records=records)
 
+            before_review = len(ledger.records)
             review = review_step(
                 goal, plan, step, outcome.summary, outcome.transcript, memory,
                 tools=tools, touched_paths=outcome.touched_paths, max_review_steps=max_review_steps,
                 models=models, ledger=ledger, client=client, memory_budget_tokens=mem_budget,
                 brain_role=brain_role, on_event=emit,
             )
+            review_brain_usd += brain_cost_since(ledger, before_review)
             emit("step_reviewed", f"step {step.index} review: {review.verdict}",
                  {"index": step.index, "verdict": review.verdict, "followup": review.followup, "reason": review.reason})
             records.extend(review.records)
@@ -954,6 +974,7 @@ def run_planned(
                     "failed",
                     failure_reason=f"step not accepted after {max_followups_per_step} follow-up(s)",
                     records=records,
+                    wasted_brain_usd=review_brain_usd,
                 )
             followups_used += 1
             remember(
@@ -969,6 +990,19 @@ def run_planned(
             executor_calls += outcome.calls
 
     # --- Execute phase -----------------------------------------------------
+    # A1: for scope=execution, planning spend is excluded from the cost ceiling.
+    envelope.mark_execution_start(ledger)
+
+    def emit_envelope_warnings() -> None:
+        # Re-read live ceilings (TUI session edits may have changed them).
+        nonlocal max_cost, max_total_steps
+        max_cost = envelope.max_cost
+        max_total_steps = envelope.max_steps
+        result.max_cost = max_cost
+        result.max_total_steps = max_total_steps
+        for warn in envelope.drain_warnings(ledger=ledger, steps_used=executor_calls):
+            emit("envelope_warn", warn["message"], warn)
+
     while True:
         # Coarse cancellation: polled at the step boundary, before any work or
         # model call for the next step is spent. Mid-step interruption is
@@ -1010,23 +1044,29 @@ def run_planned(
                 break
             step_budget = min(max_executor_steps, remaining)
 
-        # Cost ceiling guard (v0.0.32): the user-set hard cap on dollars spent
-        # (--max-cost / RELAY_MAX_COST). Checked at the step boundary, same
-        # seam as max_total_steps, so the run halts BEFORE the next step
-        # starts rather than mid-call. ``ledger.total_cost()`` is None when no
-        # call has reported a cost yet (e.g. a provider that doesn't return
-        # cost) -- in that case the guard has no signal to act on and we let
-        # the call-count ceiling carry the run.
-        if max_cost is not None and ledger is not None:
-            spent = ledger.total_cost()
-            if spent is not None and spent >= max_cost:
-                result.status = STATUS_MAX_COST
-                emit(
-                    "status",
-                    f"stopped: spent ${spent:.4f}, reached the cost ceiling (${max_cost:.4f})",
-                    {"status": STATUS_MAX_COST, "spent": spent, "max_cost": max_cost},
-                )
-                break
+        # Soft envelope warnings (once per threshold × dimension), then hard cost stop.
+        emit_envelope_warnings()
+
+        # Cost ceiling guard: chargeable spend under envelope.scope (all|execution).
+        # Checked at the step boundary so the run halts BEFORE the next step starts.
+        if envelope.hit_cost_limit(ledger):
+            spent = envelope.chargeable_cost(ledger)
+            ceiling = envelope.max_cost
+            spent_txt = f"${spent:.4f}" if spent is not None else "unknown"
+            ceiling_txt = f"${ceiling:.4f}" if ceiling is not None else "unknown"
+            result.status = STATUS_MAX_COST
+            emit(
+                "status",
+                f"stopped: spent {spent_txt}, reached the cost ceiling "
+                f"({ceiling_txt}, scope={envelope.scope})",
+                {
+                    "status": STATUS_MAX_COST,
+                    "spent": spent,
+                    "max_cost": envelope.max_cost,
+                    "scope": envelope.scope,
+                },
+            )
+            break
 
         emit("step_start", f"step {step.index}: {step.instruction}",
              {"index": step.index, "instruction": step.instruction})
@@ -1052,6 +1092,7 @@ def run_planned(
 
         if disposition.kind == "done":
             plan.mark_done(step, disposition.summary)
+            envelope.note_completed_step()
             remember("fact", f"Step {step.index} done: {disposition.summary}", disposition.summary,
                      provenance=f"step{step.index}")
             emit("step_done", f"step {step.index} done: {disposition.summary}",
@@ -1068,6 +1109,7 @@ def run_planned(
                 # tail (don't thrash). This path does NOT call evolve_plan, so no
                 # abort is possible here.
                 plan.mark_done(step, disposition.summary)
+                envelope.note_completed_step()
                 remember("fact", f"Step {step.index} done: {disposition.summary}", disposition.summary,
                          provenance=f"step{step.index}")
                 emit("step_done", f"step {step.index} done: {disposition.summary}",
@@ -1088,6 +1130,7 @@ def run_planned(
             revisions += 1
             result.revisions = revisions
             plan.mark_done(step, disposition.summary)
+            envelope.note_completed_step()
             remember("fact", f"Step {step.index} done: {disposition.summary}", disposition.summary,
                      provenance=f"step{step.index}")
             emit("step_done", f"step {step.index} done: {disposition.summary}",
@@ -1103,6 +1146,7 @@ def run_planned(
         # disposition.kind == "failed" -> record the dead end, escalate to replan.
         plan.mark_failed(step, disposition.failure_reason)
         dead_ended_instructions.append(step.instruction)  # repetition-breaker watch list
+        envelope.add_wasted_brain(disposition.wasted_brain_usd)
         remember("dead_end", f"Step {step.index} failed: {disposition.failure_reason}",
                  f"failed: {disposition.failure_reason}", provenance=f"step{step.index}")
         emit("step_failed", f"step {step.index} failed: {disposition.failure_reason}",
@@ -1119,11 +1163,13 @@ def run_planned(
         emit("escalation", f"escalation {escalations}: replanning after step {step.index}",
              {"n": escalations, "failed_index": step.index, "reason": disposition.failure_reason})
 
+        before_replan = len(ledger.records)
         revised = replan(
             goal, plan, step, disposition.failure_reason, plan.completed_outcomes(),
             models=models, ledger=ledger, client=client, brain_role=brain_role,
             memory=memory, memory_budget_tokens=mem_budget,
         )
+        envelope.add_wasted_brain(brain_cost_since(ledger, before_replan))
         if revised is None:
             result.status = STATUS_ABORTED_BY_BRAIN
             emit("status", "brain aborted: goal deemed unreachable", {"status": STATUS_ABORTED_BY_BRAIN})

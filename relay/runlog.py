@@ -41,6 +41,7 @@ _FIELDS = (
     "per_role",
     "totals",
     "wall_time_s",
+    "envelope",
 )
 
 
@@ -69,6 +70,8 @@ class RunRecord:
     per_role: list[dict] = field(default_factory=list)
     totals: dict = field(default_factory=dict)
     wall_time_s: float = 0.0
+    # A1: optional envelope snapshot (ceilings, scope, wasted brain, outcome).
+    envelope: dict | None = None
 
     def to_json_line(self) -> str:
         """Serialize to a single JSONL line (ASCII-safe, trailing newline)."""
@@ -149,6 +152,19 @@ def build_record(
         escalations = 0
 
     now = datetime.now(timezone.utc)
+    envelope_snap = None
+    env = getattr(result, "envelope", None)
+    if env is not None:
+        envelope_snap = {
+            "max_cost": env.max_cost,
+            "max_steps": env.max_steps,
+            "scope": env.scope,
+            "warn_thresholds": list(env.warn_thresholds),
+            "wasted_brain_usd": env.wasted_brain_usd,
+            "completed_steps": env.completed_steps,
+            "outcome": env.outcome_label(getattr(result, "status", "")),
+            "chargeable_cost": env.chargeable_cost(ledger),
+        }
     return RunRecord(
         schema_version=SCHEMA_VERSION,
         run_id=now.strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8],
@@ -163,6 +179,7 @@ def build_record(
         per_role=per_role,
         totals=totals,
         wall_time_s=round(wall_time_s, 4),
+        envelope=envelope_snap,
     )
 
 

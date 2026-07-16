@@ -405,6 +405,8 @@ def describe_event_for_activity(event: Event) -> tuple[str | None, str]:
         return ACTOR_BRAIN, f"revised the plan ({len(p.get('steps') or [])} step(s))"
     if kind == "escalation":
         return ACTOR_BRAIN, msg
+    if kind == "envelope_warn":
+        return None, f"! {msg}"
     if kind == "memory_write":
         return ACTOR_BRAIN, f"memory += [{p.get('kind', '')}] {p.get('summary', '')}"
     if kind == "scope_assessed":
@@ -2649,15 +2651,52 @@ class RelayTuiApp(App):
         return True, f"working dir set to {target}"
 
     def _cmd_cost(self) -> None:
-        """Show session + per-goal spend, and offer toggle / reset. Dialog-driven (no
-        inline args); cost is already tracked so opening this makes NO model call.
-        Relay SHOWS spend and lets YOU decide when to stop -- it never caps."""
+        """Show envelope + session spend. Dialog-driven; ZERO model calls.
+
+        Session-only edits (ceilings / warn thresholds) mutate the live
+        :class:`CostEnvelope` on the runner when a run is in flight — they do
+        not write config/env.
+        """
         session = self._session_total()
+        runner = self._runner
+        env = getattr(runner, "envelope", None) if runner is not None else None
+        ledger = runner.ledger if runner is not None else None
+        spent = ledger.total_cost() if ledger is not None else self._goal_cost
+        remaining = env.remaining_cost(ledger) if env is not None else None
+        title = "Envelope" if env is not None and (
+            env.max_cost is not None or env.max_steps is not None
+        ) else "Cost (Relay shows spend; you decide when to stop)"
         options = [
             {"title": f"Session total: ${session:.4f}", "value": "__session__", "category": "spend",
              "description": "Cumulative across all goals since launch or last reset"},
-            {"title": f"This goal: ${self._goal_cost:.4f}", "value": "__goal__", "category": "spend",
-             "description": "The current goal's cost (or the last goal's, while idle)"},
+            {"title": f"This goal: ${(spent or 0):.4f}", "value": "__goal__", "category": "spend",
+             "description": "Current (or last) goal spend"},
+        ]
+        if env is not None:
+            cost_line = (
+                f"Ceiling: ${env.max_cost:.4f} (scope={env.scope})"
+                if env.max_cost is not None else "Ceiling: unbounded"
+            )
+            rem_line = (
+                f"Remaining: ${remaining:.4f}" if remaining is not None else "Remaining: n/a"
+            )
+            options.append({
+                "title": cost_line, "value": "__ceiling__", "category": "envelope",
+                "description": rem_line + " · session-only raise via set-ceiling",
+            })
+            options.append({
+                "title": f"Warn @ {', '.join(f'{t:.0%}' for t in env.warn_thresholds)}",
+                "value": "__warn__", "category": "envelope",
+                "description": "Soft thresholds (session-only; next boundary check)",
+            })
+            if env.max_cost is not None:
+                options.append({
+                    "title": "Raise cost ceiling +50% (session)", "value": "__raise__",
+                    "category": "actions",
+                    "description": "Mutates this run only — does not write config",
+                    "on_select": (lambda v: self._session_raise_cost_ceiling()),
+                })
+        options.extend([
             {"title": f"Live counter: {'on' if self._cost_visible else 'off'}", "value": "__toggle__",
              "category": "actions", "description": "Show/hide the status-line per-goal counter",
              "on_select": (lambda v: self._toggle_cost_counter())},
@@ -2665,9 +2704,20 @@ class RelayTuiApp(App):
              "description": "Zero the session figure (a deliberate break; leaves the goal "
                             "counter and any run untouched)",
              "on_select": (lambda v: self._reset_session_cost())},
-        ]
-        self.push_screen(SelectDialog(
-            title="Cost (Relay shows spend; you decide when to stop)", options=options))
+        ])
+        self.push_screen(SelectDialog(title=title, options=options))
+
+    def _session_raise_cost_ceiling(self) -> None:
+        """Session-only: bump the in-flight envelope's max_cost by 50%."""
+        runner = self._runner
+        env = getattr(runner, "envelope", None) if runner is not None else None
+        if env is None or env.max_cost is None:
+            return
+        env.max_cost = float(env.max_cost) * 1.5
+        self._write_activity(
+            f"[envelope] session ceiling raised to ${env.max_cost:.4f} (not saved to config)"
+        )
+        self._update_status()
 
     def _toggle_cost_counter(self) -> None:
         """Show/hide the status-line per-goal counter (the /cost toggle)."""

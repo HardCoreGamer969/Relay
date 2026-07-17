@@ -99,7 +99,9 @@ def cost_segment(
         max_cost = float(envelope.max_cost)
         if chargeable is not None and max_cost > 0:
             fraction = float(chargeable) / max_cost
-            if fraction >= 0.99 or (hasattr(envelope, "hit_cost_limit") and envelope.hit_cost_limit(ledger)):
+            if fraction >= 0.99 or (
+                hasattr(envelope, "hit_cost_limit") and envelope.hit_cost_limit(ledger)
+            ):
                 level = "critical"
             elif fraction >= 0.5:
                 level = "warn"
@@ -124,7 +126,7 @@ def route_segment(router) -> str:
 
 
 def context_segment(models, catalog=None) -> str:
-    """``ctx N%`` when a catalog window is known for brain; else ''."""
+    """``ctx window Nk`` when a catalog window is known for brain; else ''."""
     if catalog is None or models is None:
         return ""
     try:
@@ -137,8 +139,6 @@ def context_segment(models, catalog=None) -> str:
         return ""
     if not window or window <= 0:
         return ""
-    # Without live token counts, show the window as capacity (not a real %).
-    # Prefer a placeholder that still surfaces context awareness on the rail.
     try:
         override = os.environ.get("RELAY_TUI_CTX_PCT")
         if override is not None:

@@ -49,6 +49,9 @@ testpaths = ["tests"]
 # (tests/live/) hit a real provider API and are opt-in: they carry the ``live``
 # marker and are DESELECTED by default here. CI's live-smoke job re-selects them
 # with ``-m live`` (a later ``-m`` on the command line overrides this one).
+#
+# Network blocking (--allow-hosts) is NOT in addopts: live-smoke needs the
+# network. Hermetic CI and ``scripts/test.sh`` pass --allow-hosts explicitly.
 addopts = "-m 'not live'"
 markers = [
     "live: real cheap-model integration test that calls a provider API; needs a provider key; deselected by default",

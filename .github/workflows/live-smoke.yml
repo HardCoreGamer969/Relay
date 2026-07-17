@@ -1,9 +1,9 @@
 name: live-smoke
 
-# A CANARY, not a merge gate. These tests hit a real cheap model (DeepSeek
-# deepseek-v4-flash) to prove the brain<->hands relay and the safety rails work
-# end to end. Keep this OFF required status checks — model flakiness should alert,
-# not block. It runs nightly and on demand; PRs/forks (no secret) skip cleanly.
+# Canary, not a merge gate. Hits a real cheap model to prove brain↔hands +
+# safety rails end-to-end. Keep OFF required status checks — model flakiness
+# should alert, not block. Nightly + manual; forks/no-secret skip without
+# wasting a full sync.
 on:
   workflow_dispatch:
   schedule:
@@ -20,25 +20,41 @@ jobs:
   live:
     name: live brain↔hands smoke (DeepSeek)
     runs-on: ubuntu-latest
-    # Hard cap: a hung provider call can't pin a billable runner for the default
-    # 6 hours. The per-session USD cap bounds spend; this bounds wall-clock.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v8
+
+      - name: Check for API key
+        id: key
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          if [ -z "${DEEPSEEK_API_KEY}" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No DEEPSEEK_API_KEY secret — live canary skipped."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install uv + Python
+        if: steps.key.outputs.present == 'true'
+        uses: astral-sh/setup-uv@v8
         with:
           enable-cache: true
           python-version: "3.12"
+
       - name: Sync (from lockfile)
+        if: steps.key.outputs.present == 'true'
         run: uv sync --extra dev --frozen
 
-      # If DEEPSEEK_API_KEY is unset (e.g. a fork), the live fixtures SKIP rather
-      # than fail, so this stays green. A per-session USD cap (RELAY_LIVE_BUDGET_USD)
-      # plus per-test ceilings make a runaway loop impossible to overspend.
-      # --reruns 1 absorbs a transient API blip without masking a real failure.
+      # Per-session USD cap + pytest-rerunfailures absorb a single API blip.
+      # Do NOT pass --allow-hosts here — these tests need the network.
       - name: Run live tests
+        if: steps.key.outputs.present == 'true'
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           RELAY_LIVE_MODEL: deepseek-v4-flash
           RELAY_LIVE_BUDGET_USD: "0.50"
-        run: uv run python -m pytest tests/live -m live -v --reruns 1 --reruns-delay 5
+        run: >
+          uv run python -m pytest tests/live -m live -v
+          --tb=short --reruns 1 --reruns-delay 5

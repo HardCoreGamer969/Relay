@@ -1,7 +1,11 @@
 name: tests
 
-# The gating suite: the network-free unit/integration tests across a Python x OS
-# matrix. No secrets needed — these tests never touch the network (enforced below).
+# Hermetic gate: network-free unit/integration suite.
+# Matrix is intentional and lean — not "every Python × every OS":
+#   • Ubuntu 3.10 / 3.12 / 3.13 → min supported, current default, newest
+#   • Windows 3.12 only → real regression surface (path/encoding/tool bugs)
+# Dropped: Ubuntu 3.11 (middle-of-range; covered by 3.10+3.13) and the
+# three extra Windows cells (same suite, 3× the Actions minutes).
 on:
   push:
     branches: [main]
@@ -14,6 +18,13 @@ concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Force Rich into non-terminal mode so CLI/TUI assertions stay stable under
+  # Actions' pty/TERM (same contract as local Cloud agent runs).
+  TTY_COMPATIBLE: "0"
+  # Prefer bundled/cache catalog — never attempt models.dev in hermetic CI.
+  RELAY_DISABLE_MODELS_FETCH: "1"
+
 jobs:
   test:
     name: py${{ matrix.python-version }} · ${{ matrix.os }}
@@ -22,11 +33,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows is a first-class target: Relay has repeatedly fixed Windows-only
-        # tool bugs (mkdir -p, cp1252, apply_patch), so the windows leg guards a
-        # real regression surface, not boilerplate.
-        os: [ubuntu-latest, windows-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@v5
 
@@ -34,14 +49,18 @@ jobs:
         uses: astral-sh/setup-uv@v8
         with:
           enable-cache: true
-          cache-suffix: py${{ matrix.python-version }}
+          cache-suffix: py${{ matrix.python-version }}-${{ matrix.os }}
           python-version: ${{ matrix.python-version }}
 
       - name: Sync (from lockfile)
         run: uv sync --extra dev --frozen
 
-      # --allow-hosts restricts socket connect() to loopback only: asyncio/Textual
-      # internals (loopback socketpairs) keep working, while any real external call
-      # is blocked — turning "all tests are network-free" into an enforced contract.
-      - name: Run tests (external network blocked)
-        run: uv run python -m pytest --allow-hosts=127.0.0.1,::1,localhost -q
+      # --allow-hosts keeps asyncio/Textual loopback working while blocking any
+      # real outbound call — the hermetic suite's network-free contract.
+      # (Live canary opts into the network in live-smoke.yml; do not put
+      # allow-hosts in pyproject addopts or that job breaks.)
+      - name: Run hermetic suite (external network blocked)
+        run: >
+          uv run python -m pytest
+          --allow-hosts=127.0.0.1,::1,localhost
+          -q --tb=short

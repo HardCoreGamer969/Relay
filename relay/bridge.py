@@ -678,6 +678,7 @@ class EngineRunner:
         bridge = self.bridge
         try:
             bridge.emit_event(Event(EVENT_PHASE, "planning", {"phase": "planning"}))
+            model_router = self._run_kwargs.get("model_router")
             conversation = plan_conversationally(
                 goal, self.project_root, models=self.models, ledger=self.ledger,
                 client=self.client, assumption_level=self.assumption_level,
@@ -687,6 +688,8 @@ class EngineRunner:
                 ),
                 transcript=self.transcript,
                 envelope=self.envelope,
+                memory=self.memory,
+                model_router=model_router,
             )
             if getattr(conversation, "stop_reason", None) == "max_cost":
                 from relay.orchestrator import STATUS_MAX_COST

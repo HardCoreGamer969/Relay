@@ -5,8 +5,9 @@ require accept/reject before continuing. Reject returns control to brain replan
 (step marked failed with the rejection reason). Optional ``--commit-per-step``
 makes a git commit from the step instruction (requires a clean-enough git repo).
 
-``relay rewind <step-id>`` restores touched files via ``git checkout`` when git
-is available; otherwise fails clearly.
+``relay rewind <step-id>`` restores touched files from checkpoint
+``step_befores`` snapshots when available (handles new files + commit-per-step);
+falls back to ``git checkout`` for tracked edits.
 """
 
 from __future__ import annotations
@@ -82,6 +83,36 @@ def read_file_or_none(root: str | Path, rel: str) -> str | None:
             return path.read_bytes().decode("utf-8", errors="replace")
         except OSError:
             return None
+
+
+def restore_from_snapshots(
+    root: str | Path,
+    snapshots: dict[str, str | None] | None,
+) -> list[str]:
+    """Restore paths from before-snapshots. ``None`` value means delete (was new).
+
+    Returns the list of paths restored. Missing parents are created as needed.
+    """
+    root = Path(root)
+    restored: list[str] = []
+    if not snapshots:
+        return restored
+    for rel, before in snapshots.items():
+        if not rel or ".." in Path(rel).parts:
+            continue
+        dest = root / rel
+        try:
+            if before is None:
+                if dest.is_file() or dest.is_symlink():
+                    dest.unlink()
+                    restored.append(rel)
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(before, encoding="utf-8")
+            restored.append(rel)
+        except OSError:
+            continue
+    return restored
 
 
 def unified_diff_for_path(
@@ -257,27 +288,33 @@ def rewind_step_files(
     *,
     checkpoint_id: str | None = None,
 ) -> list[str]:
-    """Restore files touched by ``step_id`` via ``git checkout -- <paths>``.
+    """Restore files touched by ``step_id``.
 
-    Looks up touches from the given checkpoint (or latest / any checkpoint that
-    recorded them). Raises ``RuntimeError`` when git is unavailable or the step
-    has no recorded touches.
+    Prefers hermetic restore from checkpoint ``step_befores`` (handles new files
+    and commit-per-step). Falls back to ``git checkout -- <paths>`` when only
+    touches are recorded. Raises ``RuntimeError`` when neither is available.
     """
     root = Path(root)
-    if not _git_ok(root):
-        raise RuntimeError(
-            "rewind requires a git repository; "
-            "this project is not a git repo (or git is missing)"
-        )
     index = parse_step_id(step_id)
     if index is None:
         raise ValueError(f"invalid step id {step_id!r}; expected e.g. '1' or 'step-1'")
+
+    befores = _lookup_befores(root, index, checkpoint_id=checkpoint_id)
+    if befores:
+        restored = restore_from_snapshots(root, befores)
+        if restored:
+            return restored
 
     touches = _lookup_touches(root, index, checkpoint_id=checkpoint_id)
     if not touches:
         raise RuntimeError(
             f"no touched paths recorded for step {index}; "
             "cannot rewind (run with checkpoints enabled)"
+        )
+    if not _git_ok(root):
+        raise RuntimeError(
+            "rewind requires checkpoint snapshots or a git repository; "
+            "this project is not a git repo (or git is missing)"
         )
     try:
         proc = subprocess.run(
@@ -293,24 +330,45 @@ def rewind_step_files(
     return touches
 
 
+def _checkpoint_candidates(
+    root: Path, *, checkpoint_id: str | None
+) -> list[str]:
+    candidates: list[str] = []
+    if checkpoint_id:
+        candidates.append(checkpoint_id)
+        return candidates
+    try:
+        latest = load_checkpoint(root, "latest")
+        candidates.append(latest.id)
+    except FileNotFoundError:
+        pass
+    for row in list_checkpoints(root):
+        cid = row.get("id")
+        if cid and cid not in candidates:
+            candidates.append(cid)
+    return candidates
+
+
+def _lookup_befores(
+    root: Path, step_index: int, *, checkpoint_id: str | None
+) -> dict[str, str | None] | None:
+    key = str(step_index)
+    for cid in _checkpoint_candidates(root, checkpoint_id=checkpoint_id):
+        try:
+            cp = load_checkpoint(root, cid)
+        except FileNotFoundError:
+            continue
+        befores = getattr(cp, "step_befores", None) or {}
+        if key in befores and isinstance(befores[key], dict) and befores[key]:
+            return dict(befores[key])
+    return None
+
+
 def _lookup_touches(
     root: Path, step_index: int, *, checkpoint_id: str | None
 ) -> list[str]:
     key = str(step_index)
-    candidates: list[str] = []
-    if checkpoint_id:
-        candidates.append(checkpoint_id)
-    else:
-        try:
-            latest = load_checkpoint(root, "latest")
-            candidates.append(latest.id)
-        except FileNotFoundError:
-            pass
-        for row in list_checkpoints(root):
-            cid = row.get("id")
-            if cid and cid not in candidates:
-                candidates.append(cid)
-    for cid in candidates:
+    for cid in _checkpoint_candidates(root, checkpoint_id=checkpoint_id):
         try:
             cp = load_checkpoint(root, cid)
         except FileNotFoundError:

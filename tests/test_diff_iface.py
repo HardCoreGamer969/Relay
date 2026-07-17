@@ -149,3 +149,71 @@ def test_rewind_requires_git(tmp_path):
     (tmp_path / "a.txt").write_text("changed", encoding="utf-8")
     with pytest.raises(RuntimeError, match="git"):
         rewind_step_files(tmp_path, "step-0")
+
+
+def test_confirm_diff_reject_restores_disk(tmp_path):
+    """Reject rolls back the step's writes before replan."""
+    plan = Plan.from_instructions(["create a.txt with bad"])
+    n = {"i": 0}
+
+    def decide(prompt):
+        n["i"] += 1
+        return "reject" if n["i"] == 1 else "accept"
+
+    client = RoutedClient(
+        brain=[
+            "<verdict>accept</verdict><reason>ok</reason>",
+            "<plan><step>create b.txt with good</step></plan>",
+            "<verdict>accept</verdict><reason>ok</reason>",
+        ],
+        hands=[
+            '<write path="a.txt">bad</write>\n<done>wrote bad</done>',
+            '<write path="b.txt">good</write>\n<done>wrote good</done>',
+        ],
+    )
+    result = run_planned(
+        "a",
+        tmp_path,
+        models=CFG,
+        client=client,
+        committed_plan=plan,
+        supervise=True,
+        confirm_diff=True,
+        user_decision=decide,
+        auto_checkpoint=False,
+        max_escalations=3,
+    )
+    assert result.status == STATUS_COMPLETED
+    # Rejected a.txt must be gone (was new; before=None → delete).
+    assert not (tmp_path / "a.txt").exists()
+    assert (tmp_path / "b.txt").read_text() == "good"
+
+
+def test_rewind_from_step_befores_without_git(tmp_path):
+    """Hermetic restore from checkpoint snapshots works outside a git repo."""
+    from relay.diff_iface import restore_from_snapshots
+
+    (tmp_path / "new.txt").write_text("created", encoding="utf-8")
+    (tmp_path / "edit.txt").write_text("after", encoding="utf-8")
+    restored = restore_from_snapshots(
+        tmp_path,
+        {"new.txt": None, "edit.txt": "before\n"},
+    )
+    assert set(restored) == {"new.txt", "edit.txt"}
+    assert not (tmp_path / "new.txt").exists()
+    assert (tmp_path / "edit.txt").read_text() == "before\n"
+
+    plan = Plan(steps=[PlanStep(0, "write files", status="done", outcome="ok")])
+    save_checkpoint(
+        tmp_path,
+        plan,
+        goal="g",
+        step_touches={"0": ["new.txt", "edit.txt"]},
+        step_befores={"0": {"new.txt": None, "edit.txt": "before\n"}},
+    )
+    (tmp_path / "new.txt").write_text("created-again", encoding="utf-8")
+    (tmp_path / "edit.txt").write_text("after-again", encoding="utf-8")
+    paths = rewind_step_files(tmp_path, "step-0")
+    assert "new.txt" in paths and "edit.txt" in paths
+    assert not (tmp_path / "new.txt").exists()
+    assert (tmp_path / "edit.txt").read_text() == "before\n"

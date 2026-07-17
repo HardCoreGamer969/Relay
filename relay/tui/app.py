@@ -296,7 +296,9 @@ class RelayTuiApp(App):
         self._popover_index = 0
         self._assumption_level = assumption_level
         self._auto_approve = auto_approve
-        self._run_kwargs = run_kwargs
+        # Always a dict: CLI launches with run_kwargs=None, and _start_steer/.get
+        # must not AttributeError on interrupt→redirect / `/redirect`.
+        self._run_kwargs = dict(run_kwargs or {})
         # TODO(prompt-2): drive anim_mode from persisted settings + a launch
         # counter (a longer "first few launches" variant for "long"). Hardcoded
         # "short" for now; "off" is a clean instant no-op.
@@ -576,6 +578,11 @@ class RelayTuiApp(App):
                 return
         # Enter while the popover is open runs the highlighted command, never a goal.
         if self._popover_open:
+            if not self._popover_commands:
+                # Unknown/partial slash: keep the typed text and give feedback
+                # instead of silently clearing the prompt.
+                self._write_activity("(unknown command)", dim=True)
+                return
             event.input.value = ""
             self._popover_run_selected()
             return
@@ -685,6 +692,12 @@ class RelayTuiApp(App):
             self._write_conversation("")  # a blank line between runs
         self._write_conversation(f"you (goal): {goal}")
         self._router.begin_run()
+        # Attach the session ModelRouter so planning/execution honor call-class.
+        # Skip when tests inject a fake client (vendor/* models must stay unbound).
+        if self._client is None and self._run_kwargs.get("model_router") is None:
+            router = self._ensure_model_router()
+            if router is not None:
+                self._run_kwargs["model_router"] = router
         # Thread the SESSION-sticky working dir + the session transcript/memory, so a
         # working dir established earlier persists AND a later steer/queue continuation
         # keeps the same conversation + learnings.
@@ -817,16 +830,18 @@ class RelayTuiApp(App):
             return
 
         def on_decision(action: str, req=request, cmd=command) -> None:
+            # First settle wins (cancel already settled → deliver is a no-op).
+            # Only mutate transcript / session allowlist when the answer landed.
             if action == "deny":
-                req.deliver("no")
-                self._write_conversation("you (approval): no", speaker="user")
+                if req.deliver("no"):
+                    self._write_conversation("you (approval): no", speaker="user")
             else:
-                if action == "session" and cmd:
-                    self._session_approvals.add(cmd)
-                req.deliver("yes")
-                self._write_conversation(
-                    f"you (approval): yes ({action})", speaker="user",
-                )
+                if req.deliver("yes"):
+                    if action == "session" and cmd:
+                        self._session_approvals.add(cmd)
+                    self._write_conversation(
+                        f"you (approval): yes ({action})", speaker="user",
+                    )
             self._update_status()
 
         self.push_screen(ApproveDialog(
@@ -1794,16 +1809,22 @@ class RelayTuiApp(App):
             )
         else:
             # manual aggregator: a slug field validated live before saving.
+            # Off-thread only for the real network validator — injected test
+            # seams stay sync so headless pilots can assert on submit().
             def on_submit(slug, r=role, p=provider):
                 ok, note = self._save_role_model(r, p, slug)
                 after_save(ok)
                 return ok, note
 
+            use_async = self._validate_fn is None or (
+                self._validate_fn is provider_validate_model
+            )
             self.push_screen(TextEntryDialog(
                 title=f"{role} model ({provider})",
                 label="Type a model slug (validated live before saving):",
                 password=False, placeholder="e.g. openai/gpt-4o",
                 on_submit=on_submit,
+                async_submit=use_async,
             ))
 
     def _fetch_models_for_pick(self) -> list[str]:
@@ -2359,6 +2380,10 @@ class RelayTuiApp(App):
         self._activity_lines = []
         self._stream_rendered = []
         self._stream_plain = []
+        # Fresh session: drop allowlist / pending steer / fold UI state too.
+        self._session_approvals.clear()
+        self._pending_steer = None
+        self._tool_folds.clear()
         # Wipe the single stream (history rows + the live plan block) and its plan state.
         self._reset_plan()
         stream = self._stream()
@@ -2481,11 +2506,20 @@ class RelayTuiApp(App):
 
     # -- cancel + clean shutdown (the money-leak guard) --------------------------
 
+    def _dismiss_approve_dialog(self) -> None:
+        """Drop a stale ApproveDialog if it is still the top screen (esc interrupt)."""
+        try:
+            if isinstance(self.screen, ApproveDialog):
+                self.pop_screen()
+        except Exception:  # noqa: BLE001 -- no screen / already dismissed
+            pass
+
     def action_cancel_run(self) -> None:
         """esc = INTERRUPT, not teardown. A running run halts at the clean boundary and
         lands at the interrupt prompt (session intact); a SECOND esc (already
         interrupted) is STOP -- abandon the plan, keep the session."""
         if self._router.state is InputState.INTERRUPTED:
+            self._dismiss_approve_dialog()
             self._stop_from_interrupt()
             return
         runner = self._runner
@@ -2499,6 +2533,7 @@ class RelayTuiApp(App):
             # _handle_finished sees _interrupting and routes to the interrupt prompt.
             self._interrupting = True
             self._stopping = True
+            self._dismiss_approve_dialog()
             self._write_activity("[interrupt] halting at the next boundary... (esc again to stop)")
             self._update_status()
 

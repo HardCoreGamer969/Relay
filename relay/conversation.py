@@ -394,6 +394,7 @@ def plan_conversationally(
     on_event: EventSink | None = None,
     transcript: Transcript | None = None,
     envelope: CostEnvelope | None = None,
+    model_router: Any | None = None,
 ) -> ConversationResult:
     """Run the pre-execution planning conversation, returning a committed plan.
 
@@ -442,12 +443,19 @@ def plan_conversationally(
         )
         return True
 
+    def _models_for(purpose: str) -> ModelConfig | None:
+        if model_router is None or models is None:
+            return models
+        remapped, _change = model_router.models_for_purpose(models, purpose)
+        return remapped
+
     digest = project_digest(project_root)
     mem_ctx = _memory_slice(memory, goal, client=client, models=models, ledger=ledger)
 
     # 1. Scope assessment (visible + logged), then posture from scope + dial.
     assessment = _assess_scope(
-        goal, digest, assumption_level, mem_ctx, models=models, ledger=ledger, client=client, brain_role=brain_role
+        goal, digest, assumption_level, mem_ctx,
+        models=_models_for("plan"), ledger=ledger, client=client, brain_role=brain_role,
     )
     if cost_stop():
         return result
@@ -482,7 +490,7 @@ def plan_conversationally(
     # 3. Propose the initial plan (precise spec + surfaced assumptions).
     plan, assumptions, headline = _propose(
         goal, digest, assumption_level, answers, None, None, mem_ctx,
-        models=models, ledger=ledger, client=client, brain_role=brain_role,
+        models=_models_for("plan"), ledger=ledger, client=client, brain_role=brain_role,
     )
     if cost_stop():
         return result
@@ -519,7 +527,7 @@ def plan_conversationally(
         nonlocal plan, assumptions, headline
         plan, assumptions, headline = _propose(
             goal, digest, assumption_level, answers, result.plan, feedback, mem_ctx,
-            models=models, ledger=ledger, client=client, brain_role=brain_role,
+            models=_models_for("plan"), ledger=ledger, client=client, brain_role=brain_role,
         )
         result.plan = plan
         result.assumptions = assumptions
@@ -536,7 +544,7 @@ def plan_conversationally(
         result.rounds += 1
         classification = _classify_reaction(
             goal, result.plan, reaction,
-            models=models, ledger=ledger, client=client, brain_role=brain_role,
+            models=_models_for("plan"), ledger=ledger, client=client, brain_role=brain_role,
         )
         if cost_stop():
             return result

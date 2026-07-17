@@ -34,6 +34,7 @@ from relay.diff_iface import (
     commit_step_changes,
     confirm_step_diff,
     read_file_or_none,
+    restore_from_snapshots,
 )
 from relay.envelope import CostEnvelope, brain_cost_since
 from relay.explain import explain_events
@@ -489,6 +490,7 @@ def _run_executor_step(
     path_lease: PathLease | None = None,
     lease_owner: str | None = None,
     model_router: Any | None = None,
+    envelope: CostEnvelope | None = None,
 ) -> _StepOutcome:
     """Run the hands in a fresh, narrow context until done/blocked/budget/question.
 
@@ -582,7 +584,9 @@ def _run_executor_step(
                 ledger.record_parse_failure()
                 consecutive_parse_failures += 1
             if model_router is not None and models is not None:
-                fitness = model_router.note_parse_failure(models)
+                fitness = model_router.note_parse_failure(
+                    models, envelope=envelope, ledger=ledger,
+                )
                 if fitness is not None and emit is not None:
                     emit(
                         EVENT_ROUTE_CHANGE,
@@ -676,6 +680,18 @@ def _run_executor_step(
                 )
                 continue
             # D2/D3/D4: snapshot + lease before mutating writes.
+            # Bash can write arbitrary paths; under a PathLease fail closed so the
+            # step serializes via replan instead of bypassing leases.
+            if path_lease is not None and action.kind == "bash":
+                return _StepOutcome(
+                    False,
+                    failure_reason=(
+                        "orchestra: bash cannot run in a parallel batch "
+                        "(path claims are opaque); replan serially"
+                    ),
+                    calls=calls, transcript=transcript, touched_paths=touched,
+                    before_snapshots=before_snaps, contested_path="*",
+                )
             write_paths: list[str] = []
             if action.kind in ("edit", "write") and action.path:
                 write_paths = [action.path]
@@ -1044,13 +1060,42 @@ def run_planned(
         ).to_dict()
         return result
 
+    def _models_for(purpose: str) -> ModelConfig:
+        """Remap brain/hands via the route contract for a harness purpose."""
+        if model_router is None or models is None:
+            return models  # type: ignore[return-value]
+        remapped, change = model_router.models_for_purpose(models, purpose)
+        if change is not None and change.from_model != change.to_model:
+            emit(
+                EVENT_ROUTE_CHANGE,
+                f"route {change.route}: {change.role} "
+                f"{change.from_model}→{change.to_model} ({change.reason})",
+                change.as_payload(),
+            )
+        return remapped
+
+    def _replan_models() -> ModelConfig:
+        if model_router is None or models is None:
+            return models  # type: ignore[return-value]
+        remapped, change = model_router.models_for_replan(
+            models, envelope=envelope, ledger=ledger,
+        )
+        if change is not None and change.from_model != change.to_model:
+            emit(
+                EVENT_ROUTE_CHANGE,
+                f"route {change.route}: {change.role} "
+                f"{change.from_model}→{change.to_model} ({change.reason})",
+                change.as_payload(),
+            )
+        return remapped
+
     # --- Plan phase --------------------------------------------------------
     # A committed_plan (from the planning conversation) skips make_plan.
     if committed_plan is not None:
         plan = committed_plan if committed_plan.steps else None
     else:
         plan = make_plan(
-            goal, project_root, models=models, ledger=ledger, client=client,
+            goal, project_root, models=_models_for("plan"), ledger=ledger, client=client,
             max_investigation_steps=max_investigation_steps, brain_role=brain_role,
             on_event=lambda kind, message, payload: emit(kind, message, payload),
         )
@@ -1115,7 +1160,7 @@ def run_planned(
             if revisions < max_plan_revisions:
                 reason = "skeptic objections:\n- " + "\n- ".join(review.objections)
                 revised = evolve_plan(
-                    goal, plan, reason, memory, models=models, ledger=ledger,
+                    goal, plan, reason, memory, models=_models_for("replan"), ledger=ledger,
                     client=client, memory_budget_tokens=mem_budget, brain_role=brain_role,
                 )
                 revisions += 1
@@ -1205,7 +1250,8 @@ def run_planned(
                 transcript, budget_tokens=mem_budget, client=client, models=models, ledger=ledger
             )
             resolution = answer_or_escalate(
-                question, goal, plan, step, memory, models=models, ledger=ledger,
+                question, goal, plan, step, memory, models=_models_for("answer"),
+                ledger=ledger,
                 client=client, memory_budget_tokens=mem_budget, brain_role=brain_role,
                 assumption_level=assumption_level, conversation_context=convo_ctx,
                 question_class=question_class,
@@ -1287,6 +1333,7 @@ def run_planned(
             shared_context=hands_shared(), hands_context_mode=context_mode,
             step_summaries=summaries, wide_transcript=wide_tx,
             model_router=model_router,
+            envelope=envelope,
         )
         executor_calls += outcome.calls
         followups_used = 0
@@ -1317,7 +1364,8 @@ def run_planned(
             review = review_step(
                 goal, plan, step, outcome.summary, outcome.transcript, memory,
                 tools=tools, touched_paths=outcome.touched_paths, max_review_steps=max_review_steps,
-                models=models, ledger=ledger, client=client, memory_budget_tokens=mem_budget,
+                models=_models_for("review"), ledger=ledger, client=client,
+                memory_budget_tokens=mem_budget,
                 brain_role=brain_role, on_event=emit,
             )
             review_brain_usd += brain_cost_since(ledger, before_review)
@@ -1358,6 +1406,7 @@ def run_planned(
                 on_finding=record_finding, shared_context=hands_shared(),
                 hands_context_mode=context_mode, step_summaries=summaries, wide_transcript=wide_tx,
                 model_router=model_router,
+                envelope=envelope,
             )
             executor_calls += outcome.calls
 
@@ -1416,6 +1465,8 @@ def run_planned(
                 {"index": step.index, "accepted": accepted, "reason": reason, "paths": touched},
             )
             if not accepted:
+                # Roll back disk to pre-step snapshots before replan.
+                restore_from_snapshots(project_root, befores)
                 return reason
         plan.mark_done(step, summary)
         envelope.note_completed_step()
@@ -1468,6 +1519,9 @@ def run_planned(
         nonlocal executor_calls, escalations, plan
         lease = PathLease()
         mem_lock = threading.Lock()
+        # Split remaining budget across the batch so N workers cannot burn
+        # N * step_budget calls before the next ceiling check.
+        per_worker_budget = max(1, step_budget // max(1, len(batch)))
 
         def make_worker(step: PlanStep, slot: int):
             role = hands_role_for_worker(slot)
@@ -1487,11 +1541,12 @@ def run_planned(
 
                 outcome = _run_executor_step(
                     step, plan, goal, worker_tools, hands_role=role, models=models,
-                    ledger=ledger, client=client, max_steps=step_budget, emit=None,
+                    ledger=ledger, client=client, max_steps=per_worker_budget, emit=None,
                     cancel_check=cancel_check, reads={}, on_finding=record_finding,
                     shared_context="", hands_context_mode="needle",
                     path_lease=lease, lease_owner=role,
                     model_router=model_router,
+                    envelope=envelope,
                 )
                 return WorkerResult(
                     step_index=step.index,
@@ -1530,6 +1585,7 @@ def run_planned(
             emit("status", "run cancelled during orchestra batch", {"status": STATUS_CANCELLED})
             return False
 
+        # Pass 1: account every worker's calls + emit status (no early break).
         failure: WorkerResult | None = None
         for step in batch:
             wr = by_index.get(step.index)
@@ -1548,24 +1604,28 @@ def run_planned(
                     "contested_path": wr.contested_path,
                 },
             )
-            if wr.success:
-                reject = _confirm_then_settle(
-                    step, wr.summary or "orchestra step complete",
-                    touched=wr.touched_paths, befores=wr.before_snapshots,
-                    provenance=f"step{step.index} {wr.worker_role}",
-                )
-                if reject:
-                    plan.mark_failed(step, reject)
-                    dead_ended_instructions.append(step.instruction)
+
+        # Pass 2: settle every success so disk writes aren't left pending on a
+        # sibling failure. Rejects restore snapshots via _confirm_then_settle.
+        for step in batch:
+            wr = by_index.get(step.index)
+            if wr is None or not wr.success:
+                continue
+            reject = _confirm_then_settle(
+                step, wr.summary or "orchestra step complete",
+                touched=wr.touched_paths, befores=wr.before_snapshots,
+                provenance=f"step{step.index} {wr.worker_role}",
+            )
+            if reject:
+                plan.mark_failed(step, reject)
+                dead_ended_instructions.append(step.instruction)
+                if failure is None:
                     failure = WorkerResult(
                         step_index=step.index, success=False, failure_reason=reject,
                         worker_role=wr.worker_role,
                     )
-                    break
-            else:
-                failure = wr
-                break
 
+        # Pass 3: first failed worker (plan order) drives replan.
         if failure is None:
             for step in batch:
                 wr = by_index.get(step.index)
@@ -1608,7 +1668,7 @@ def run_planned(
             before_replan = len(ledger.records)
             revised = replan(
                 goal, plan, failed_step, failure.failure_reason, plan.completed_outcomes(),
-                models=models, ledger=ledger, client=client, brain_role=brain_role,
+                models=_replan_models(), ledger=ledger, client=client, brain_role=brain_role,
                 memory=memory, memory_budget_tokens=mem_budget,
             )
             envelope.add_wasted_brain(brain_cost_since(ledger, before_replan))
@@ -1754,7 +1814,7 @@ def run_planned(
                 before_replan = len(ledger.records)
                 revised = replan(
                     goal, plan, step, reject, plan.completed_outcomes(),
-                    models=models, ledger=ledger, client=client, brain_role=brain_role,
+                    models=_replan_models(), ledger=ledger, client=client, brain_role=brain_role,
                     memory=memory, memory_budget_tokens=mem_budget,
                 )
                 envelope.add_wasted_brain(brain_cost_since(ledger, before_replan))
@@ -1790,8 +1850,10 @@ def run_planned(
                 emit("status", f"plan-revision budget ({max_plan_revisions}) reached; keeping current plan",
                      {"status": "revision_budget"})
                 continue
-            revised = evolve_plan(goal, plan, disposition.revise_reason, memory, models=models,
-                                  ledger=ledger, client=client, memory_budget_tokens=mem_budget, brain_role=brain_role)
+            revised = evolve_plan(
+                goal, plan, disposition.revise_reason, memory, models=_models_for("replan"),
+                ledger=ledger, client=client, memory_budget_tokens=mem_budget, brain_role=brain_role,
+            )
             if revised is None:
                 result.status = STATUS_ABORTED_BY_BRAIN
                 emit("status", "brain aborted: goal deemed unreachable", {"status": STATUS_ABORTED_BY_BRAIN})
@@ -1835,21 +1897,9 @@ def run_planned(
              {"n": escalations, "failed_index": step.index, "reason": disposition.failure_reason})
 
         before_replan = len(ledger.records)
-        replan_models = models
-        if model_router is not None:
-            replan_models, route_change = model_router.models_for_replan(
-                models, envelope=envelope, ledger=ledger,
-            )
-            if route_change is not None:
-                emit(
-                    EVENT_ROUTE_CHANGE,
-                    f"route {route_change.route}: {route_change.role} "
-                    f"{route_change.from_model}→{route_change.to_model} ({route_change.reason})",
-                    route_change.as_payload(),
-                )
         revised = replan(
             goal, plan, step, disposition.failure_reason, plan.completed_outcomes(),
-            models=replan_models, ledger=ledger, client=client, brain_role=brain_role,
+            models=_replan_models(), ledger=ledger, client=client, brain_role=brain_role,
             memory=memory, memory_budget_tokens=mem_budget,
         )
         envelope.add_wasted_brain(brain_cost_since(ledger, before_replan))

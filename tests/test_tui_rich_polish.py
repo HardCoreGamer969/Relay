@@ -176,3 +176,64 @@ def test_tui_prefs_persist_plan_mode(tmp_path, monkeypatch):
             assert cfg["tui"]["plan_dock"] == "hidden"
 
     asyncio.run(main())
+
+
+def test_run_kwargs_defaults_to_empty_dict(tmp_path):
+    """CLI launches with run_kwargs=None; steer/redirect must not AttributeError."""
+    app = _app(tmp_path)
+    assert app._run_kwargs == {}
+    # The budget check path used by _start_steer.
+    assert app._run_kwargs.get("max_plan_revisions", 5) == 5
+
+
+def test_clear_resets_session_approvals(tmp_path):
+    async def main():
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._session_approvals.add("pip install x")
+            app._pending_steer = "old"
+            app._tool_folds[1] = {"label": "x"}
+            app._cmd_clear()
+            assert app._session_approvals == set()
+            assert app._pending_steer is None
+            assert app._tool_folds == {}
+
+    asyncio.run(main())
+
+
+def test_stale_approve_decision_does_not_fake_transcript(tmp_path):
+    async def main():
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            req = UiRequest(
+                kind=REQUEST_APPROVAL,
+                prompt=(
+                    "The executor wants to run a gated command:\n  rm -rf /tmp/x\n"
+                    "Why gated: destructive\nApprove? (yes/no)"
+                ),
+            )
+            app._open_approve_modal(req)
+            await pilot.pause()
+            assert isinstance(app.screen, ApproveDialog)
+            # Interrupt settles the request first (as runner.cancel would).
+            assert req.cancel() is True
+            app._dismiss_approve_dialog()
+            await pilot.pause()
+            # Late Once must not append a fake approval line.
+            before = list(app._conversation_lines)
+            # Re-open a finished dialog callback path directly.
+            def on_decision(action: str, req=req):
+                if action == "deny":
+                    if req.deliver("no"):
+                        app._write_conversation("you (approval): no", speaker="user")
+                else:
+                    if req.deliver("yes"):
+                        app._write_conversation(
+                            f"you (approval): yes ({action})", speaker="user",
+                        )
+            on_decision("once")
+            assert app._conversation_lines == before
+
+    asyncio.run(main())

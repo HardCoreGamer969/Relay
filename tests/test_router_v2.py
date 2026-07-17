@@ -413,3 +413,38 @@ def test_e12_log_shadow_helper(tmp_path):
     )
     text = (tmp_path / ".relay" / "shadow.jsonl").read_text(encoding="utf-8")
     assert "review" in text
+
+
+def test_e8_skeptic_beats_phase_brain():
+    c = parse_route_contract(
+        {
+            "route": "balanced",
+            "call_class": {"skeptic": "cheap/skeptic"},
+            "phases": {"planning": {"brain": "plan/opus"}},
+        }
+    )
+    assert model_for_call_class(c, "skeptic", phase="planning") == "cheap/skeptic"
+    assert model_for_call_class(c, "plan", phase="planning") == "plan/opus"
+
+
+def test_e9_fitness_freeze_via_envelope(monkeypatch):
+    monkeypatch.delenv("RELAY_HANDS_MODEL", raising=False)
+    from relay.envelope import CostEnvelope
+    from relay.telemetry import CallRecord, Ledger
+
+    c = parse_route_contract({"route": "economy", "hands_bump_on_parse_failures": 1})
+    router = ModelRouter(route=c.as_profile(), contract=c)
+    models = ModelConfig(brain=c.brain, hands=c.hands)
+    ledger = Ledger()
+    # Pretend we already spent past the freeze fraction.
+    ledger.add(CallRecord("hands", c.hands, 1, 1, 0.0, 0.9))
+    env = CostEnvelope(max_cost=1.0)
+    change = router.note_parse_failure(models, envelope=env, ledger=ledger)
+    assert change is not None
+    assert change.reason == "bump_frozen"
+    assert router.bumps_frozen is True
+
+
+def test_next_hands_tier_off_ladder_goes_premium():
+    from relay.router import next_hands_tier, _HANDS_TIERS
+    assert next_hands_tier("vendor/custom-hands") == _HANDS_TIERS[-1]

@@ -37,3 +37,20 @@ def test_resolve_env_beats_config(monkeypatch, tmp_path):
 def test_unknown_falls_to_default(monkeypatch, tmp_path):
     monkeypatch.delenv("RELAY_PROFILE", raising=False)
     assert resolve_profile("nope", root=tmp_path, config={}).name == DEFAULT_PROFILE
+
+
+def test_env_assumption_level_beats_default_profile(monkeypatch, tmp_path):
+    """relay run must honor RELAY_ASSUMPTION_LEVEL over the default profile dial."""
+    import os
+    from relay.config import resolve_assumption_level
+    from relay.profiles import resolve_profile
+
+    monkeypatch.delenv("RELAY_PROFILE", raising=False)
+    monkeypatch.setenv("RELAY_ASSUMPTION_LEVEL", "5")
+    active = resolve_profile(None, root=tmp_path, config={})
+    dial_override = None
+    if dial_override is None and not os.environ.get("RELAY_ASSUMPTION_LEVEL"):
+        dial_override = active.assumption_level
+    dial = resolve_assumption_level(override=dial_override)
+    assert dial == "5"
+    assert active.assumption_level == "3"  # contractor default still 3

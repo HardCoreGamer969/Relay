@@ -172,7 +172,17 @@ class SetupScreen(ModalScreen):
         name = event.worker.name or ""
         if not name.startswith("setup-models-"):
             return
-        role = name[len("setup-models-"):]
+        # Name format: setup-models-{role}::{provider} — ignore stale completes.
+        rest = name[len("setup-models-"):]
+        if "::" not in rest:
+            return
+        role, provider = rest.split("::", 1)
+        try:
+            current = str(self.query_one(f"#{role}-provider", Select).value)
+        except Exception:  # noqa: BLE001 -- torn down
+            return
+        if current != provider:
+            return
         ids = list(event.worker.result or [])
         self._apply_model_options(role, ids)
 
@@ -196,16 +206,20 @@ class SetupScreen(ModalScreen):
             return []
 
     def _start_fetch_models(self, role: str, provider: str) -> None:
-        """Kick a named thread worker so results can be routed per role."""
+        """Kick a named thread worker so results can be routed per role.
+
+        Stamp the provider into the worker name and use an exclusive per-role
+        group so a slow prior fetch cannot overwrite a newer provider's list.
+        """
         def fetch() -> list[str]:
             return self.models_for(provider)
 
         self.run_worker(
             fetch,
             thread=True,
-            name=f"setup-models-{role}",
-            group="setup-models",
-            exclusive=False,
+            name=f"setup-models-{role}::{provider}",
+            group=f"setup-models-{role}",
+            exclusive=True,
             exit_on_error=False,
         )
 

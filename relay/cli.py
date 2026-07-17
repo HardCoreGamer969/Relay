@@ -334,15 +334,34 @@ def run(
     ledger = Ledger()
     approver = None if auto_approve else _interactive_approver
     active_profile = resolve_profile(profile or None, root=root)
-    dial = resolve_assumption_level(override=assume or active_profile.assumption_level)
+    # Precedence: --assume > RELAY_ASSUMPTION_LEVEL > profile dial > auto.
+    # Do NOT pass the profile dial as override when env is set (that shadowed
+    # RELAY_ASSUMPTION_LEVEL and diverged from the TUI path).
+    dial_override = assume or None
+    if dial_override is None and not os.environ.get("RELAY_ASSUMPTION_LEVEL"):
+        dial_override = active_profile.assumption_level
+    dial = resolve_assumption_level(override=dial_override)
     confirm_plan = confirm_plan or active_profile.confirm_plan
     supervise_flag = (not no_supervise) and active_profile.supervise
-    ceiling = resolve_max_total_steps(
-        override=max_total_steps if max_total_steps is not None else active_profile.max_total_steps_hint
-    )
-    cost_ceiling = resolve_max_cost(
-        override=max_cost if max_cost is not None else active_profile.max_cost_hint
-    )
+    # Profile step/cost hints are soft defaults — never override CLI/env/config.
+    ceiling = resolve_max_total_steps(override=max_total_steps)
+    if (
+        max_total_steps is None
+        and not os.environ.get("RELAY_MAX_TOTAL_STEPS")
+        and active_profile.max_total_steps_hint is not None
+    ):
+        cfg_store = load_config() or {}
+        if cfg_store.get("max_total_steps") is None:
+            ceiling = active_profile.max_total_steps_hint
+    cost_ceiling = resolve_max_cost(override=max_cost)
+    if (
+        max_cost is None
+        and not os.environ.get("RELAY_MAX_COST")
+        and active_profile.max_cost_hint is not None
+    ):
+        cfg_store = load_config() or {}
+        if cfg_store.get("max_cost") is None:
+            cost_ceiling = active_profile.max_cost_hint
     scope = resolve_envelope_scope(override=envelope_scope or None)
     warn_thresholds = resolve_envelope_warn(override=envelope_warn or None)
     bash_timeout = resolve_bash_timeout()
@@ -510,6 +529,13 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
 
     transcript = Transcript()  # the one continuous thread across planning + execution
 
+    # A3: reload durable shared memory so findings survive process exit (TUI/bridge
+    # already does this; CLI previously only wrote, never read).
+    from relay.durable_memory import merge_shared_into_bus
+    from relay.memory import MemoryBus
+    memory = MemoryBus()
+    merge_shared_into_bus(memory, root)
+
     # D2: resume from checkpoint or load a named fork (skip planning conversation).
     committed = None
     if resume_checkpoint:
@@ -563,6 +589,7 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
                 orchestra_workers=orchestra_workers,
                 save_fork_as=save_fork_as,
                 auto_checkpoint=auto_checkpoint,
+                memory=memory,
             )
         except Exception as exc:  # noqa: BLE001
             _print_run_error(exc)
@@ -584,6 +611,7 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
             assumption_level=dial, user_turn=_interactive_user_turn,
             max_rounds=1 if confirm_plan else DEFAULT_MAX_ROUNDS,
             on_event=_on_conv_event, transcript=transcript, envelope=env,
+            memory=memory,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)
@@ -648,6 +676,7 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
             orchestra_workers=orchestra_workers,
             save_fork_as=save_fork_as,
             auto_checkpoint=auto_checkpoint,
+            memory=memory,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)

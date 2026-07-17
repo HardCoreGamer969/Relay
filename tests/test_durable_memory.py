@@ -60,3 +60,17 @@ def test_trim_prefers_pinned(tmp_path):
     ids = {e.summary for e in list_entries(tmp_path)}
     assert "n0" in ids  # pinned survived
     assert len(ids) == 2
+
+
+def test_cli_run_planned_reloads_shared_memory(tmp_path, monkeypatch):
+    """CLI path must merge durable shared memory before planning/execution."""
+    from relay.durable_memory import merge_shared_into_bus, save_shared
+    from relay.memory import MemoryBus, PlanMemory
+
+    durable = PlanMemory()
+    durable.remember("fact", "auth lives in auth.py", "auth in auth.py", provenance="run-a")
+    save_shared(tmp_path, durable)
+
+    bus = MemoryBus()
+    assert merge_shared_into_bus(bus, tmp_path) == 1
+    assert any("auth.py" in e.detail for e in bus.shared.entries)

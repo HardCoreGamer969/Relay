@@ -540,11 +540,9 @@ def next_hands_tier(current: str) -> str | None:
     try:
         idx = _HANDS_TIERS.index(current)
     except ValueError:
-        # Not on ladder: bump toward premium hands.
-        for slug in _HANDS_TIERS:
-            if slug != current:
-                return slug
-        return None
+        # Not on ladder: bump toward premium hands (last distinct tier), never
+        # economy — returning the first different slug previously downgraded.
+        return _HANDS_TIERS[-1] if _HANDS_TIERS else None
     for j in range(idx + 1, len(_HANDS_TIERS)):
         if _HANDS_TIERS[j] != current:
             return _HANDS_TIERS[j]

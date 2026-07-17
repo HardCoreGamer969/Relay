@@ -5,6 +5,12 @@
 > tests/CI/docs/website quality stack). Every finding cited below carries a
 > `file:line` reference valid as of commit `ad36ecf`.
 
+> **Product differentiation** (bake-off, assumption profiles, model router, etc.)
+> lives in [`features/MASTER.md`](features/MASTER.md) — a sibling roadmap, not a
+> section of this file. This plan stays engineering: bugs, structure, parity
+> hygiene. When a features-doc item needs infra from here, link it; do not
+> duplicate designs across the two trees.
+
 ---
 
 ## The verdict: don't rewrite — refactor in place
@@ -401,6 +407,11 @@ rendered-output diffs (the mirror buffers make this assertable).
   `tui.py:2756-2764`).
 
 ## TUI sequencing
+
+> **Product cockpit plan (locked decisions + U0–U6):**  
+> [`docs/features/tui-revamp/MASTER.md`](features/tui-revamp/MASTER.md)  
+> folds T1–T5 into stages U0–U6 with IDE density, website brand, and anim kill switch.
+> Prefer that folder for status; this section remains the engineering rationale.
 
 ```
 T1 (split)  ──►  T2 (foundations)  ──►  T3 (rendering)  ──►  T5 (polish)

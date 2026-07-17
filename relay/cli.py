@@ -8,6 +8,7 @@ Every command prints telemetry, now naturally split brain vs hands.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -17,8 +18,6 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from relay.catalog import load_catalog
-from relay.client import build_client
 from relay.config import (
     ROLES,
     default_config,
@@ -26,12 +25,26 @@ from relay.config import (
     load_models,
     resolve_assumption_level,
     resolve_bash_timeout,
+    resolve_envelope_scope,
+    resolve_envelope_warn,
+    resolve_hands_context_mode,
     resolve_max_cost,
     resolve_max_total_steps,
 )
+from relay.doctor import (
+    _build_provider_clients,
+    _doctor_checks,
+    _missing_provider_keys,
+    _probe_model,
+    _print_doctor_table,
+    _run_doctor,
+    _safe_load_catalog,
+)
 from relay.context import resolve_context_window
+from relay.envelope import CostEnvelope
+from relay.profiles import resolve_profile
+from relay.router import ModelRouter, format_broker_line
 from relay.providers import (
-    DEFAULT_PROVIDER,
     DISCOVERY_LIST,
     known_providers,
     list_models,
@@ -43,6 +56,7 @@ from relay.store import CONFIG_VERSION, load_config, save_config
 from relay.conversation import DEFAULT_MAX_ROUNDS, plan_conversationally
 from relay.loop import (
     STATUS_COMPLETED,
+    STATUS_MAX_COST as SOLO_STATUS_MAX_COST,
     STATUS_MAX_STEPS,
     STATUS_PARSE_FAILURE_ABORT,
     StepResult,
@@ -56,6 +70,7 @@ from relay.orchestrator import (
     STATUS_MAX_COST,
     STATUS_PLANNING_FAILED,
     STATUS_REPEATED_STEP,
+    STATUS_SKEPTIC_BLOCKED,
     STATUS_UNRESOLVED_ESCALATION,
     Event,
     PlannedTaskResult,
@@ -183,10 +198,22 @@ def run(
     ),
     max_cost: float | None = typer.Option(
         None, "--max-cost",
-        help="Hard cost ceiling (dollars) for a planned run. The run halts at "
-        "the step boundary when ledger.total_cost() crosses this value. "
-        "Default unbounded; pass 0 to disable explicitly. Overrides "
-        "RELAY_MAX_COST and config for this run.",
+        help="Hard cost ceiling (dollars). The run halts at a step/turn boundary "
+        "when chargeable spend crosses this value. Default unbounded; pass 0 to "
+        "disable. Overrides RELAY_MAX_COST and config for this run.",
+    ),
+    envelope_scope: str = typer.Option(
+        "",
+        "--envelope-scope",
+        help="Cost-envelope scope (cost ceiling only; does not change step ceilings): "
+        "'all' counts planning+execution (default), 'execution' excludes planning spend. "
+        "Overrides RELAY_ENVELOPE_SCOPE / config.",
+    ),
+    envelope_warn: str = typer.Option(
+        "",
+        "--envelope-warn",
+        help="Comma-separated warn fractions of each active ceiling "
+        "(default 0.5,0.8,0.9,0.99). Overrides RELAY_ENVELOPE_WARN / config.",
     ),
     no_supervise: bool = typer.Option(
         False, "--no-supervise",
@@ -196,6 +223,27 @@ def run(
         "", "--assume",
         help="Assumption dial: 1 (assume freely) .. 5 (follow the letter) or 'auto'. "
         "Overrides RELAY_ASSUMPTION_LEVEL for this run.",
+    ),
+    profile: str = typer.Option(
+        "",
+        "--profile",
+        help="Assumption profile (surgeon|contractor|intern|chaos). Sets dial + "
+        "defaults; --assume still wins for the dial. Overrides RELAY_PROFILE / "
+        ".relay/profile.json / config.",
+    ),
+    hands_context: str = typer.Option(
+        "",
+        "--hands-context",
+        help="Hands context dial: needle (default) | findings | summary | wide. "
+        "wide is debug-only and still never receives brain reasoning. "
+        "Overrides RELAY_HANDS_CONTEXT_MODE.",
+    ),
+    route: str = typer.Option(
+        "",
+        "--route",
+        help="Model route profile: economy | balanced | premium. Sets brain/hands "
+        "defaults; RELAY_BRAIN_MODEL / RELAY_HANDS_MODEL / config still win. "
+        "Overrides RELAY_ROUTE / .relay/route.json.",
     ),
     show_transcript: bool = typer.Option(
         False, "--show-transcript",
@@ -211,6 +259,68 @@ def run(
     no_log: bool = typer.Option(
         False, "--no-log", help="Skip persisting this run to .relay/runs.jsonl."
     ),
+    skeptic: bool | None = typer.Option(
+        None,
+        "--skeptic/--no-skeptic",
+        help="Enable the adversarial skeptic (read-only plan review). Unresolved "
+        "objections block continue or force a replan. Default: RELAY_SKEPTIC / "
+        "config review.adversarial (off).",
+    ),
+    confirm_diff: bool | None = typer.Option(
+        None,
+        "--confirm-diff/--no-confirm-diff",
+        help="After each successful step, show a unified diff of touched paths "
+        "and require accept/reject before continuing (D3). Default: "
+        "RELAY_CONFIRM_DIFF / config diff.confirm (off).",
+    ),
+    commit_per_step: bool | None = typer.Option(
+        None,
+        "--commit-per-step/--no-commit-per-step",
+        help="After each accepted step, git-commit touched paths with a message "
+        "from the step instruction (requires a git repo). Default: "
+        "RELAY_COMMIT_PER_STEP / config diff.commit_per_step (off).",
+    ),
+    orchestra: int = typer.Option(
+        1,
+        "--orchestra",
+        help="Max parallel hands workers for disjoint-file steps (D4). "
+        "1 = serial (default). Overlapping path claims serialize.",
+    ),
+    save_fork: str = typer.Option(
+        "",
+        "--save-fork",
+        help="After the plan is committed, save it as a named fork under "
+        ".relay/forks/<name>.json (D2).",
+    ),
+    resume: str = typer.Option(
+        "",
+        "--resume",
+        help="Resume from a checkpoint id (or 'latest') under .relay/checkpoints/ "
+        "(D2). Skips planning; executes remaining pending steps.",
+    ),
+    fork_load: str = typer.Option(
+        "",
+        "--fork",
+        help="Load a named plan fork from .relay/forks/ and execute it "
+        "(skips planning conversation).",
+    ),
+    no_checkpoint: bool = typer.Option(
+        False,
+        "--no-checkpoint",
+        help="Disable automatic step-boundary checkpoints under .relay/checkpoints/.",
+    ),
+    shadow_route: bool | None = typer.Option(
+        None,
+        "--shadow-route/--no-shadow-route",
+        help="Log cheaper call-class choices to .relay/shadow.jsonl without dual "
+        "API calls (E12). Default: RELAY_SHADOW_ROUTE (off).",
+    ),
+    counterfactual: str = typer.Option(
+        "premium",
+        "--counterfactual",
+        help="Baseline route for end-of-run counterfactual receipt (E4). "
+        "Pass empty string to disable. Default: premium when route ≠ premium.",
+    ),
 ) -> None:
     """Run the agent against a goal.
 
@@ -223,49 +333,116 @@ def run(
     cfg = load_models()
     ledger = Ledger()
     approver = None if auto_approve else _interactive_approver
-    dial = resolve_assumption_level(override=assume or None)
-    ceiling = resolve_max_total_steps(override=max_total_steps)  # 50 by default; flag/env/config can raise
-    cost_ceiling = resolve_max_cost(override=max_cost)
+    active_profile = resolve_profile(profile or None, root=root)
+    dial = resolve_assumption_level(override=assume or active_profile.assumption_level)
+    confirm_plan = confirm_plan or active_profile.confirm_plan
+    supervise_flag = (not no_supervise) and active_profile.supervise
+    ceiling = resolve_max_total_steps(
+        override=max_total_steps if max_total_steps is not None else active_profile.max_total_steps_hint
+    )
+    cost_ceiling = resolve_max_cost(
+        override=max_cost if max_cost is not None else active_profile.max_cost_hint
+    )
+    scope = resolve_envelope_scope(override=envelope_scope or None)
+    warn_thresholds = resolve_envelope_warn(override=envelope_warn or None)
     bash_timeout = resolve_bash_timeout()
     _warn_if_dirty_git(root)
 
     mode = "solo" if solo else "planned"
+    # Solo uses --max-steps as the step dimension; planned uses the global ceiling.
+    step_ceiling = max_steps if solo else ceiling
+    envelope = CostEnvelope(
+        max_cost=cost_ceiling,
+        max_steps=step_ceiling,
+        scope=scope,
+        warn_thresholds=warn_thresholds,
+    )
+    context_mode = resolve_hands_context_mode(hands_context or None)
+    router = ModelRouter.from_resolve(route or None, root=root, shadow=shadow_route)
+    cfg, _route_changes = router.bind(cfg)
+    from relay.skeptic import resolve_skeptic
+    from relay.diff_iface import resolve_confirm_diff, resolve_commit_per_step
+    skeptic_on = resolve_skeptic(skeptic)
+    confirm_diff_on = resolve_confirm_diff(confirm_diff)
+    commit_per_step_on = resolve_commit_per_step(commit_per_step)
+    broker = format_broker_line(
+        router, envelope, None, orchestra_workers=orchestra
+    )
+    console.print(
+        f"[dim]profile={active_profile.name} ({active_profile.description}) · "
+        f"dial={dial} · hands-context={context_mode} · {broker}"
+        f"{' · skeptic' if skeptic_on else ''}"
+        f"{' · confirm-diff' if confirm_diff_on else ''}"
+        f"{' · commit-per-step' if commit_per_step_on else ''}"
+        f"{' · shadow' if router.shadow_enabled else ''}[/dim]"
+    )
     start = time.perf_counter()
     if solo:
-        result = _run_solo(goal, root, solo, max_steps, cfg, ledger, auto_approve, approver,
-                           bash_timeout_s=bash_timeout)
+        result = _run_solo(
+            goal, root, solo, max_steps, cfg, ledger, auto_approve, approver,
+            bash_timeout_s=bash_timeout, envelope=envelope,
+        )
     else:
         result = _run_planned(
             goal, root, cfg, ledger, auto_approve, approver, confirm_plan,
-            supervise=not no_supervise, dial=dial, show_transcript=show_transcript,
+            supervise=supervise_flag, dial=dial, show_transcript=show_transcript,
             max_total_steps=ceiling, max_cost=cost_ceiling, bash_timeout_s=bash_timeout,
-            plan_only=plan_only,
+            plan_only=plan_only, envelope=envelope,
+            hands_context_mode=context_mode, model_router=router,
+            skeptic=skeptic_on,
+            confirm_diff=confirm_diff_on,
+            commit_per_step=commit_per_step_on,
+            orchestra_workers=orchestra,
+            save_fork_as=save_fork or None,
+            resume_checkpoint=resume or None,
+            fork_name=fork_load or None,
+            auto_checkpoint=not no_checkpoint,
         )
     wall_time_s = time.perf_counter() - start
 
     _print_telemetry(ledger)
+    cf_baseline = (counterfactual or "").strip().lower()
+    if cf_baseline and router.route.name == cf_baseline:
+        cf_baseline = ""  # skip when already on the baseline route
+    _print_receipt(
+        envelope, ledger, status=getattr(result, "status", ""),
+        counterfactual_baseline=cf_baseline or None,
+    )
+    # A3: persist shared findings/directives for the next run in this project.
+    try:
+        from relay.durable_memory import capture_bus_shared
+        mem = getattr(result, "memory", None)
+        if mem is not None:
+            capture_bus_shared(mem, root)
+    except OSError:
+        pass
     if not no_log:
         _save_run(goal=goal, mode=mode, result=result, ledger=ledger, cfg=cfg,
                   wall_time_s=wall_time_s, root=root)
 
 
 def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver, *,
-               bash_timeout_s=120.0):
+               bash_timeout_s=120.0, envelope: CostEnvelope | None = None):
     """The v0.02 single-model loop, kept for comparison/debugging."""
     bash_policy = "auto-approve" if auto_approve else "interactive approval"
+    env = envelope or CostEnvelope(max_steps=max_steps)
     console.print(
         Panel(
             f"[bold]{goal}[/bold]\nroot={root}  solo role={role}  max-steps={max_steps}  "
-            f"bash policy={bash_policy}",
+            f"bash policy={bash_policy}\n{env.preflight_text()}",
             title="Relay run (solo)",
             border_style="cyan",
         )
     )
+
+    def _warn(payload: dict) -> None:
+        console.print(f"[yellow]{payload.get('message', 'envelope warn')}[/yellow]")
+
     try:
         result = run_task(
             goal, root, role=role, max_steps=max_steps, models=cfg, ledger=ledger,
             on_step=_print_step, approver=approver, auto_approve=auto_approve,
-            bash_timeout_s=bash_timeout_s,
+            bash_timeout_s=bash_timeout_s, envelope=env, on_envelope_warn=_warn,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)
@@ -277,6 +454,9 @@ def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver, 
         console.print(
             f"\n[yellow]stopped: hit max-steps ({max_steps}) without <done>[/yellow]"
         )
+    elif result.status in (SOLO_STATUS_MAX_COST, STATUS_MAX_COST):
+        msg = friendly_terminal_message(STATUS_MAX_COST, max_total_steps=max_steps)
+        console.print(f"\n[yellow]{msg or 'stopped: cost ceiling reached'}[/yellow]")
     elif result.status == STATUS_PARSE_FAILURE_ABORT:
         console.print(
             "\n[bold red]aborted: too many consecutive parse failures[/bold red]"
@@ -288,18 +468,41 @@ def _run_solo(goal, root, role, max_steps, cfg, ledger, auto_approve, approver, 
 
 def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, *,
                  supervise=True, dial="auto", show_transcript=False, max_total_steps=None,
-                 max_cost=None, bash_timeout_s=120.0, plan_only=False):
+                 max_cost=None, bash_timeout_s=120.0, plan_only=False,
+                 envelope: CostEnvelope | None = None,
+                 hands_context_mode: str | None = None,
+                 model_router: ModelRouter | None = None,
+                 skeptic: bool = False,
+                 confirm_diff: bool = False,
+                 commit_per_step: bool = False,
+                 orchestra_workers: int = 1,
+                 save_fork_as: str | None = None,
+                 resume_checkpoint: str | None = None,
+                 fork_name: str | None = None,
+                 auto_checkpoint: bool = True):
     """Conversational planning -> commit -> the two-role autonomous loop.
 
     Both phases share ONE transcript, so a mid-run escalation appears as the next
     turn of the same conversation rather than a separate popup.
     """
     bash_policy = "auto-approve" if auto_approve else "interactive approval"
+    env = envelope or CostEnvelope(max_cost=max_cost, max_steps=max_total_steps)
+    ctx = hands_context_mode or resolve_hands_context_mode()
+    if model_router is not None:
+        broker = format_broker_line(
+            model_router, env, None, orchestra_workers=orchestra_workers
+        )
+    else:
+        broker = "route=-"
     console.print(
         Panel(
             f"[bold]{goal}[/bold]\nroot={root}\nbrain={cfg.brain}\nhands={cfg.hands}\n"
             f"bash policy={bash_policy}  supervision={'on' if supervise else 'off'}  "
-            f"assume={dial}",
+            f"assume={dial}  hands-context={ctx}\n{broker}"
+            f"{'  skeptic=on' if skeptic else ''}"
+            f"{'  confirm-diff' if confirm_diff else ''}"
+            f"{'  commit-per-step' if commit_per_step else ''}\n"
+            f"{env.preflight_text()}",
             title="Relay run (brain + hands)",
             border_style="cyan",
         )
@@ -307,36 +510,123 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
 
     transcript = Transcript()  # the one continuous thread across planning + execution
 
+    # D2: resume from checkpoint or load a named fork (skip planning conversation).
+    committed = None
+    if resume_checkpoint:
+        from relay.plan_fork import load_checkpoint, plan_for_resume
+        try:
+            cp = load_checkpoint(root, resume_checkpoint)
+        except FileNotFoundError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        committed = plan_for_resume(cp)
+        goal = goal or cp.goal or goal
+        console.print(
+            f"[dim]resuming checkpoint {cp.id} "
+            f"(cursor={cp.cursor}, completed={len(cp.completed_indices)})[/dim]"
+        )
+    elif fork_name:
+        from relay.plan_fork import load_fork, plan_for_resume
+        try:
+            fork = load_fork(root, fork_name)
+        except (FileNotFoundError, ValueError) as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        committed = plan_for_resume(fork)
+        goal = goal or fork.goal or goal
+        console.print(f"[dim]loaded fork {fork.name} ({len(committed.steps)} step(s))[/dim]")
+
+    if committed is not None:
+        def _on_exec_event(event: Event) -> None:
+            _print_event(event)
+            if event.kind == "envelope_warn":
+                console.print(f"[yellow]{event.message}[/yellow]")
+
+        try:
+            from relay.catalog import get_catalog
+            catalog = get_catalog()
+            result = run_planned(
+                goal, root, models=cfg, ledger=ledger, client=None,
+                approver=approver, auto_approve=auto_approve,
+                supervise=supervise, user_decision=_interactive_user_decision,
+                assumption_level=dial, committed_plan=committed,
+                on_event=_on_exec_event, transcript=transcript,
+                max_total_steps=max_total_steps, max_cost=max_cost,
+                catalog=catalog,
+                bash_timeout_s=bash_timeout_s,
+                envelope=env,
+                hands_context_mode=hands_context_mode,
+                model_router=model_router,
+                skeptic=skeptic,
+                confirm_diff=confirm_diff,
+                commit_per_step=commit_per_step,
+                orchestra_workers=orchestra_workers,
+                save_fork_as=save_fork_as,
+                auto_checkpoint=auto_checkpoint,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _print_run_error(exc)
+            raise typer.Exit(code=1)
+        _print_planned_status(result)
+        if show_transcript:
+            _print_transcript(result.transcript_compacted or result.transcript or transcript)
+        return result
+
+    def _on_conv_event(kind, message, payload):
+        _print_conv_event(kind, message, payload)
+        if kind == "envelope_warn":
+            console.print(f"[yellow]{message}[/yellow]")
+
     # 1. Plan as a conversation (--confirm-plan = the degenerate 1-round case).
     try:
         conversation = plan_conversationally(
             goal, root, models=cfg, ledger=ledger, client=None,
             assumption_level=dial, user_turn=_interactive_user_turn,
             max_rounds=1 if confirm_plan else DEFAULT_MAX_ROUNDS,
-            on_event=_print_conv_event, transcript=transcript,
+            on_event=_on_conv_event, transcript=transcript, envelope=env,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)
         raise typer.Exit(code=1)
 
+    if conversation.stop_reason == "max_cost":
+        console.print("\n[yellow]stopped during planning: cost ceiling reached[/yellow]")
+        return PlannedTaskResult(
+            goal=goal, plan=conversation.plan, status=STATUS_MAX_COST,
+            ledger=ledger, transcript=transcript, envelope=env, max_cost=env.max_cost,
+        )
+
     if not conversation.committed or conversation.plan is None or not conversation.plan.steps:
         console.print("\n[yellow]plan not committed; nothing executed[/yellow]")
         return PlannedTaskResult(goal=goal, plan=conversation.plan, status=STATUS_DECLINED,
-                                 ledger=ledger, transcript=transcript)
+                                 ledger=ledger, transcript=transcript, envelope=env)
 
-    # --plan-only: print the committed plan and exit WITHOUT executing.
-    # Useful for reviewing what the brain would do before spending money on execution.
+    # Post-plan snapshot (spent so far / remaining) before hands execute.
+    if env.max_cost is not None or (ledger.total_cost() or 0) > 0:
+        console.print(f"[dim]{env.post_plan_snapshot(ledger)}[/dim]")
     if plan_only:
         steps = conversation.plan.steps
         body = "\n".join(f"{i}. {s.instruction}" for i, s in enumerate(steps, 1))
         console.print(Panel(body, title=f"Planned plan ({len(steps)} step(s), NOT executed)",
                             border_style="magenta"))
         console.print("[dim](--plan-only: no files were written, no executor calls made)[/dim]")
+        if save_fork_as:
+            from relay.plan_fork import save_fork
+            try:
+                fork = save_fork(root, save_fork_as, conversation.plan, goal=goal, notes="plan-only")
+                console.print(f"[green]fork saved:[/green] {fork.name}")
+            except ValueError as exc:
+                console.print(f"[red]fork save failed:[/red] {exc}")
         return PlannedTaskResult(goal=goal, plan=conversation.plan, status=STATUS_DECLINED,
-                                 ledger=ledger, transcript=transcript)
+                                 ledger=ledger, transcript=transcript, envelope=env)
 
     # 2. Execute the committed plan on the SAME thread (the dial keeps biasing
     #    answer_or_escalate; escalations continue the conversation above).
+    def _on_exec_event(event: Event) -> None:
+        _print_event(event)
+        if event.kind == "envelope_warn":
+            console.print(f"[yellow]{event.message}[/yellow]")
+
     try:
         from relay.catalog import get_catalog
         catalog = get_catalog()
@@ -345,10 +635,19 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
             approver=approver, auto_approve=auto_approve,
             supervise=supervise, user_decision=_interactive_user_decision,
             assumption_level=dial, committed_plan=conversation.plan,
-            on_event=_print_event, transcript=transcript,
+            on_event=_on_exec_event, transcript=transcript,
             max_total_steps=max_total_steps, max_cost=max_cost,
             catalog=catalog,
             bash_timeout_s=bash_timeout_s,
+            envelope=env,
+            hands_context_mode=hands_context_mode,
+            model_router=model_router,
+            skeptic=skeptic,
+            confirm_diff=confirm_diff,
+            commit_per_step=commit_per_step,
+            orchestra_workers=orchestra_workers,
+            save_fork_as=save_fork_as,
+            auto_checkpoint=auto_checkpoint,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)
@@ -438,6 +737,12 @@ def runs(
     root: str = typer.Option(
         ".", "--root", help="Project root whose .relay/runs.jsonl to read."
     ),
+    explain: str = typer.Option(
+        "",
+        "--explain",
+        help="Print the harness flight recorder (/why) for a run_id prefix "
+        "(deterministic, zero model tokens). Example: relay runs --explain 20260716",
+    ),
 ) -> None:
     """Show recently recorded runs from <root>/.relay/runs.jsonl."""
     path = default_log_path(root)
@@ -445,7 +750,50 @@ def runs(
     if not records:
         console.print(f"[yellow]no runs recorded yet[/yellow] (looked in {path})")
         return
+    if explain:
+        needle = explain.strip()
+        match = next((r for r in reversed(records) if r.run_id.startswith(needle)), None)
+        if match is None:
+            console.print(f"[yellow]no run matching id prefix {needle!r}[/yellow]")
+            raise typer.Exit(code=1)
+        harness = match.harness if isinstance(getattr(match, "harness", None), dict) else None
+        if not harness:
+            console.print(
+                f"[yellow]run {match.run_id} has no harness snapshot "
+                f"(older runs before A2)[/yellow]"
+            )
+            raise typer.Exit(code=1)
+        from relay.explain import HarnessReport
+
+        report = HarnessReport(**{k: harness.get(k, getattr(HarnessReport(), k)) for k in HarnessReport().__dict__})
+        # Simpler: render from dict keys we care about
+        console.print(_harness_text_from_dict(harness, run_id=match.run_id))
+        # E5: append spend section when ledger totals / route_changes exist.
+        from relay.router import explain_spend
+
+        spend = explain_spend(
+            [
+                {"kind": "route_change", "message": line, "payload": {}}
+                for line in (harness.get("route_changes") or [])
+            ],
+            None,
+        )
+        if harness.get("spend"):
+            console.print(harness["spend"])
+        elif "route_change" in spend or harness.get("route_changes"):
+            console.print(spend)
+        return
     console.print(_runs_table(records, limit))
+
+
+def _harness_text_from_dict(harness: dict, *, run_id: str = "") -> str:
+    from relay.explain import HarnessReport
+
+    fields = HarnessReport.__dataclass_fields__
+    kwargs = {k: harness[k] for k in fields if k in harness}
+    report = HarnessReport(**kwargs)
+    header = f"run_id: {run_id}\n" if run_id else ""
+    return header + report.to_text()
 
 
 def _fmt_ts(iso: str) -> str:
@@ -484,6 +832,390 @@ def _runs_table(records, limit: int) -> Table:
             str(rec.steps),
         )
     return table
+
+
+@app.command()
+def duel(
+    goal: str = typer.Option(
+        ..., "--goal", "-g", help="Goal to run across every brain×hands pairing."
+    ),
+    pair: list[str] = typer.Option(
+        [],
+        "--pair",
+        help="Repeatable pairing: brain=<slug>,hands=<slug>. At least two recommended.",
+    ),
+    matrix: str = typer.Option(
+        "",
+        "--matrix",
+        help="Path to a matrix file (JSON list or brain=...,hands=... lines).",
+    ),
+    root: str = typer.Option(
+        ".", "--root", help="Project root (git worktree restored between pairings)."
+    ),
+    max_total_steps: int | None = typer.Option(
+        20, "--max-total-steps", help="Per-pairing executor step ceiling (default 20)."
+    ),
+    auto_approve: bool = typer.Option(
+        True,
+        "--auto-approve/--no-auto-approve",
+        help="Auto-approve CONFIRM bash during duel runs (default on).",
+    ),
+    list_past: bool = typer.Option(
+        False, "--list", help="List persisted duel scorecards under .relay/duels/."
+    ),
+) -> None:
+    """Model bake-off: run the same goal across N brain×hands pairings (sequential).
+
+    v1 restores the worktree via git checkout between pairings when ``root`` is a
+    git repo. A dirty tree at start fails closed. Scorecards land in .relay/duels/.
+    """
+    from relay.duel import list_duels, load_matrix, parse_pair, run_duel
+
+    if list_past:
+        rows = list_duels(root)
+        if not rows:
+            console.print("[yellow]no duels recorded yet[/yellow]")
+            return
+        table = Table(title=f"Relay duels ({len(rows)})")
+        table.add_column("Id", style="cyan")
+        table.add_column("When", style="dim")
+        table.add_column("Goal", overflow="fold")
+        table.add_column("Pairs", justify="right")
+        for row in rows[:20]:
+            table.add_row(
+                str(row.get("duel_id", "")),
+                str(row.get("timestamp", ""))[:19],
+                str(row.get("goal", ""))[:60],
+                str(len(row.get("pairings") or [])),
+            )
+        console.print(table)
+        return
+
+    pairings = []
+    try:
+        for spec in pair:
+            pairings.append(parse_pair(spec))
+        if matrix:
+            pairings.extend(load_matrix(matrix))
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        console.print(f"[red]matrix error:[/red] {exc}")
+        raise typer.Exit(code=1)
+    if len(pairings) < 1:
+        console.print(
+            "[red]need at least one --pair brain=...,hands=... or --matrix file[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    console.print(
+        Panel(
+            f"[bold]{goal}[/bold]\n"
+            f"pairings={len(pairings)} (sequential)  root={root}\n"
+            "v1: same-tree; git checkout/clean between pairings when in a repo",
+            title="Relay duel",
+            border_style="magenta",
+        )
+    )
+
+    def _on_pairing(p, score) -> None:
+        cost = "-" if score.cost_usd is None else f"${score.cost_usd:.4f}"
+        console.print(
+            f"  [cyan]{p.label()}[/cyan] -> {score.status}  "
+            f"steps={score.steps}  cost={cost}  "
+            f"escalations={score.escalations}  wall={score.wall_time_s:.2f}s"
+        )
+
+    try:
+        result = run_duel(
+            goal,
+            root,
+            pairings,
+            auto_approve=auto_approve,
+            supervise=False,
+            max_total_steps=max_total_steps,
+            on_pairing=_on_pairing,
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]duel failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    table = Table(title=f"Duel scorecard {result.duel_id}")
+    table.add_column("Brain")
+    table.add_column("Hands")
+    table.add_column("Status")
+    table.add_column("Steps", justify="right")
+    table.add_column("$", justify="right")
+    table.add_column("Esc", justify="right")
+    table.add_column("Wall s", justify="right")
+    for s in result.pairings:
+        cost = "-" if s.cost_usd is None else f"{s.cost_usd:.4f}"
+        table.add_row(
+            s.brain, s.hands, s.status, str(s.steps), cost,
+            str(s.escalations), f"{s.wall_time_s:.2f}",
+        )
+    console.print(table)
+    for note in result.notes:
+        console.print(f"[dim]note: {note}[/dim]")
+    from relay.duel import default_duels_dir
+    console.print(f"[dim]saved -> {default_duels_dir(root) / (result.duel_id + '.json')}[/dim]")
+
+
+@app.command()
+def probe(
+    slug: str = typer.Argument(..., help="Model slug to grade (OpenRouter-style)."),
+    role: str = typer.Option(
+        "both",
+        "--role",
+        help="Which protocol surface to grade: brain | hands | both.",
+    ),
+    fixture: str = typer.Option(
+        "",
+        "--fixture",
+        help="Path to a transcript fixture JSON (offline grading).",
+    ),
+    fixtures_dir: str = typer.Option(
+        "",
+        "--fixtures-dir",
+        help="Directory of fixtures (default: bundled relay/probes + tests fixtures).",
+    ),
+) -> None:
+    """Protocol fitness lab: grade plan shape / tag discipline (offline fixtures).
+
+    Exit codes: 0=fit (>=70), 2=weak (40-69), 3=unfit (<40), 1=error.
+    """
+    from pathlib import Path as _Path
+
+    from relay.probe import (
+        DEFAULT_FIXTURES_DIR,
+        EXIT_ERROR,
+        probe_offline,
+    )
+
+    role_n = (role or "both").strip().lower()
+    if role_n not in ("brain", "hands", "both"):
+        console.print(f"[red]invalid --role {role!r}; use brain|hands|both[/red]")
+        raise typer.Exit(code=EXIT_ERROR)
+
+    dirs: list[_Path] = []
+    if fixtures_dir:
+        dirs.append(_Path(fixtures_dir))
+    else:
+        dirs.append(DEFAULT_FIXTURES_DIR)
+        test_fix = _Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "protocol_lab"
+        if test_fix.is_dir():
+            dirs.append(test_fix)
+
+    try:
+        if fixture:
+            result = probe_offline(slug, role=role_n, fixture=fixture)
+        else:
+            # Prefer the first directory that has fixtures.
+            chosen = next((d for d in dirs if d.is_dir() and any(d.glob("*.json"))), dirs[0])
+            result = probe_offline(slug, role=role_n, fixtures_dir=chosen)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]probe error:[/red] {exc}")
+        raise typer.Exit(code=EXIT_ERROR)
+
+    band_style = {"fit": "green", "weak": "yellow", "unfit": "red"}.get(result.band, "white")
+    console.print(
+        Panel(
+            f"[bold]{result.slug}[/bold]  role={result.role}\n"
+            f"overall=[{band_style}]{result.overall}/100 ({result.band})[/{band_style}]\n"
+            f"fixture={result.fixture or '-'}",
+            title="Relay probe",
+            border_style="cyan",
+        )
+    )
+    table = Table(title="Dimensions")
+    table.add_column("Dimension")
+    table.add_column("Score", justify="right")
+    table.add_column("Rationale", overflow="fold")
+    for dim in result.dimensions:
+        table.add_row(dim.name, str(dim.score), dim.rationale)
+    console.print(table)
+    for note in result.notes:
+        console.print(f"[dim]note: {note}[/dim]")
+    raise typer.Exit(code=result.exit_code())
+
+
+@app.command()
+def memory(
+    action: str = typer.Argument(
+        "list",
+        help="list | pin <id> | forget <id>",
+    ),
+    entry_id: str = typer.Argument("", help="Entry id for pin/forget."),
+    root: str = typer.Option(".", "--root", help="Project root for .relay/memory.json."),
+) -> None:
+    """Manage durable shared findings/directives (A3). Never touches brain-private memory."""
+    from relay.durable_memory import forget_entry, list_entries, pin_entry
+
+    act = (action or "list").strip().lower()
+    if act == "list":
+        entries = list_entries(root)
+        if not entries:
+            console.print("[dim](no durable shared memory yet)[/dim]")
+            return
+        table = Table(title="Durable shared memory")
+        table.add_column("Id")
+        table.add_column("Kind")
+        table.add_column("Summary", overflow="fold")
+        table.add_column("Tags")
+        for e in entries:
+            table.add_row(e.id, e.kind, e.summary, ",".join(e.tags) or "-")
+        console.print(table)
+        return
+    if act == "pin":
+        if not entry_id:
+            console.print("[red]pin requires an entry id[/red]")
+            raise typer.Exit(1)
+        ok = pin_entry(root, entry_id)
+        console.print("[green]pinned[/green]" if ok else f"[yellow]not found: {entry_id}[/yellow]")
+        raise typer.Exit(0 if ok else 1)
+    if act == "forget":
+        if not entry_id:
+            console.print("[red]forget requires an entry id[/red]")
+            raise typer.Exit(1)
+        ok = forget_entry(root, entry_id)
+        console.print("[green]forgot[/green]" if ok else f"[yellow]not found: {entry_id}[/yellow]")
+        raise typer.Exit(0 if ok else 1)
+    console.print(f"[red]unknown action {action!r}; use list|pin|forget[/red]")
+    raise typer.Exit(1)
+
+
+@app.command()
+def fork(
+    action: str = typer.Argument(
+        "list",
+        help="list | save <name> | load <name>",
+    ),
+    name: str = typer.Argument("", help="Fork name for save/load."),
+    root: str = typer.Option(".", "--root", help="Project root for .relay/forks/."),
+    from_checkpoint: str = typer.Option(
+        "",
+        "--from-checkpoint",
+        help="When saving: source checkpoint id (default: latest).",
+    ),
+    goal: str = typer.Option("", "--goal", "-g", help="Goal metadata when saving from checkpoint."),
+) -> None:
+    """Named plan forks under .relay/forks/ (D2). Save/load alternate plan futures."""
+    from relay.plan_fork import (
+        fork_from_checkpoint,
+        list_forks,
+        load_fork,
+    )
+
+    act = (action or "list").strip().lower()
+    if act == "list":
+        rows = list_forks(root)
+        if not rows:
+            console.print("[dim](no forks yet)[/dim]")
+            return
+        table = Table(title="Plan forks")
+        table.add_column("Name")
+        table.add_column("Steps", justify="right")
+        table.add_column("Created")
+        table.add_column("Goal", overflow="fold")
+        for row in rows:
+            table.add_row(
+                row["name"], str(row["steps"]), row.get("created_at", ""),
+                (row.get("goal") or "")[:60],
+            )
+        console.print(table)
+        return
+    if act == "save":
+        if not name:
+            console.print("[red]save requires a fork name[/red]")
+            raise typer.Exit(1)
+        cid = from_checkpoint or "latest"
+        try:
+            record = fork_from_checkpoint(root, name, cid, notes="cli save")
+        except FileNotFoundError:
+            console.print(
+                "[red]no checkpoint to fork from; run once first, "
+                "or pass --from-checkpoint <id>[/red]"
+            )
+            raise typer.Exit(1)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        console.print(
+            f"[green]fork saved:[/green] {record.name} "
+            f"({len(record.to_plan().steps)} step(s))"
+        )
+        return
+    if act == "load":
+        if not name:
+            console.print("[red]load requires a fork name[/red]")
+            raise typer.Exit(1)
+        try:
+            record = load_fork(root, name)
+        except (FileNotFoundError, ValueError) as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        plan = record.to_plan()
+        body = "\n".join(
+            f"{s.index}. [{s.status}] {s.instruction}" for s in plan.steps
+        ) or "(empty)"
+        console.print(Panel(
+            body,
+            title=f"Fork {record.name} ({len(plan.steps)} step(s))",
+            border_style="magenta",
+        ))
+        console.print(
+            f"[dim]resume with: relay run -g \"{record.goal or goal or '...'}\" "
+            f"--fork {record.name} --root {root}[/dim]"
+        )
+        return
+    console.print(f"[red]unknown action {action!r}; use list|save|load[/red]")
+    raise typer.Exit(1)
+
+
+@app.command()
+def rewind(
+    step_id: str = typer.Argument(
+        "",
+        help="Step id to restore files for (e.g. 1 or step-1). Omit with --checkpoint.",
+    ),
+    root: str = typer.Option(".", "--root", help="Project root."),
+    checkpoint: str = typer.Option(
+        "",
+        "--checkpoint",
+        help="Checkpoint id (or 'latest') to inspect / restore plan cursor from (D2).",
+    ),
+) -> None:
+    """Rewind a step's touched files via git, or show a checkpoint cursor (D2/D3)."""
+    from relay.diff_iface import rewind_step_files
+    from relay.plan_fork import load_checkpoint
+
+    if checkpoint:
+        try:
+            cp = load_checkpoint(root, checkpoint)
+        except FileNotFoundError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        console.print(
+            f"[green]checkpoint {cp.id}[/green] cursor={cp.cursor} "
+            f"completed={cp.completed_indices} status={cp.status}"
+        )
+        console.print(
+            f"[dim]resume: relay run -g \"{cp.goal or '...'}\" "
+            f"--resume {cp.id} --root {root}[/dim]"
+        )
+        if not step_id:
+            return
+    if not step_id:
+        console.print("[red]provide a step id (e.g. step-1) or --checkpoint <id>[/red]")
+        raise typer.Exit(1)
+    try:
+        paths = rewind_step_files(
+            root, step_id, checkpoint_id=checkpoint or None,
+        )
+    except (RuntimeError, ValueError) as exc:
+        console.print(f"[red]rewind failed:[/red] {exc}")
+        raise typer.Exit(1)
+    console.print(
+        f"[green]restored[/green] step {step_id}: {', '.join(paths)}"
+    )
 
 
 @app.command()
@@ -543,112 +1275,6 @@ def doctor(
     raise typer.Exit(code=0 if all_ok else 1)
 
 
-def _doctor_checks(cfg, slugs) -> list[tuple[str, str, str]]:
-    """The ``(label, provider, model)`` checks: ad-hoc slugs or the configured roles."""
-    if slugs:
-        return [("arg", DEFAULT_PROVIDER, s) for s in slugs]
-    return [("brain", cfg.brain_provider, cfg.brain), ("hands", cfg.hands_provider, cfg.hands)]
-
-
-def _missing_provider_keys(checks) -> list[str]:
-    """Key env-vars (deduped, in order) that are needed by some provider but unset.
-
-    v0.0.32: check both the env var AND the auth.json store -- ``build_client``
-    accepts both (env > auth.json), so a key saved via ``relay config set-key``
-    is just as usable as one in the env. Checking only ``os.environ`` here
-    would report a false "not set" for a user who set their key in-app,
-    and the doctor would hard-exit before even probing. ``resolve_key`` is
-    the single source of truth for "is this provider's key present?".
-    """
-    from relay.secrets import resolve_key
-    missing: list[str] = []
-    seen: set[str] = set()
-    for _, provider, _ in checks:
-        if provider in seen:
-            continue
-        seen.add(provider)
-        try:
-            profile = resolve_provider(provider)
-        except ValueError:
-            continue  # unknown provider surfaces as a failed probe, not a key error
-        if resolve_key(profile.id, profile.key_env) is None and profile.key_env not in missing:
-            missing.append(profile.key_env)
-    return missing
-
-
-def _build_provider_clients(checks) -> dict:
-    """Build one client per distinct provider; a build failure is a failed probe."""
-    clients: dict = {}
-    for _, provider, _ in checks:
-        if provider in clients:
-            continue
-        try:
-            clients[provider] = build_client(provider)
-        except Exception as exc:  # noqa: BLE001 — surface as a failed probe, not a traceback
-            console.print(f"[red]could not build the {provider} client:[/red] {exc}")
-    return clients
-
-
-def _safe_load_catalog():
-    """Load the catalog for the status line; never let it crash doctor."""
-    try:
-        return load_catalog()
-    except Exception:  # noqa: BLE001 — catalog status is informational only
-        return None
-
-
-def _probe_model(client, slug: str, provider: str = DEFAULT_PROVIDER) -> tuple[bool, str]:
-    """Minimal (max_tokens=1) call to check a slug resolves. Never raises.
-
-    Only the OpenRouter path asks for usage cost (its include flag); other
-    providers get a plain probe.
-    """
-    try:
-        extra_body = {"usage": {"include": True}} if provider == DEFAULT_PROVIDER else {}
-        client.chat.completions.create(
-            model=slug,
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=1,
-            extra_body=extra_body,
-        )
-        return True, "resolved"
-    except Exception as exc:  # noqa: BLE001 — classify any failure as the note
-        text = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
-        return False, text[:120]
-
-
-def _run_doctor(checks, clients) -> tuple[list[dict], bool]:
-    """Probe each ``(label, provider, slug)`` against its provider's client."""
-    rows: list[dict] = []
-    all_ok = True
-    for label, provider, slug in checks:
-        client = clients.get(provider)
-        if client is None:
-            ok, note = False, f"no client for provider {provider!r}"
-        else:
-            ok, note = _probe_model(client, slug, provider)
-        rows.append(
-            {"role": label, "provider": provider, "model": slug,
-             "status": "OK" if ok else "FAILED", "note": note}
-        )
-        all_ok = all_ok and ok
-    return rows, all_ok
-
-
-def _print_doctor_table(rows) -> None:
-    table = Table(title="Relay doctor: provider/model preflight")
-    table.add_column("Role", style="bold")
-    table.add_column("Provider")
-    table.add_column("Model", overflow="fold")
-    table.add_column("Status")
-    table.add_column("Note", overflow="fold")
-    for row in rows:
-        style = "green" if row["status"] == "OK" else "bold red"
-        table.add_row(
-            row["role"], row.get("provider", ""), row["model"],
-            f"[{style}]{row['status']}[/{style}]", row["note"],
-        )
-    console.print(table)
 
 
 # --- `relay config`: manage providers, models, and keys ---------------------
@@ -903,6 +1529,16 @@ def _print_event(event: Event) -> None:
         verdict = event.payload.get("verdict", "")
         color = {"accept": "green", "follow_up": "yellow", "revise_plan": "magenta"}.get(verdict, "white")
         console.print(f"  [{color}]review: {verdict}[/{color}]")
+    elif kind == "skeptic_review":
+        verdict = event.payload.get("verdict", "")
+        color = "green" if verdict == "clear" else "yellow"
+        console.print(f"  [{color}]skeptic: {verdict}[/{color}]")
+        for obj in event.payload.get("objections") or []:
+            console.print(f"    [yellow]! {obj}[/yellow]")
+    elif kind == "skeptic_dismissed":
+        console.print("  [green]skeptic objections dismissed by user[/green]")
+    elif kind == "skeptic_replan":
+        console.print(f"  [magenta]{event.message}[/magenta]")
     elif kind == "memory_write":
         console.print(f"    [dim]memory += [{event.payload.get('kind')}] {event.payload.get('summary')}[/dim]")
     elif kind == "step_done":
@@ -942,6 +1578,9 @@ def _print_planned_status(result) -> None:
     elif status == STATUS_MAX_COST:
         msg = friendly_terminal_message(status)
         console.print(f"\n[yellow]COST CEILING[/yellow] {msg}")
+    elif status == STATUS_SKEPTIC_BLOCKED:
+        msg = friendly_terminal_message(status)
+        console.print(f"\n[bold red]SKEPTIC BLOCKED[/bold red] {msg}")
     elif status == STATUS_DECLINED:
         console.print("\n[yellow]DECLINED[/yellow] plan not approved; nothing executed")
     else:
@@ -1055,6 +1694,88 @@ def _print_telemetry(ledger: Ledger) -> None:
     pf = ledger.parse_failures
     style = "bold red" if pf else "dim"
     console.print(f"[{style}]parse failures: {pf}[/{style}]")
+
+
+def _print_receipt(
+    envelope: CostEnvelope,
+    ledger: Ledger,
+    *,
+    status: str,
+    counterfactual_baseline: str | None = "premium",
+) -> None:
+    """Print the A1 envelope receipt under the telemetry table."""
+    for line in envelope.receipt_lines(ledger, status=status or ""):
+        if line == "Receipt":
+            console.print(f"[bold]{line}[/bold]")
+        else:
+            console.print(f"[dim]{line}[/dim]")
+    if counterfactual_baseline:
+        from relay.router import estimate_counterfactual_cost
+
+        cf = estimate_counterfactual_cost(ledger, baseline_route=counterfactual_baseline)
+        for line in cf.get("lines") or []:
+            console.print(f"[dim]  {line}[/dim]")
+
+
+# --- Route contracts (E1+) ----------------------------------------------------
+
+route_app = typer.Typer(
+    help="Inspect and set the repo route contract (.relay/route.json).",
+    no_args_is_help=True,
+)
+app.add_typer(route_app, name="route")
+
+
+@route_app.command("show")
+def route_show(
+    root: str = typer.Option(".", "--root", help="Project root."),
+) -> None:
+    """Print the resolved route contract (CLI/env/repo/defaults)."""
+    from relay.router import resolve_route_contract
+
+    contract = resolve_route_contract(None, root=root)
+    console.print_json(data=contract.to_dict())
+    if contract.unknown_keys:
+        console.print(
+            f"[yellow]unknown keys ignored: {', '.join(contract.unknown_keys)}[/yellow]"
+        )
+
+
+@route_app.command("set")
+def route_set(
+    name: str = typer.Argument(..., help="Route name: economy | balanced | premium."),
+    root: str = typer.Option(".", "--root", help="Project root."),
+) -> None:
+    """Write a builtin route contract to .relay/route.json."""
+    from relay.router import ROUTES, builtin_contract, save_route_contract
+
+    key = name.strip().lower()
+    if key not in ROUTES:
+        console.print(f"[red]unknown route {name!r}; choose from {', '.join(ROUTES)}[/red]")
+        raise typer.Exit(code=1)
+    path = save_route_contract(root, builtin_contract(key))  # type: ignore[arg-type]
+    console.print(f"[green]wrote {path}[/green] (route={key})")
+
+
+@route_app.command("recommend")
+def route_recommend(
+    root: str = typer.Option(".", "--root", help="Project root."),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Write the recommendation to .relay/route.json (never silent).",
+    ),
+) -> None:
+    """Suggest a route from duel scorecards / successful runlog (E11)."""
+    from relay.router import builtin_contract, recommend_route, save_route_contract
+
+    rec = recommend_route(root)
+    console.print(f"[bold]recommended route:[/bold] {rec['route']}")
+    for line in rec.get("evidence") or []:
+        console.print(f"  [dim]{line}[/dim]")
+    if apply:
+        path = save_route_contract(root, builtin_contract(rec["route"]))  # type: ignore[arg-type]
+        console.print(f"[green]applied → {path}[/green]")
 
 
 if __name__ == "__main__":

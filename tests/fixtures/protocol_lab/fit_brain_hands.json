@@ -1,0 +1,17 @@
+{
+  "name": "fit_brain_hands",
+  "slug": "vendor/fit-model",
+  "brain": [
+    {
+      "text": "<plan><step>create hello.txt with HELLO</step><step>verify hello.txt contents via read</step></plan>"
+    }
+  ],
+  "hands": [
+    {
+      "text": "<edit path=\"hello.txt\">HELLO</edit>\n<done>wrote hello.txt</done>"
+    },
+    {
+      "text": "<read path=\"hello.txt\"/>\n<done>verified HELLO</done>"
+    }
+  ]
+}

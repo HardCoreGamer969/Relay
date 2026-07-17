@@ -26,7 +26,7 @@ from textual.containers import VerticalScroll
 from relay.bridge import RunOutcome
 from relay.config import ModelConfig
 from relay.orchestrator import Event
-from relay.tui import C_CYAN, C_GREEN, C_MAGENTA, RelayTuiApp
+from relay.tui import C_GREEN, W_RED, W_TEXT_DIM, RelayTuiApp
 
 CFG = ModelConfig(brain="vendor/brain", hands="vendor/hands")
 
@@ -92,9 +92,9 @@ def test_brain_hands_and_finding_colors(tmp_path):
             )
             await pilot.pause()
 
-            # brain = magenta, hands = cyan, findings = green (Relay's split).
-            assert _has_styled(app, "escalates", C_MAGENTA)
-            assert _has_styled(app, "do we need OAuth?", C_CYAN)
+            # brain = red (website), hands = dim, findings = green.
+            assert _has_styled(app, "escalates", W_RED)
+            assert _has_styled(app, "do we need OAuth?", W_TEXT_DIM)
             assert _has_styled(app, "storage.load() eats corrupt json", C_GREEN)
             # the finding is a distinct line, not folded into a tool/plan row.
             assert any("finding" in plain and "storage.load" in plain for plain, _ in _rows(app))
@@ -115,22 +115,22 @@ def test_plan_renders_inline_and_a_step_advances_in_place(tmp_path):
                       {"steps": ["scaffold pkg", "write storage", "wire cli"]})
             )
             await pilot.pause()
-            # The plan is ONE inline block (not a per-event re-print).
-            assert len(app.query(".plan")) == 1
+            # The plan is ONE dock widget (not a per-event re-print in the stream).
+            assert app.query_one("#plan-dock") is not None
             assert [s["status"] for s in app._plan_steps] == ["pending", "pending", "pending"]
 
             app._handle_event(Event("step_start", "step 0", {"index": 0, "instruction": "scaffold pkg"}))
             await pilot.pause()
             assert app._plan_steps[0]["status"] == "active"
             assert app._plan_steps[1]["status"] == "pending"
-            assert len(app.query(".plan")) == 1  # SAME block, updated in place
+            assert app.query_one("#plan-dock") is not None  # SAME dock, updated in place
 
             app._handle_event(Event("step_done", "done", {"index": 0, "outcome": "made it"}))
             app._handle_event(Event("step_start", "step 1", {"index": 1, "instruction": "write storage"}))
             await pilot.pause()
             assert app._plan_steps[0]["status"] == "done"
             assert app._plan_steps[1]["status"] == "active"
-            assert len(app.query(".plan")) == 1  # still ONE block, advanced in place
+            assert app.query_one("#plan-dock") is not None  # still ONE dock, advanced in place
 
     asyncio.run(main())
 
@@ -237,7 +237,7 @@ def test_plan_revision_advances_in_place_with_continued_indices(tmp_path):
             app._handle_event(Event("step_start", "s1", {"index": 1, "instruction": "b"}))
             app._handle_event(Event("step_done", "d1", {"index": 1, "outcome": "ok"}))
             await pilot.pause()
-            assert len(app.query(".plan")) == 1
+            assert len(app.query("#plan-dock")) == 1
 
             # The brain revises the remaining tail: only the pending instructions are
             # emitted; the engine continues indexing from the settled count (-> 2, 3).
@@ -248,8 +248,8 @@ def test_plan_revision_advances_in_place_with_continued_indices(tmp_path):
             statuses = [s["status"] for s in app._plan_steps]
             assert statuses == ["done", "done", "active", "pending"]
             assert app._plan_steps[2]["instruction"] == "c-prime"
-            assert len(app.query(".plan")) == 1  # SAME block, advanced in place
+            assert len(app.query("#plan-dock")) == 1  # SAME dock, advanced in place
             app._update_status()
             assert "step 3/4" in app._status_text
-
+            assert "route=" in app._status_text  # U2: always-on route chip
     asyncio.run(main())

@@ -91,6 +91,45 @@ def assumption_directive(level: str) -> str:
     return _ASSUMPTION_DIRECTIVES.get(level, _ASSUMPTION_DIRECTIVES["auto"])
 
 
+# --- hands context dial (B3) ------------------------------------------------
+
+# How much context the hands sees. Default ``needle`` preserves the narrow-hands
+# architecture promise. ``wide`` is debug-only and still never receives brain
+# reasoning (hard invariant).
+HANDS_CONTEXT_MODES = ("needle", "findings", "summary", "wide")
+DEFAULT_HANDS_CONTEXT_MODE = "needle"
+
+
+def resolve_hands_context_mode(override: str | None = None, config: dict | None = None) -> str:
+    """Resolve hands context mode: override > env > config > ``needle``.
+
+    ``RELAY_HANDS_CONTEXT_MODE`` (not ``RELAY_HANDS_CONTEXT``, which sizes the
+    hands *window*). Invalid values fall through.
+    """
+    config = config if config is not None else store.load_config()
+    for candidate in (
+        override,
+        os.environ.get("RELAY_HANDS_CONTEXT_MODE"),
+        (config.get("hands_context_mode") if isinstance(config, dict) else None),
+    ):
+        if candidate is None:
+            continue
+        value = str(candidate).strip().lower()
+        if value in HANDS_CONTEXT_MODES:
+            return value
+    return DEFAULT_HANDS_CONTEXT_MODE
+
+
+def hands_context_mode_summary(mode: str) -> str:
+    """One-line help text for a hands-context mode."""
+    return {
+        "needle": "current step + one-line carry-over only (default; narrow hands)",
+        "findings": "needle + shared findings/directives",
+        "summary": "findings + compact prior-step summaries",
+        "wide": "debug: more prior-step transcript (never brain reasoning; not recommended default)",
+    }.get(mode, hands_context_mode_summary(DEFAULT_HANDS_CONTEXT_MODE))
+
+
 # --- the global step ceiling (v0.0.21) --------------------------------------
 
 # The autonomous loop's one comprehensible top-level safety net: the total number
@@ -257,6 +296,113 @@ def resolve_max_total_steps(
     return DEFAULT_MAX_TOTAL_STEPS
 
 
+# --- cost envelope scope + warn thresholds (features A1) --------------------
+
+DEFAULT_ENVELOPE_SCOPE = "all"
+ENVELOPE_SCOPES = ("all", "execution")
+DEFAULT_ENVELOPE_WARN: tuple[float, ...] = (0.50, 0.80, 0.90, 0.99)
+
+
+def resolve_envelope_scope(
+    override: object = None, config: dict | None = None
+) -> str:
+    """Resolve cost-envelope scope: **override > env > config > ``all``**.
+
+    Cost-only knob: ``all`` counts planning+execution toward ``max_cost``;
+    ``execution`` excludes planning spend. Does **not** change step-ceiling
+    semantics. Invalid values fall through.
+    """
+    for candidate in (override, os.environ.get("RELAY_ENVELOPE_SCOPE")):
+        parsed = _parse_scope(candidate)
+        if parsed is not _UNSET:
+            return parsed  # type: ignore[return-value]
+    config = config if config is not None else store.load_config()
+    cfg_val = config.get("envelope_scope") if isinstance(config, dict) else None
+    parsed = _parse_scope(cfg_val)
+    if parsed is not _UNSET:
+        return parsed  # type: ignore[return-value]
+    return DEFAULT_ENVELOPE_SCOPE
+
+
+def _parse_scope(value: object) -> object:
+    if value is None or isinstance(value, bool):
+        return _UNSET
+    text = str(value).strip().lower()
+    if not text:
+        return _UNSET
+    if text in ENVELOPE_SCOPES:
+        return text
+    return _UNSET
+
+
+def resolve_envelope_warn(
+    override: object = None, config: dict | None = None
+) -> tuple[float, ...]:
+    """Resolve warn fractions: **override > env > config > defaults**.
+
+    Accepts a comma/space-separated string (``0.5,0.8,0.9,0.99``), a list/tuple
+    of numbers, or percent-looking values (``50`` / ``50%`` → ``0.50``). Invalid
+    or empty sources fall through; if nothing usable, returns the defaults.
+    """
+    for candidate in (override, os.environ.get("RELAY_ENVELOPE_WARN")):
+        parsed = _parse_warn_list(candidate)
+        if parsed is not _UNSET:
+            return parsed  # type: ignore[return-value]
+    config = config if config is not None else store.load_config()
+    cfg_val = config.get("envelope_warn") if isinstance(config, dict) else None
+    parsed = _parse_warn_list(cfg_val)
+    if parsed is not _UNSET:
+        return parsed  # type: ignore[return-value]
+    return DEFAULT_ENVELOPE_WARN
+
+
+def _parse_warn_list(value: object) -> object:
+    if value is None or isinstance(value, bool):
+        return _UNSET
+    if isinstance(value, (int, float)):
+        one = _normalize_warn_fraction(value)
+        return (one,) if one is not None else _UNSET
+    if isinstance(value, (list, tuple)):
+        fractions: list[float] = []
+        for item in value:
+            n = _normalize_warn_fraction(item)
+            if n is not None:
+                fractions.append(n)
+        return tuple(sorted(set(fractions))) if fractions else _UNSET
+    text = str(value).strip()
+    if not text:
+        return _UNSET
+    parts = [p for p in re.split(r"[\s,;]+", text) if p]
+    fractions = []
+    for part in parts:
+        n = _normalize_warn_fraction(part)
+        if n is not None:
+            fractions.append(n)
+    return tuple(sorted(set(fractions))) if fractions else _UNSET
+
+
+def _normalize_warn_fraction(value: object) -> float | None:
+    """One threshold → (0, 1], or None if unusable."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        n = float(value)
+    else:
+        text = str(value).strip().lower().rstrip("%")
+        if not text:
+            return None
+        try:
+            n = float(text)
+        except ValueError:
+            return None
+        # Bare "50" means 50%, not 50× the ceiling.
+        if n > 1.0:
+            n = n / 100.0
+    if n <= 0 or n > 1.0:
+        return None
+    return n
+
+
 def assumption_summary(level: str) -> str:
     """A short, plain-language description of what the dial does at ``level``.
 
@@ -303,7 +449,12 @@ class ModelConfig:
     hands_thinking: bool = False
 
     def for_role(self, role: str) -> str:
-        """Resolve the model slug for ``role``, raising on unknown roles."""
+        """Resolve the model slug for ``role``, raising on unknown roles.
+
+        Orchestra workers may use ``hands-N`` / ``brain-N`` suffixes; those
+        canonicalize to the base role for model selection while telemetry keeps
+        the full role string on the :class:`~relay.telemetry.CallRecord`.
+        """
         return self._pick(role, {"brain": self.brain, "hands": self.hands})
 
     def provider_for_role(self, role: str) -> str:
@@ -315,12 +466,23 @@ class ModelConfig:
         return self._pick(role, {"brain": self.brain_thinking, "hands": self.hands_thinking})
 
     @staticmethod
-    def _pick(role: str, mapping: dict):
-        if role not in mapping:
-            raise ValueError(
-                f"Unknown role {role!r}. Valid roles: {', '.join(ROLES)}."
-            )
-        return mapping[role]
+    def canonical_role(role: str) -> str:
+        """Map ``hands-2`` → ``hands``; unknown roles raise."""
+        if role in ROLES:
+            return role
+        if isinstance(role, str) and "-" in role:
+            base = role.split("-", 1)[0]
+            if base in ROLES and role[len(base) + 1 :].isdigit():
+                return base
+        raise ValueError(
+            f"Unknown role {role!r}. Valid roles: {', '.join(ROLES)} "
+            "(or hands-N / brain-N orchestra workers)."
+        )
+
+    @classmethod
+    def _pick(cls, role: str, mapping: dict):
+        key = cls.canonical_role(role)
+        return mapping[key]
 
 
 _TRUE = ("1", "true", "yes", "on")

@@ -1,0 +1,14 @@
+{
+  "name": "unfit_prose",
+  "slug": "vendor/unfit-model",
+  "brain": [
+    {
+      "text": "I will now write a plan in prose without any tags and then edit files myself."
+    }
+  ],
+  "hands": [
+    {
+      "text": "Sure, I'll edit the file and run bash to finish. Done!"
+    }
+  ]
+}

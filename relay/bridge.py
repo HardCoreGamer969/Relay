@@ -41,8 +41,17 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
-from relay.config import ModelConfig, resolve_bash_timeout, resolve_max_total_steps
+from relay.config import (
+    ModelConfig,
+    resolve_bash_timeout,
+    resolve_envelope_scope,
+    resolve_envelope_warn,
+    resolve_max_cost,
+    resolve_max_total_steps,
+)
 from relay.conversation import DEFAULT_MAX_ROUNDS, ConversationResult, plan_conversationally
+from relay.envelope import CostEnvelope
+from relay.durable_memory import capture_bus_shared, merge_shared_into_bus
 from relay.memory import MemoryBus
 from relay.orchestrator import (
     STATUS_CANCELLED,
@@ -449,6 +458,7 @@ class Session(WorkingDirSession):
         super().__init__(launch_root)
         self.transcript = Transcript()
         self.memory = MemoryBus()
+        merge_shared_into_bus(self.memory, self.working_dir)
         self.goal: str | None = None
         self.last_plan: Plan | None = None
         self.revisions = 0
@@ -459,9 +469,11 @@ class Session(WorkingDirSession):
         """Full-session reset (``/clear``): wipe conversation, memory, plan, queue,
         and recall history, and start fresh. Distinct from STOP, which abandons the
         plan but keeps all of this. The working DIR is left as-is (it is a workspace
-        location, not conversation/memory/plan)."""
+        location, not conversation/memory/plan). Durable shared memory is re-loaded
+        from disk (A3) so pinned findings survive ``/clear``."""
         self.transcript = Transcript()
         self.memory = MemoryBus()
+        merge_shared_into_bus(self.memory, self.working_dir)
         self.goal = None
         self.last_plan = None
         self.revisions = 0
@@ -593,6 +605,7 @@ class EngineRunner:
         # (tests) gets fresh ones, unchanged from before.
         self.transcript = transcript if transcript is not None else Transcript()
         self.memory = memory if memory is not None else MemoryBus()
+        merge_shared_into_bus(self.memory, self.project_root)
         self.outcome: RunOutcome | None = None
         self._on_finished = on_finished
         self._run_kwargs = dict(run_kwargs or {})  # extra run_planned knobs (tests)
@@ -602,7 +615,18 @@ class EngineRunner:
         # run_kwargs value (tests) is respected; setdefault only fills when absent.
         self._run_kwargs.setdefault("max_total_steps", resolve_max_total_steps())
         self._run_kwargs.setdefault("bash_timeout_s", resolve_bash_timeout())
+        self._run_kwargs.setdefault("max_cost", resolve_max_cost())
+        # A1: build a shared CostEnvelope unless the caller already passed one.
+        if "envelope" not in self._run_kwargs:
+            self._run_kwargs["envelope"] = CostEnvelope(
+                max_cost=self._run_kwargs.get("max_cost"),
+                max_steps=self._run_kwargs.get("max_total_steps"),
+                scope=resolve_envelope_scope(),
+                warn_thresholds=resolve_envelope_warn(),
+            )
         self._thread: threading.Thread | None = None
+        # Expose the live envelope so the TUI `/cost` panel can edit session-only.
+        self.envelope: CostEnvelope = self._run_kwargs["envelope"]
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -662,8 +686,20 @@ class EngineRunner:
                     Event(kind, message, payload)
                 ),
                 transcript=self.transcript,
+                envelope=self.envelope,
             )
-            if not conversation.committed or conversation.plan is None or not conversation.plan.steps:
+            if getattr(conversation, "stop_reason", None) == "max_cost":
+                from relay.orchestrator import STATUS_MAX_COST
+                outcome = RunOutcome(
+                    status=STATUS_MAX_COST,
+                    conversation=conversation,
+                    result=PlannedTaskResult(
+                        goal=goal, plan=conversation.plan, status=STATUS_MAX_COST,
+                        ledger=self.ledger, transcript=self.transcript,
+                        envelope=self.envelope, max_cost=self.envelope.max_cost,
+                    ),
+                )
+            elif not conversation.committed or conversation.plan is None or not conversation.plan.steps:
                 outcome = RunOutcome(status=STATUS_DECLINED, conversation=conversation)
             else:
                 bridge.emit_event(Event(EVENT_PHASE, "executing", {"phase": "executing"}))
@@ -686,6 +722,10 @@ class EngineRunner:
         except Exception as exc:  # noqa: BLE001 -- the UI must hear about ANY failure
             outcome = RunOutcome(status=STATUS_ERROR,
                                  error=f"{exc.__class__.__name__}: {exc}")
+        try:
+            capture_bus_shared(self.memory, self.project_root)
+        except OSError:
+            pass
         self.outcome = outcome
         self._on_finished(outcome)
 
@@ -726,5 +766,9 @@ class EngineRunner:
         except Exception as exc:  # noqa: BLE001 -- the UI must hear about ANY failure
             outcome = RunOutcome(status=STATUS_ERROR,
                                  error=f"{exc.__class__.__name__}: {exc}")
+        try:
+            capture_bus_shared(self.memory, self.project_root)
+        except OSError:
+            pass
         self.outcome = outcome
         self._on_finished(outcome)

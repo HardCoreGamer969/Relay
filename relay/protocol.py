@@ -17,15 +17,20 @@ Supported tags::
     <plan><step>...</step>...</plan>         the brain's ordered plan (v0.04)
     <abort>reason</abort>                    the brain: goal is unreachable (v0.04)
     <blocked>reason</blocked>                the executor: stuck on this step (v0.04)
-    <question>...</question>                 the executor: needs info to proceed (v0.06)
+    <question class="product|tech|mechanical">...</question>
+                                             the executor: needs info to proceed (v0.06);
+                                             optional class= for the product-decision
+                                             firewall (B2). Unlabeled → product (fail closed).
     <finding>...</finding>                   the executor: surface a bug/discovery (v0.0.29)
 
 ``<question>`` is distinct from ``<blocked>``: a question is mid-step (the brain
 answers it or escalates, then the executor continues), whereas ``<blocked>`` ends
-the step. ``<finding>`` is distinct from BOTH: it is a non-blocking note the hands
-emits to tell the planner about a bug / security issue / wrong assumption -- it does
-NOT end the step and the hands does NOT wait for an answer (it is recorded to the
-shared memory pool and the hands continues working).
+the step. ``class`` on ``<question>`` (or a leading ``[tech]`` / ``class: tech``
+marker in the body) feeds the product-decision firewall. ``<finding>`` is distinct
+from BOTH: it is a non-blocking note the hands emits to tell the planner about a
+bug / security issue / wrong assumption -- it does NOT end the step and the hands
+does NOT wait for an answer (it is recorded to the shared memory pool and the hands
+continues working).
 
 ``<done>`` is context-dependent in v0.04: from the **executor** it means *this
 step* is complete (not the whole task); the task completes when the plan is
@@ -61,6 +66,7 @@ class Action:
       - ``glob``: ``pattern`` + ``path`` (the base dir to match under)
       - ``webfetch``: ``url``
       - ``done`` / ``abort`` / ``blocked`` / ``finding``: ``content`` (the summary/reason/note)
+      - ``question``: ``content`` + optional ``question_class`` (``product``/``tech``/``mechanical``)
       - ``plan``: ``steps`` (ordered step instructions)
     """
 
@@ -75,6 +81,8 @@ class Action:
     tool_name: str | None = None
     arguments: dict | None = None
     eol: str | None = None
+    # Product-decision firewall (B2): class= on <question>, when present.
+    question_class: str | None = None
 
 
 @dataclass
@@ -315,6 +323,12 @@ def parse(text: str) -> ParseResult:
                 actions.append(Action(kind=kind, content=_strip_block_newlines(content), eol=attrs.get("eol")))
             elif kind == "bash":
                 actions.append(Action(kind=kind, content=content.strip()))
+            elif kind == "question":
+                actions.append(Action(
+                    kind="question",
+                    content=content.strip(),
+                    question_class=attrs.get("class") or attrs.get("qclass"),
+                ))
             else:
                 actions.append(Action(kind=kind, content=content.strip()))
             continue

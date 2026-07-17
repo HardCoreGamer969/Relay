@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
 import pytest
 
@@ -22,11 +21,17 @@ from relay.catalog import (
 )
 
 
+def _use_fixture(monkeypatch, catalog_fixture: str) -> None:
+    """Point the catalog at the local fixture file (the hermetic "fetch" rung)."""
+    monkeypatch.delenv("RELAY_DISABLE_MODELS_FETCH", raising=False)
+    monkeypatch.setenv("RELAY_MODELS_URL", catalog_fixture)
+
+
 # --- parsing ----------------------------------------------------------------
 
 
 def test_parse_and_lookup_cost_capabilities_limit(catalog_fixture, monkeypatch):
-    monkeypatch.setenv("RELAY_MODELS_URL", catalog_fixture)
+    _use_fixture(monkeypatch, catalog_fixture)
     cat = load_catalog()
 
     # cost lookup (per-1M prices straight off the fixture)
@@ -50,7 +55,7 @@ def test_parse_and_lookup_cost_capabilities_limit(catalog_fixture, monkeypatch):
 
 
 def test_lookup_misses_return_none_not_zero(catalog_fixture, monkeypatch):
-    monkeypatch.setenv("RELAY_MODELS_URL", catalog_fixture)
+    _use_fixture(monkeypatch, catalog_fixture)
     cat = load_catalog()
     assert cat.cost("deepseek", "no-such-model") is None
     assert cat.model("nope", "nope") is None
@@ -89,7 +94,7 @@ def test_defensive_parsing_tolerates_unknown_and_missing_fields():
 
 
 def test_cache_read_can_be_absent(catalog_fixture, monkeypatch):
-    monkeypatch.setenv("RELAY_MODELS_URL", catalog_fixture)
+    _use_fixture(monkeypatch, catalog_fixture)
     cat = load_catalog()
     flash = cat.cost("deepseek", "deepseek-v4-flash")
     assert flash is not None
@@ -122,7 +127,7 @@ def test_fresh_cache_is_used_without_fetching(monkeypatch):
 
 
 def test_network_fetch_populates_and_caches(catalog_fixture, monkeypatch):
-    monkeypatch.setenv("RELAY_MODELS_URL", catalog_fixture)
+    _use_fixture(monkeypatch, catalog_fixture)
     cat = load_catalog()
     assert cat.status == "fetch"  # no cache yet -> reads the fixture ("network")
     assert cat.cost("deepseek", "deepseek-v4-pro") is not None
@@ -174,7 +179,7 @@ def test_cache_from_a_different_source_is_ignored(catalog_fixture, monkeypatch):
     # A fresh cache stamped with a DIFFERENT source must not be served.
     _write_disk_cache("https://somewhere-else.example/api.json",
                       {"x": {"id": "x", "models": {}}}, age_s=1)
-    monkeypatch.setenv("RELAY_MODELS_URL", catalog_fixture)
+    _use_fixture(monkeypatch, catalog_fixture)
     cat = load_catalog()
     assert cat.status == "fetch"  # the mismatched cache was ignored; fixture read
     assert "deepseek" in cat.providers
@@ -183,6 +188,7 @@ def test_cache_from_a_different_source_is_ignored(catalog_fixture, monkeypatch):
 def test_load_never_raises_on_garbage_source(monkeypatch, tmp_path):
     bad = tmp_path / "not.json"
     bad.write_text("{ this is not valid json", encoding="utf-8")
+    monkeypatch.delenv("RELAY_DISABLE_MODELS_FETCH", raising=False)
     monkeypatch.setenv("RELAY_MODELS_URL", str(bad))
     cat = load_catalog()
     # Parse failed -> fell through to bundled rather than crashing.
@@ -235,7 +241,7 @@ def test_endpoint_uses_direct_json_path_as_is():
 
 
 def test_get_catalog_memoizes(catalog_fixture, monkeypatch):
-    monkeypatch.setenv("RELAY_MODELS_URL", catalog_fixture)
+    _use_fixture(monkeypatch, catalog_fixture)
     calls = {"n": 0}
     real = catalog._fetch_raw
 

@@ -1132,13 +1132,15 @@ catalog resolved from.
 
 ```bash
 pip install -e ".[dev]"
-scripts/test.sh            # the whole suite (recommended)
+scripts/test.sh            # hermetic suite (recommended; network blocked)
 scripts/test.sh tests/test_tools.py   # forward any pytest args
+RELAY_ALLOW_NETWORK=1 scripts/test.sh tests/live -m live   # opt-in live canary
 ```
 
-Tests are network-free — the OpenAI-compatible client is mocked and the catalog
-is served from a local fixture (`RELAY_MODELS_URL`) with the cache isolated to a
-tmp dir, so the suite never makes a real API call.
+Tests are network-free by default — the OpenAI-compatible client is mocked, the
+catalog is served from a local fixture, and ``scripts/test.sh`` / CI pass
+``--allow-hosts`` so outbound sockets fail closed. Live canaries opt in with
+``RELAY_ALLOW_NETWORK=1``.
 
 **Run the suite via `scripts/test.sh`, not `pytest … | tail`.** Piping pytest
 into `tail` (or `head`, etc.) makes the shell report *the pipe's last command's*

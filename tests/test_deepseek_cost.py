@@ -54,8 +54,14 @@ def _deepseek_cfg(model="deepseek-v4-pro"):
     return ModelConfig(brain="x", hands=model, hands_provider="deepseek")
 
 
-def test_deepseek_cost_uses_cache_hit_miss_split(catalog_fixture, monkeypatch):
+
+def _use_fixture(monkeypatch, catalog_fixture: str) -> None:
+    monkeypatch.delenv("RELAY_DISABLE_MODELS_FETCH", raising=False)
     monkeypatch.setenv("RELAY_MODELS_URL", catalog_fixture)
+
+
+def test_deepseek_cost_uses_cache_hit_miss_split(catalog_fixture, monkeypatch):
+    _use_fixture(monkeypatch, catalog_fixture)
     hit, miss, completion = 8000, 2000, 500
     client = _Client(DeepSeekUsage(hit, miss, completion))
     ledger = Ledger()
@@ -81,7 +87,7 @@ def test_deepseek_cost_uses_cache_hit_miss_split(catalog_fixture, monkeypatch):
 
 def test_deepseek_cost_falls_back_when_cache_read_absent(catalog_fixture, monkeypatch):
     # deepseek-v4-flash has no cache_read in the fixture -> hits priced at input rate.
-    monkeypatch.setenv("RELAY_MODELS_URL", catalog_fixture)
+    _use_fixture(monkeypatch, catalog_fixture)
     hit, miss, completion = 1000, 1000, 100
     client = _Client(DeepSeekUsage(hit, miss, completion))
 
@@ -98,7 +104,7 @@ def test_deepseek_cost_falls_back_when_cache_read_absent(catalog_fixture, monkey
 
 def test_deepseek_cost_no_split_prices_prompt_at_input_rate(catalog_fixture, monkeypatch):
     # A usage block with no cache split at all -> all prompt tokens at input rate.
-    monkeypatch.setenv("RELAY_MODELS_URL", catalog_fixture)
+    _use_fixture(monkeypatch, catalog_fixture)
     usage = SimpleNamespace(prompt_tokens=1000, completion_tokens=200, total_tokens=1200)
     client = _Client(usage)
 
@@ -113,7 +119,7 @@ def test_deepseek_cost_no_split_prices_prompt_at_input_rate(catalog_fixture, mon
 
 
 def test_deepseek_cost_unknown_model_is_none_not_zero(catalog_fixture, monkeypatch):
-    monkeypatch.setenv("RELAY_MODELS_URL", catalog_fixture)
+    _use_fixture(monkeypatch, catalog_fixture)
     client = _Client(DeepSeekUsage(100, 100, 10))
     result = call_model(
         "hands", [{"role": "user", "content": "hi"}],
@@ -126,7 +132,7 @@ def test_deepseek_cost_unknown_model_is_none_not_zero(catalog_fixture, monkeypat
 def test_openrouter_cost_path_unchanged(catalog_fixture, monkeypatch):
     """The OpenRouter cost path must not be touched by the DeepSeek work: it still
     reads the returned ``cost`` and never consults the catalog."""
-    monkeypatch.setenv("RELAY_MODELS_URL", catalog_fixture)
+    _use_fixture(monkeypatch, catalog_fixture)
     usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15, cost=0.000123)
     client = _Client(usage)
     cfg = ModelConfig(brain="vendor/brain", hands="vendor/hands")  # both openrouter

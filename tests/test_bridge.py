@@ -367,7 +367,7 @@ class _UiSink:
 def test_runner_full_loop_one_thread_one_transcript(tmp_path):
     """Goal -> proposal -> commit -> escalation answered in the SAME thread -> done."""
     client = _ArcClient(hands=[
-        "<question>do we need OAuth login?</question>",
+        '<question class="mechanical">do we need OAuth login?</question>',
         '<edit path="login.py">x</edit>\n<done>added login</done>',
     ])
     sink = _UiSink()

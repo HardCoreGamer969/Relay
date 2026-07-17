@@ -184,7 +184,7 @@ def test_executor_question_self_answered(tmp_path):
             "<verdict>accept</verdict>",
         ],
         hands=[
-            "<question>where do I read config from?</question>",
+            '<question class="mechanical">where do I read config from?</question>',
             '<edit path="cfg.py">cfg</edit>\n<done>wrote loader</done>',
         ],
     )
@@ -213,7 +213,7 @@ def test_executor_question_escalated_to_user(tmp_path):
             "<verdict>accept</verdict>",
         ],
         hands=[
-            "<question>do we need OAuth login?</question>",
+            '<question class="mechanical">do we need OAuth login?</question>',
             '<edit path="login.py">x</edit>\n<done>added login</done>',
         ],
     )
@@ -231,9 +231,9 @@ def test_escalation_without_callback_ends_unresolved(tmp_path):
     client = RoutedClient(
         brain=[
             "<plan><step>add login</step></plan>",
-            "<decision>escalate</decision><ask_user>Should login support OAuth?</ask_user>",
+            # unlabeled / product: firewall escalates without needing a brain decision
         ],
-        hands=["<question>do we need OAuth?</question>"],
+        hands=['<question class="product">do we need OAuth?</question>'],
     )
     result = run_planned("auth", tmp_path, models=CFG, client=client, user_decision=None)
 
@@ -254,7 +254,7 @@ def test_self_answer_is_consistent_with_prior_memory(tmp_path):
             "<verdict>accept</verdict>",
         ],
         hands=[
-            "<question>which storage backend?</question>",
+            '<question class="mechanical">which storage backend?</question>',
             '<edit path="store.py">x</edit>\n<done>built store</done>',
         ],
     )
@@ -512,10 +512,9 @@ def test_stuck_loop_result_turn_is_plain_language(tmp_path):
 
 
 def test_executor_context_stays_narrow(tmp_path):
-    # v0.0.29 invariant (Stage 1): the hands sees the narrow per-step context PLUS the
-    # SHARED pool (curated directives/findings) -- but NEVER the brain pool (no brain
-    # reasoning leaks) and not yet its own hands pool. The narrow-context principle is
-    # preserved; only the curated shared channel is admitted.
+    # B3: default ``needle`` keeps the classic narrow step+carry-over context —
+    # shared directives require ``findings``+. Hard invariant in every mode: the
+    # brain pool never leaks into the hands prompt.
     mem = MemoryBus()
     mem.remember("decision", "BRAINONLY_SECRET internal brain reasoning", "brain", pool=POOL_BRAIN)
     mem.remember("confirmation", "SHARED_DIRECTIVE use oauth not api keys", "shared", pool=POOL_SHARED)
@@ -546,11 +545,32 @@ def test_executor_context_stays_narrow(tmp_path):
     assert "created alpha.txt" in step1_ctx  # one-line carry-over allowed
     assert "ALPHA_RAW_CONTENT" not in step1_ctx  # prior raw transcript NOT leaked
     assert "STEP_ALPHA" not in step1_ctx
-    # The new invariant: shared directives ARE injected; the brain pool is NEVER seen;
-    # and (Stage 2 deferred) the hands does NOT yet read its own hands pool.
-    assert "SHARED_DIRECTIVE" in step0_ctx and "SHARED_DIRECTIVE" in step1_ctx
+    # Needle default: shared stays out; brain pool never appears.
+    assert "SHARED_DIRECTIVE" not in step0_ctx and "SHARED_DIRECTIVE" not in step1_ctx
     assert "BRAINONLY_SECRET" not in step0_ctx and "BRAINONLY_SECRET" not in step1_ctx
     assert "HANDSONLY_SCRATCH" not in step0_ctx and "HANDSONLY_SCRATCH" not in step1_ctx
+
+
+def test_executor_findings_mode_injects_shared_not_brain(tmp_path):
+    mem = MemoryBus()
+    mem.remember("decision", "BRAINONLY_SECRET internal brain reasoning", "brain", pool=POOL_BRAIN)
+    mem.remember("confirmation", "SHARED_DIRECTIVE use oauth not api keys", "shared", pool=POOL_SHARED)
+    client = RoutedClient(
+        brain=[
+            "<plan><step>STEP_ALPHA create alpha.txt</step></plan>",
+            "<verdict>accept</verdict>",
+        ],
+        hands=[
+            '<edit path="alpha.txt">ALPHA</edit>\n<done>created alpha.txt</done>',
+        ],
+    )
+    result = run_planned(
+        "g", tmp_path, models=CFG, client=client, memory=mem, hands_context_mode="findings",
+    )
+    assert result.status == STATUS_COMPLETED
+    ctx = "\n".join(m["content"] for m in _hands_calls(client)[0]["messages"])
+    assert "SHARED_DIRECTIVE" in ctx
+    assert "BRAINONLY_SECRET" not in ctx
 
 
 # --- budgets / terminal statuses -------------------------------------------
@@ -653,6 +673,69 @@ def test_no_cost_ceiling_means_no_max_cost_status(tmp_path):
         _models._extract_cost = original
 
 
+def test_envelope_warn_fires_once_at_half_cost(tmp_path):
+    """Soft 50% warn emits once when chargeable cost crosses the threshold."""
+    from relay import models as _models
+    from relay.envelope import CostEnvelope
+
+    original = _models._extract_cost
+    _models._extract_cost = lambda usage, *, provider, model: 0.001
+    warns: list = []
+    try:
+        client = RoutedClient(
+            brain=[
+                "<plan><step>create a.txt</step><step>create b.txt</step></plan>",
+            ],
+            hands=[
+                '<edit path="a.txt">A</edit>\n<done>did a</done>',
+                '<edit path="b.txt">B</edit>\n<done>did b</done>',
+            ],
+        )
+        env = CostEnvelope(
+            max_cost=0.004, max_steps=50, scope="all", warn_thresholds=(0.5, 0.99)
+        )
+        result = run_planned(
+            "g",
+            tmp_path,
+            models=CFG,
+            client=client,
+            envelope=env,
+            on_event=lambda e: warns.append(e) if e.kind == "envelope_warn" else None,
+            supervise=False,
+        )
+        assert result.status == STATUS_COMPLETED
+        assert any(e.payload.get("threshold") == 0.5 for e in warns)
+        assert sum(1 for e in warns if e.payload.get("threshold") == 0.5) == 1
+        assert result.envelope is env
+    finally:
+        _models._extract_cost = original
+
+
+def test_envelope_scope_execution_ignores_planning_spend(tmp_path):
+    """scope=execution: planning brain calls do not count toward max_cost."""
+    from relay import models as _models
+    from relay.envelope import CostEnvelope
+
+    original = _models._extract_cost
+    _models._extract_cost = lambda usage, *, provider, model: 0.001
+    try:
+        client = RoutedClient(
+            brain=[
+                "<plan><step>create a.txt</step></plan>",
+                "<verdict>accept</verdict>",
+            ],
+            hands=['<edit path="a.txt">A</edit>\n<done>did a</done>'],
+        )
+        # Planning alone would exceed 0.0015 if counted; execution-only should complete.
+        env = CostEnvelope(max_cost=0.0015, scope="execution", warn_thresholds=(0.99,))
+        result = run_planned(
+            "g", tmp_path, models=CFG, client=client, envelope=env, supervise=True
+        )
+        assert result.status == STATUS_COMPLETED
+    finally:
+        _models._extract_cost = original
+
+
 def test_max_cost_resolves_with_no_ledger_cost_unknown_is_a_noop(tmp_path):
     """If the provider never returns a cost, ledger.total_cost() is None
     -- the guard has no signal and falls through (the call-count ceiling
@@ -701,7 +784,7 @@ def test_events_stream_brain_executor_exchanges(tmp_path):
             "<verdict>accept</verdict>",
         ],
         hands=[
-            "<question>where to read config?</question>",
+            '<question class="mechanical">where to read config?</question>',
             '<edit path="cfg.py">x</edit>\n<done>wrote it</done>',
         ],
     )
@@ -842,7 +925,7 @@ def test_assumption_level_threaded_into_answer(tmp_path):
             "<verdict>accept</verdict>",
         ],
         hands=[
-            "<question>where to read config?</question>",
+            '<question class="tech">where to read config?</question>',
             '<edit path="cfg.py">x</edit>\n<done>wrote it</done>',
         ],
     )
@@ -1057,7 +1140,7 @@ def test_self_answer_decision_graduates_to_shared(tmp_path):
             "<verdict>accept</verdict>",
         ],
         hands=[
-            "<question>where is config?</question>",
+            '<question class="mechanical">where is config?</question>',
             '<edit path="c.py">x</edit>\n<done>wrote it</done>',
         ],
     )

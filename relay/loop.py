@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from relay.config import ModelConfig
+from relay.envelope import CostEnvelope
 from relay.models import call_model
 from relay.protocol import Action, parse
 from relay.telemetry import Ledger
@@ -76,6 +77,7 @@ class ParseFailureTracker:
 STATUS_COMPLETED = "completed"  # the model emitted <done>
 STATUS_MAX_STEPS = "max_steps"  # ran out of turns without <done>
 STATUS_PARSE_FAILURE_ABORT = "parse_failure_abort"  # hit consecutive-parse-failure limit
+STATUS_MAX_COST = "max_cost"  # A1: hard cost ceiling reached at a turn boundary
 
 SYSTEM_PROMPT = """\
 You are Relay, an autonomous coding agent working inside a single project directory.
@@ -193,6 +195,8 @@ class TaskResult:
     status: str = STATUS_MAX_STEPS
     done_summary: str | None = None
     ledger: Ledger | None = None
+    envelope: CostEnvelope | None = None
+    max_cost: float | None = None
 
     @property
     def done(self) -> bool:
@@ -388,6 +392,9 @@ def run_task(
     approver: Callable[[str, str], bool] | None = None,
     auto_approve: bool = False,
     bash_timeout_s: float | None = 120.0,
+    max_cost: float | None = None,
+    envelope: CostEnvelope | None = None,
+    on_envelope_warn: Callable[[dict], None] | None = None,
 ) -> TaskResult:
     """Drive the single-model agent loop until ``<done>`` or ``max_steps``.
 
@@ -407,19 +414,23 @@ def run_task(
             affects ``BLOCKED`` commands, which are always refused.
         bash_timeout_s: Timeout for bash commands in seconds. ``None`` disables
             the timeout (unbounded). Default 120s.
+        max_cost: Optional hard cost ceiling (dollars). Checked at turn boundaries.
+        envelope: Optional :class:`CostEnvelope` (overrides max_cost/max_steps when set).
+        on_envelope_warn: Optional callback for soft threshold warning dicts.
     """
     tools = Tools(Path(project_root), approver=approver, auto_approve=auto_approve,
                   bash_timeout_s=bash_timeout_s)
     ledger = ledger if ledger is not None else Ledger()
-    result = TaskResult(goal=goal, ledger=ledger)
-    # v0.0.32: the read-before-edit guard (``guarded_execute_action``) is now
-    # in scope for the solo loop too. The solo loop used to call unguarded
-    # ``execute_action`` (loop.py:404 before this change), so a solo agent
-    # could blind-clobber a file it had never read. Same freshness model as
-    # the executor (content-hash based) -- a read in turn N is valid for
-    # edits in turn M while the file is unchanged. A fresh per-run dict
-    # here (vs. the cross-step dict in ``run_planned``) is the right
-    # granularity: the solo loop is single-role, single-goal.
+    if envelope is None:
+        envelope = CostEnvelope(max_cost=max_cost, max_steps=max_steps, scope="all")
+    else:
+        if envelope.max_steps is None:
+            envelope.max_steps = max_steps
+        if max_cost is not None and envelope.max_cost is None:
+            envelope.max_cost = max_cost
+    result = TaskResult(goal=goal, ledger=ledger, envelope=envelope, max_cost=envelope.max_cost)
+    # Solo has no separate planning phase — chargeable cost is always ledger total
+    # from turn 0 (baseline stays 0 whether scope is all or execution).
     reads: dict[str, str] = {}
 
     messages: list[dict[str, str]] = [
@@ -433,11 +444,21 @@ def run_task(
             on_step(step)
 
     consecutive_parse_failures = 0
+    turns_used = 0
 
     for _ in range(max_steps):
+        # Soft warnings + hard cost stop at the turn boundary (before next call).
+        for warn in envelope.drain_warnings(ledger=ledger, steps_used=turns_used):
+            if on_envelope_warn is not None:
+                on_envelope_warn(warn)
+        if envelope.hit_cost_limit(ledger):
+            result.status = STATUS_MAX_COST
+            break
+
         reply = call_model(
             role, messages, models=models, ledger=ledger, client=client
         ).text
+        turns_used += 1
         messages.append({"role": "assistant", "content": reply})
 
         parsed = parse(reply)
@@ -470,6 +491,7 @@ def run_task(
             if action.kind == "done":
                 result.status = STATUS_COMPLETED
                 result.done_summary = action.content or ""
+                envelope.note_completed_step()
                 emit(StepResult(kind="done", detail=describe_action(action), observation=""))
                 break
             observation = guarded_execute_action(tools, action, reads)

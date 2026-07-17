@@ -38,19 +38,19 @@ experience-level projection slots in there without a refactor.
 from __future__ import annotations
 
 import asyncio
+import logging
 import platform
 import random
-import re
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.containers import Container, Vertical, VerticalScroll
-from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Input, Label, Select, Static
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.widgets import Input, Static
+from textual.worker import Worker, WorkerState
+
+_LOG = logging.getLogger("relay.tui")
 
 from relay.bridge import (
     ACTION_ANSWER,
@@ -75,7 +75,6 @@ from relay.config import (
     ModelConfig,
     assumption_summary,
     describe_resolution,
-    default_config,
     env_override_for,
     load_models,
     resolve_max_total_steps,
@@ -89,1054 +88,95 @@ from relay.providers import (
     resolve_provider,
     validate_model as provider_validate_model,
 )
-from relay.secrets import resolve_key, set_key as secrets_set_key
-from relay.store import CONFIG_VERSION, load_config, save_config
-from relay.transcript import Turn
+from relay.secrets import resolve_key
 
-# How often the conversation pane catches up with the (append-only) transcript.
-_SYNC_INTERVAL_S = 0.2
+from .commands import (
+    COMMANDS,
+    Command,
+    _parse_inline_command,
+    _run_active,
+    command_by_name,
+    filter_commands,
+    visible_commands,
+)
+from .dialogs import ApproveDialog, SegmentedControl, SelectDialog, TextEntryDialog
+from .events import (
+    describe_event_for_activity,
+    format_turn,
+    friendly_provider_error,
+    model_identity,
+    present_prompt,
+)
+from .input import PromptInput
+from .plan import PLAN_MODES, render_plan_dock, resolve_plan_mode
+from .setup import SetupScreen, _call_persist_role, _call_secrets_set_key
+from .status import (
+    StatusSnapshot,
+    active_instruction,
+    context_segment,
+    cost_segment,
+    mode_word,
+    resolve_anim_mode,
+    route_segment,
+    step_segment,
+)
+from .stream import (
+    STREAM_BUFFER_MAX,
+    STREAM_MAX_LINES,
+    find_in_lines,
+    render_conversation_body,
+    render_observation,
+    stream_should_follow,
+    tool_summary_line,
+    trim_deque_list,
+    trim_stream_children,
+)
+from .theme import (
+    ACTOR_BRAIN,
+    ACTOR_HANDS,
+    C_AMBER,
+    C_CYAN,
+    C_DIM,
+    C_GREEN,
+    C_MAGENTA,
+    C_MUTED,
+    C_RED,
+    C_TXT,
+    RELAY_WORDMARK,
+    W_BG,
+    W_BG_CARD,
+    W_BG_RAISED,
+    W_BORDER,
+    W_RED,
+    W_TEXT,
+    W_TEXT_DIM,
+    W_TEXT_MUTED,
+    W_WARN,
+    _ACTOR_STYLES,
+    _ANIM_FPS,
+    _COST_PULSE_S,
+    _GENERATING_STATES,
+    _glitch_thresholds,
+    _LED_INTERVAL_S,
+    _normalize_block,
+    _PLAN_ICON,
+    _SPIN_INTERVAL_S,
+    _SPINNER_FRAMES,
+    _STARTUP_SHORT_S,
+    _TRANSITION_SHORT_S,
+    glitch_frame,
+    pick_greeting,
+    pick_placeholder,
+    placeholder_for_state,
+)
+
+# Backup transcript sync (events are the primary path; this catches rare gaps).
+_SYNC_INTERVAL_S = 1.0
 # Bounded wait when joining the worker on quit -- never hang the exit.
 _JOIN_TIMEOUT_S = 5.0
 
-# The rotating welcome greetings -- one shown per launch. Warmer than "Goal:";
-# productive, inviting, a little character. Edit freely.
-GREETINGS = (
-    "What are we building today?",
-    "What should we work on?",
-    "Point me at something.",
-    "What's the mission?",
-    "Give me a goal.",
-    "What are we shipping?",
-    "Where do we start?",
-)
-
-# The rotating IDLE input placeholders -- one chosen per launch. Same warm voice
-# as GREETINGS, but kept DISJOINT from it so the box never echoes the greeting
-# shown right above it (a guarantee, not a coincidence -- see the test).
-INPUT_PLACEHOLDERS = (
-    "what's next?",
-    "what are we building?",
-    "what should we tackle?",
-    "what needs doing?",
-    "point me at something...",
-)
-
-# The states where the engine is ACTIVELY generating (the model is genuinely
-# running). The slash popover is suppressed only here -- every other state (idle and
-# the awaiting-user states) accepts a slash command (see ``_slash_allowed``).
-_GENERATING_STATES = (InputState.PLANNING, InputState.EXECUTING)
-
-# State-aware placeholders: the one box's PURPOSE changes with what the engine is
-# waiting for, so the prompt should say what a submit now means. Short.
-_STATE_PLACEHOLDERS = {
-    InputState.AWAITING_REACTION: "React to the plan (approve, or ask for changes)...",
-    InputState.AWAITING_DECISION: "Your answer...",
-    InputState.AWAITING_APPROVAL: "Approve this command? (y/n)...",
-    InputState.PLANNING: "The agent is working... (esc to cancel)",
-    InputState.EXECUTING: "The agent is working... (esc to cancel)",
-}
-
-# The RELAY wordmark hero: hand-built 5-row block glyphs, letterspaced wide. We
-# can't reproduce the curved interlocking-R logo glyph in text, so the confident
-# letterspaced wordmark IS the hero (legible beats a janky knockoff). Each glyph
-# is a fixed 5x5 cell grid, so the assembled banner is a clean rectangle (which
-# the glitch animator wants -- see below).
-_WORDMARK_GLYPHS = {
-    "R": ["████ ", "█   █", "████ ", "█  █ ", "█   █"],
-    "E": ["█████", "█    ", "████ ", "█    ", "█████"],
-    "L": ["█    ", "█    ", "█    ", "█    ", "█████"],
-    "A": [" ███ ", "█   █", "█████", "█   █", "█   █"],
-    "Y": ["█   █", " █ █ ", "  █  ", "  █  ", "  █  "],
-}
-_WORDMARK_GAP = "   "
-
-
-def _build_wordmark(word: str = "RELAY", gap: str = _WORDMARK_GAP) -> str:
-    """Assemble the letterspaced block wordmark as one multi-line string."""
-    rows = [gap.join(_WORDMARK_GLYPHS[ch][r] for ch in word) for r in range(5)]
-    return "\n".join(rows)
-
-
-RELAY_WORDMARK = _build_wordmark()
-
-# -- the glitch / datamosh animator -------------------------------------------
-
-# Cyberpunk static: glyphs an unlocked cell flickers through before it resolves.
-_GLITCH_GLYPHS = "▓▒░█▌▐╱╲╳<>/\\|=+*#%01"
-
-# One routed animator, short by default -- the app is relaunched constantly
-# during dev, so a long boot gets old fast. Modes: "short" (fully implemented),
-# "off" (instant, no timers), "long" (stubbed to short for now).
-_ANIM_FPS = 24
-_STARTUP_SHORT_S = 0.45      # boot decode that resolves into the wordmark
-_TRANSITION_SHORT_S = 0.4    # welcome -> working datamosh (short ALWAYS)
-
-# How long the live cost counter stays highlighted after it climbs (a single
-# transient style flip on change -- no animation loop, no thread, zero model calls).
-_COST_PULSE_S = 0.5
-
-
-def _normalize_block(target: str) -> list[str]:
-    """Split into equal-width rows so the glitch matrix is a clean rectangle."""
-    lines = target.split("\n")
-    width = max((len(line) for line in lines), default=0)
-    return [line.ljust(width) for line in lines]
-
-
-def _glitch_thresholds(lines: list[str]) -> list[list[float]]:
-    """A stable per-cell lock-threshold matrix (computed once per animation).
-
-    Each cell locks to its true value when progress crosses its threshold;
-    stable across frames so a locked cell never flickers back to noise.
-    """
-    rng = random.Random()
-    return [[rng.random() for _ in line] for line in lines]
-
-
-def glitch_frame(
-    lines: list[str],
-    thresholds: list[list[float]],
-    progress: float,
-    shimmer: random.Random,
-    *,
-    direction: str = "in",
-) -> str:
-    """One datamosh frame: locked cells show the true glyph, the rest flicker.
-
-    ``direction="in"`` resolves noise -> target (boot); ``"out"`` dissolves
-    target -> noise (the welcome handoff). ``shimmer`` is re-rolled each frame so
-    unlocked cells crackle. At ``progress>=1`` an "in" frame is fully the target;
-    at ``progress<=0`` an "out" frame is fully the target.
-    """
-    out = []
-    for row, line in enumerate(lines):
-        chars = []
-        for col, ch in enumerate(line):
-            threshold = thresholds[row][col]
-            locked = progress >= threshold if direction == "in" else progress < threshold
-            chars.append(ch if locked else shimmer.choice(_GLITCH_GLYPHS))
-        out.append("".join(chars))
-    return "\n".join(out)
-
-
-def present_prompt(text: str) -> str:
-    """THE chokepoint for every user-facing question/prompt string.
-
-    v1 passes full-fidelity text through unchanged. Prompt 2's
-    experience-level projection (rephrasing per user expertise) plugs in here
-    -- one place, no refactor.
-    """
-    return text
-
-
-def format_turn(turn: Turn) -> str:
-    """Render one transcript turn for the conversation pane.
-
-    UNICODE-CLEAN by contract: the turn text is passed through verbatim (no
-    ASCII sanitizing, no ellipsis truncation) -- Textual renders real unicode
-    natively, unlike the legacy Windows console path.
-    """
-    who = "you" if turn.speaker == "user" else "brain"
-    return f"{who} ({turn.phase}): {turn.text}"
-
-
-def model_identity(models: ModelConfig) -> str:
-    """The brain/hands pairing as IDENTITY (welcome screen), not a status note.
-
-    This is the user knowing which pairing they're about to spend money on,
-    front and center -- so it reads as the machine's name, cleanly styled.
-    """
-    return f"brain ~{models.brain}  ·  hands ~{models.hands}"
-
-
-# -- friendly provider errors (the catch-all so raw API JSON never reaches a user) --
-
-# Pretty provider labels for user-facing error text (fall back to the raw id).
-_PROVIDER_LABELS = {"openrouter": "OpenRouter", "deepseek": "DeepSeek"}
-
-# Markers that betray a raw provider/API error blob (JSON / status line) we must
-# never surface verbatim.
-_RAW_ERROR_MARKERS = ("{'error'", '{"error"', "'raw'", '"raw"', "error code:", "traceback")
-
-
-def _provider_label(provider: str | None) -> str:
-    return _PROVIDER_LABELS.get(provider, provider) if provider else "The provider"
-
-
-def _is_raw_provider_error(text: str) -> bool:
-    """Whether ``text`` looks like a raw provider/API error blob (don't show it raw)."""
-    low = text.lower()
-    return any(marker in low for marker in _RAW_ERROR_MARKERS)
-
-
-def _http_status(text: str) -> str | None:
-    """Pull an HTTP-ish 4xx/5xx status code out of a provider error string."""
-    match = re.search(r"\b([45]\d\d)\b", text)
-    return match.group(1) if match else None
-
-
-def friendly_provider_error(error, *, provider: str | None = None, model: str | None = None) -> str:
-    """Render a raw provider/API error as a friendly, ASCII-safe one-liner.
-
-    THE catch-all net: at every point a provider error would reach the UI (the
-    run-error path and the slash live calls -- validation, listing, doctor), this
-    states what failed, which provider/model, and a short hint to re-pick -- and
-    NEVER includes the raw ``{'error': {... 'raw': ...}}`` payload (which may be
-    logged at debug elsewhere, but not shown). Text that does NOT look like a raw
-    provider error is returned unchanged, so a clean validation note ("'x' is not in
-    deepseek's live model list") and a plain non-provider error read normally.
-    """
-    text = str(error or "").strip()
-    if not _is_raw_provider_error(text):
-        return text
-    label = _provider_label(provider)
-    code = _http_status(text)
-    code_note = f" (HTTP {code})" if code else ""
-    if model:
-        lead = (
-            f"{label} rejected the request -- '{model}' may not be a valid {label} model"
-            if code == "400"
-            else f"{label} returned an error{code_note} for '{model}'"
-        )
-        return f"{lead}. Use /model or /provider to pick a valid one."
-    return (
-        f"{label} returned an error{code_note}. The model or provider may be invalid -- "
-        "check with /doctor, or re-pick via /model or /provider."
-    )
-
-
-def pick_greeting() -> str:
-    """One greeting for this launch (rotation is by random choice)."""
-    return random.choice(GREETINGS)
-
-
-def pick_placeholder() -> str:
-    """One idle input placeholder for this launch (rotation by random choice)."""
-    return random.choice(INPUT_PLACEHOLDERS)
-
-
-def placeholder_for_state(state: InputState, idle_placeholder: str) -> str:
-    """Resolve the input placeholder for the current router state (pure, testable).
-
-    The awaiting/busy states get their fixed cue from :data:`_STATE_PLACEHOLDERS`;
-    idle (and the welcome screen) shows ``idle_placeholder`` -- the rotating phrase
-    chosen for this launch.
-    """
-    return _STATE_PLACEHOLDERS.get(state, idle_placeholder)
-
-
-# -- the brain<->hands activity feed (rendered from ALREADY-EMITTED events) ----
-#
-# Attribution so the back-and-forth reads as a dialogue: the brain (planner) and
-# the hands (executor) are the two voices; "you" is the human; system lines carry
-# no tag. This is PURE PRESENTATION of data the engine already put on the event
-# stream -- it must never trigger a model call (see the zero-new-tokens guard test).
-ACTOR_BRAIN = "brain"
-ACTOR_HANDS = "hands"
-ACTOR_YOU = "you"
-
-# -- the cyberpunk palette (v0.0.30): the single source of truth for the stream's
-# styling, mirroring the agreed mockup. Near-black background, neon accents.
-# Relay's improvement over a single-agent stream is the brain/hands/findings split:
-#   brain = magenta, hands = cyan, findings = green, you = bright magenta;
-#   cost = amber, done = green, active = cyan. Cyberpunk == palette + activity-only
-#   spinners/LED ONLY -- no CRT/scanlines/glow/ambient motion (it's a tool).
-C_BG = "#06090e"
-C_PANEL = "#080d14"
-C_CYAN = "#34d9ee"
-C_MAGENTA = "#e879f9"
-C_GREEN = "#3ee48b"
-C_AMBER = "#ffcf4d"
-C_RED = "#ff6b6b"
-C_TXT = "#d3e3ef"
-C_MUTED = "#8aa0b3"
-C_DIM = "#5a7187"
-
-# Speaker -> gutter style for the stream (Relay's brain/hands/you distinction).
-_ACTOR_STYLES = {ACTOR_BRAIN: C_MAGENTA, ACTOR_HANDS: C_CYAN, ACTOR_YOU: f"bold {C_MAGENTA}"}
-
-# The active-step / running spinner (a clean spinner, from the mockup) + plan icons.
-# Motion happens ONLY on the active plan step + the mode LED (activity-only).
-_SPINNER_FRAMES = ("◍", "◐", "◎", "◑")  # ◍ ◐ ◎ ◑
-# Plan-step icons. The "active" step animates through _SPINNER_FRAMES while running;
-# its entry here is the RESTING icon shown when motion is off ("off" anim mode, or a
-# settled/halted run) -- keep it equal to _SPINNER_FRAMES[0] so the two never diverge.
-_PLAN_ICON = {"done": "◉", "active": "◍", "pending": "○", "failed": "✗"}
-_SPIN_INTERVAL_S = 0.15   # active-step spinner cadence
-_LED_INTERVAL_S = 0.7     # the mode LED's slow "breathing" cadence
-
-
-def describe_event_for_activity(event: Event) -> tuple[str | None, str]:
-    """Map one engine event to ``(actor, line)`` for the activity feed.
-
-    ``actor`` is ``brain`` / ``hands`` / ``you`` (or ``None`` for a system line).
-    Every field read here is already present on the emitted event -- nothing is
-    fetched, narrated, or summarized by a model.
-    """
-    kind = event.kind
-    p = event.payload or {}
-    msg = event.message
-
-    if kind == "step_start":
-        return ACTOR_BRAIN, f"-> step {p.get('index')}: {p.get('instruction', msg)}"
-    if kind == "exec_action":
-        return ACTOR_HANDS, msg  # describe_action text; observation appended by caller
-    if kind == "exec_parse_failure":
-        return ACTOR_HANDS, f"! parse failure: {p.get('snippet', '')}"
-    if kind == "executor_question":
-        return ACTOR_HANDS, f"? {p.get('question', msg)}"
-    if kind == "brain_self_answered":
-        return ACTOR_BRAIN, f"answers: {p.get('answer', '')}"
-    if kind == "brain_escalated":
-        return ACTOR_BRAIN, f"escalates: {p.get('question', msg)}"
-    if kind == "user_decided":
-        return ACTOR_YOU, f"decided: {p.get('answer', msg)}"
-    if kind == "step_reviewed":
-        return ACTOR_BRAIN, f"reviews step {p.get('index')}: {p.get('verdict', '')}"
-    if kind == "step_done":
-        return ACTOR_HANDS, f"done step {p.get('index')}: {p.get('outcome', '')}"
-    if kind == "step_failed":
-        return ACTOR_HANDS, f"failed step {p.get('index')}: {p.get('reason', '')}"
-    if kind == "plan_created":
-        return ACTOR_BRAIN, f"plan: {len(p.get('steps') or [])} step(s)"
-    if kind == "plan_proposed":
-        return ACTOR_BRAIN, f"proposed a plan ({len(p.get('steps') or [])} step(s))"
-    if kind in ("plan_revised", "replanned"):
-        return ACTOR_BRAIN, f"revised the plan ({len(p.get('steps') or [])} step(s))"
-    if kind == "escalation":
-        return ACTOR_BRAIN, msg
-    if kind == "memory_write":
-        return ACTOR_BRAIN, f"memory += [{p.get('kind', '')}] {p.get('summary', '')}"
-    if kind == "scope_assessed":
-        return ACTOR_BRAIN, f"scope: {p.get('scope', '')} -> {p.get('posture', '')}"
-    if kind in ("scoping_question", "elicitation", "clarify"):
-        return ACTOR_BRAIN, f"asks: {p.get('question', msg)}"
-    if kind == "user_reacted":
-        return ACTOR_YOU, f"reacted: {p.get('reaction', msg)}"
-    if kind == "rejected":
-        return ACTOR_YOU, "rejected the plan"
-    if kind == "committed":
-        return ACTOR_YOU, "committed the plan"
-    # status / transcript_compacted / not_committed / anything else: a system line.
-    return None, msg
-
-
-def setup_summary() -> str:
-    """A plain, key-free summary of the current resolution (provider/model/key
-    presence per role/provider). Reads :func:`describe_resolution` -- NEVER a key."""
-    res = describe_resolution()
-    lines = []
-    for role in ROLES:
-        f = res["roles"][role]
-        thinking = "on" if f["thinking"][0] else "off"
-        lines.append(
-            f"{role}: {f['provider'][0]} / {f['model'][0]}  (thinking {thinking}; "
-            f"src {f['provider'][1]}/{f['model'][1]})"
-        )
-    for pid in known_providers():
-        present = res["providers"][pid]["key_present"]
-        lines.append(f"key[{pid}]: {'present' if present else 'absent'}")
-    return "\n".join(lines)
-
-
-def persist_role(
-    role: str, provider: str, model: str, thinking: bool, *, validate_fn=None
-) -> tuple[bool, str]:
-    """Validate a (provider, model) live, then persist the role to config.json.
-
-    The ONE place a role selection is written -- shared by the SetupScreen and the
-    ``/model`` slash command so they can never fork (same validation, same write).
-    ``validate_fn`` defaults to the shared :func:`relay.providers.validate_model`.
-    Returns ``(saved?, note)``; does not persist on validation failure.
-    """
-    validate_fn = validate_fn or provider_validate_model
-    model = (model or "").strip()
-    if not model:
-        return False, "enter a model id"
-    ok, note = validate_fn(provider, model)
-    if not ok:
-        return False, note
-    config = load_config() or default_config()
-    config.setdefault("version", CONFIG_VERSION)
-    config.setdefault("roles", {})[role] = {
-        "provider": provider, "model": model, "thinking": bool(thinking),
-    }
-    save_config(config)
-    return True, note
-
-
-class SetupScreen(ModalScreen):
-    """In-TUI provider setup: enter a key (masked), pick per-role models, toggle
-    thinking -- for a beta user with no terminal/.env knowledge.
-
-    All persistence goes through the Part-1 backend (auth.json 0o600 for keys,
-    config.json for selections). Network-touching work (model listing, slug
-    validation) is behind injectable seams so the screen is headless-testable and
-    never hits the network in tests. Real unicode; consistent cyberpunk aesthetic.
-    """
-
-    BINDINGS = [("escape", "close", "Close setup")]
-
-    CSS = """
-    SetupScreen { align: center middle; }
-    #setup-box {
-        width: 80%; max-width: 100; height: auto; max-height: 90%;
-        padding: 1 2; border: double $primary; background: $surface;
-    }
-    #setup-title { text-style: bold; content-align: center middle; }
-    #setup-summary { color: $text-muted; margin: 1 0; }
-    #setup-status { margin-top: 1; }
-    .setup-section { margin-top: 1; text-style: bold; color: $secondary; }
-    Select, Input, Checkbox { margin-bottom: 1; }
-    """
-
-    def __init__(
-        self,
-        *,
-        models: ModelConfig,
-        list_models_fn=None,
-        validate_fn=None,
-        on_saved=None,
-    ) -> None:
-        super().__init__()
-        self._models = models
-        # Seams (injected by tests; default to the real, network-touching funcs).
-        self._list_models_fn = list_models_fn or provider_list_models
-        self._validate_fn = validate_fn or provider_validate_model
-        self._on_saved = on_saved
-        self._provider_options = [(p, p) for p in known_providers()]
-        # The last status message rendered (mirrored for headless tests).
-        self.status_text = ""
-
-    # -- layout ---------------------------------------------------------------
-
-    def compose(self) -> ComposeResult:
-        with VerticalScroll(id="setup-box"):
-            yield Static("Relay setup", id="setup-title")
-            yield Static(setup_summary(), id="setup-summary")
-
-            yield Label("Provider key", classes="setup-section")
-            yield Select(self._provider_options, id="key-provider", allow_blank=False,
-                         value=self._models.brain_provider)
-            # password=True -> the field shows bullets; keys get screenshotted.
-            yield Input(placeholder="paste the API key (hidden)", password=True, id="key-input")
-            yield Button("Save key", id="save-key", variant="primary")
-
-            for role in ROLES:
-                provider = self._models.provider_for_role(role)
-                yield Label(f"{role} model", classes="setup-section")
-                yield Select(self._provider_options, id=f"{role}-provider",
-                             allow_blank=False, value=provider)
-                yield Input(value=self._models.for_role(role),
-                            placeholder="model id / slug", id=f"{role}-model")
-                # For a list provider, a selectable list of live ids (fills the
-                # input on pick). For a manual provider it simply stays empty.
-                yield Select(self._model_options(role, provider), id=f"{role}-model-list",
-                             allow_blank=True)
-                yield Checkbox("thinking", value=self._models.thinking_for_role(role),
-                               id=f"{role}-thinking")
-                yield Button(f"Save {role}", id=f"save-{role}")
-
-            yield Static("", id="setup-status")
-            yield Static("openrouter: type any slug  ·  deepseek: pick from the list  ·  esc to close",
-                         id="setup-hint")
-
-    # -- seams + helpers (testable) ------------------------------------------
-
-    def _model_options(self, role: str, provider: str) -> list[tuple[str, str]]:
-        """Selectable model-id options for a role's provider (``[]`` for manual)."""
-        return [(mid, mid) for mid in self.models_for(provider)]
-
-    def models_for(self, provider: str) -> list[str]:
-        """Live model ids for a ``list`` provider (``[]`` for manual / on error)."""
-        try:
-            profile = resolve_provider(provider)
-        except ValueError:
-            return []
-        if profile.discovery != DISCOVERY_LIST:
-            return []
-        try:
-            return list(self._list_models_fn(provider))
-        except Exception:  # noqa: BLE001 -- no key/network: just an empty list
-            return []
-
-    def save_key(self, provider: str, key: str) -> bool:
-        """Store a key (masked-entered) to auth.json 0o600. Returns saved?."""
-        key = (key or "").strip()
-        if not key:
-            self._set_status("[yellow]no key entered.[/yellow]")
-            return False
-        secrets_set_key(provider, key)  # the value is NEVER echoed back
-        self._set_status(f"[green]stored a key for {provider}.[/green]")
-        self._refresh_summary()
-        self._notify_saved()
-        return True
-
-    def save_role(self, role: str, provider: str, model: str, thinking: bool) -> bool:
-        """Validate (live) and persist a role's provider/model/thinking. Returns saved?.
-
-        Delegates to the shared :func:`persist_role` (same path the ``/model`` slash
-        command uses) so validation + persistence never fork.
-        """
-        ok, note = persist_role(role, provider, model, thinking, validate_fn=self._validate_fn)
-        if not ok:
-            note = friendly_provider_error(note, provider=provider, model=model)
-            self._set_status(f"[red]{role} rejected:[/red] {note}")  # inline error, not saved
-            return False
-        self._set_status(f"[green]saved {role}: {provider} / {model}.[/green]")
-        self._refresh_summary()
-        self._notify_saved()
-        return True
-
-    # -- widget event wiring --------------------------------------------------
-
-    def on_select_changed(self, event: Select.Changed) -> None:
-        sid = event.select.id or ""
-        if sid.endswith("-provider") and not sid.startswith("key"):
-            role = sid[: -len("-provider")]
-            self._repopulate_model_list(role, str(event.value))
-        elif sid.endswith("-model-list") and event.value not in (None, Select.BLANK):
-            role = sid[: -len("-model-list")]
-            self.query_one(f"#{role}-model", Input).value = str(event.value)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        bid = event.button.id or ""
-        if bid == "save-key":
-            provider = str(self.query_one("#key-provider", Select).value)
-            self.save_key(provider, self.query_one("#key-input", Input).value)
-            self.query_one("#key-input", Input).value = ""  # don't leave the key on screen
-        elif bid.startswith("save-"):
-            self._save_role_from_widgets(bid[len("save-"):])
-
-    def _save_role_from_widgets(self, role: str) -> None:
-        if role not in ROLES:
-            return
-        provider = str(self.query_one(f"#{role}-provider", Select).value)
-        model = self.query_one(f"#{role}-model", Input).value
-        thinking = self.query_one(f"#{role}-thinking", Checkbox).value
-        self.save_role(role, provider, model, bool(thinking))
-
-    def _repopulate_model_list(self, role: str, provider: str) -> None:
-        try:
-            select = self.query_one(f"#{role}-model-list", Select)
-        except Exception:  # noqa: BLE001 -- not mounted yet
-            return
-        select.set_options(self._model_options(role, provider))
-
-    def _refresh_summary(self) -> None:
-        try:
-            self.query_one("#setup-summary", Static).update(setup_summary())
-        except Exception:  # noqa: BLE001 -- not mounted
-            pass
-
-    def _set_status(self, message: str) -> None:
-        self.status_text = message
-        try:
-            self.query_one("#setup-status", Static).update(message)
-        except Exception:  # noqa: BLE001 -- not mounted
-            pass
-
-    def _notify_saved(self) -> None:
-        if self._on_saved is not None:
-            self._on_saved()
-
-    def action_close(self) -> None:
-        self.dismiss()
-
-
-# ============================================================================
-# Slash commands: a dialog-driven control plane (v0.0.17)
-# ============================================================================
-#
-# Typing "/" in the prompt opens a filterable popover of commands; each command's
-# run() opens a DIALOG or performs a clean no-arg action. NO command parses inline
-# arguments, and NO command (especially /key) ever reads a value out of the prompt
-# text. Slash commands are a thin front door that LAUNCHES the existing v0.0.16
-# flows (masked key entry, live model listing, validation, persistence, doctor,
-# runs) -- they reuse those functions, never fork them.
-
-
-@dataclass(frozen=True)
-class Command:
-    """One slash command as a data record.
-
-    ``name`` is the slash trigger (``"model"`` -> typed ``/model``); ``title`` /
-    ``description`` are human text; ``category`` groups it in lists; ``run(app)``
-    opens a dialog or performs the action (it takes only the app -- never a value
-    parsed from the input); ``enabled(app)`` optionally hides the command in the
-    current state (e.g. mid-run). Adding a command is adding a record to
-    :data:`COMMANDS`.
-    """
-
-    name: str
-    title: str
-    description: str
-    category: str
-    run: Callable  # run(app) -> None
-    enabled: Callable | None = None  # enabled(app) -> bool
-
-
-def _run_active(app) -> bool:
-    """Whether a run is in flight (used by ``enabled`` predicates)."""
-    runner = getattr(app, "_runner", None)
-    # ``EngineRunner`` records its terminal outcome before invoking the UI's
-    # ``on_finished`` callback.  The worker thread can remain alive for a tiny
-    # tail while that callback returns, but it cannot mutate the transcript or
-    # execute more work once ``outcome`` is set.  Treat that settled tail as
-    # inactive so a user who interrupts, stops, and immediately runs ``/clear``
-    # does not hit a silent no-op race.
-    return (
-        runner is not None
-        and getattr(runner, "is_running", False)
-        and getattr(runner, "outcome", None) is None
-    )
-
-
-def _parse_inline_command(text: str) -> tuple[str, str] | None:
-    """Parse ``/name arg...`` into ``(name, arg)``; ``None`` if not a slash command.
-
-    Only the v0.0.28 inline-arg commands (``/queue`` / ``/redirect``) use this; every
-    other slash command stays argument-free and runs via the popover."""
-    if not text.startswith("/"):
-        return None
-    parts = text[1:].split(None, 1)
-    if not parts:
-        return None
-    return parts[0], (parts[1].strip() if len(parts) > 1 else "")
-
-
-def visible_commands(app) -> list[Command]:
-    """Commands available in the app's current state (``enabled`` honored)."""
-    return [c for c in COMMANDS if c.enabled is None or c.enabled(app)]
-
-
-def filter_commands(app, query: str) -> list[Command]:
-    """Visible commands whose name/title matches ``query`` (substring; empty = all)."""
-    q = (query or "").strip().lower()
-    out = []
-    for command in visible_commands(app):
-        if not q or q in command.name.lower() or q in command.title.lower():
-            out.append(command)
-    return out
-
-
-class PromptInput(Input):
-    """The main prompt input. When the slash popover is open it routes up/down/esc
-    to the popover (Enter is handled via ``Input.Submitted`` in the app)."""
-
-    def _on_paste(self, event) -> None:
-        """Capture a multi-line paste IN FULL.
-
-        Textual's ``Input._on_paste`` keeps only ``event.text.splitlines()[0]`` --
-        silently dropping every line after the first. That corrupts a pasted
-        multi-line goal/spec (Relay sees only line one). We insert the WHOLE pasted
-        text instead. A newline WITHIN a paste is content, never a submit: the paste
-        arrives as one ``Paste`` event (not a stream of Enter keypresses), so this
-        does not submit and does not touch the explicit Enter-to-submit path for
-        typed input.
-
-        ``prevent_default()`` is essential: Textual dispatches an event to EVERY
-        matching handler in the MRO, so without it the base ``Input._on_paste``
-        would still run after this one and re-append the truncated first line.
-        """
-        text = event.text
-        if text:
-            selection = self.selection
-            if selection.is_empty:
-                self.insert_text_at_cursor(text)
-            else:
-                self.replace(text, *selection)
-        event.prevent_default()  # suppress the base (first-line-only) paste handler
-        event.stop()
-
-    def on_key(self, event) -> None:
-        app = self.app
-        # While the slash popover is open, up/down move the highlight and esc closes it.
-        if getattr(app, "_popover_open", False):
-            if event.key == "down":
-                app._popover_move(1); event.prevent_default(); event.stop()
-            elif event.key == "up":
-                app._popover_move(-1); event.prevent_default(); event.stop()
-            elif event.key == "escape":
-                app._popover_close(); event.prevent_default(); event.stop()
-            return
-        # Otherwise up/down are the ONE unified recall-and-edit affordance: walk the
-        # input history (goals, steers, queued items) into the field for editing.
-        if event.key == "up":
-            recalled = app._recall_older()
-            if recalled is not None:
-                self.value = recalled
-                self.cursor_position = len(self.value)
-            event.prevent_default(); event.stop()
-        elif event.key == "down":
-            recalled = app._recall_newer()
-            if recalled is not None:
-                self.value = recalled
-                self.cursor_position = len(self.value)
-            event.prevent_default(); event.stop()
-
-
-class FilterInput(Input):
-    """A dialog's filter field: up/down move the dialog highlight (the screen owns
-    selection); typing filters via the screen's ``apply_filter``."""
-
-    def on_key(self, event) -> None:
-        screen = self.screen
-        if event.key == "down" and hasattr(screen, "move"):
-            screen.move(1); event.prevent_default(); event.stop()
-        elif event.key == "up" and hasattr(screen, "move"):
-            screen.move(-1); event.prevent_default(); event.stop()
-
-
-_DIALOG_CSS = """
-SelectDialog, TextEntryDialog, SegmentedControl { align: center middle; }
-#dialog-box {
-    width: 80%; max-width: 100; height: auto; max-height: 90%;
-    padding: 1 2; border: double $primary; background: $surface;
-}
-#dialog-title { text-style: bold; content-align: center middle; }
-#dialog-list { margin: 1 0; }
-#segment-row { margin: 1 0; content-align: center middle; }
-#dialog-hint, #entry-hint { color: $text-muted; text-style: dim; margin-top: 1; }
-#dialog-filter, #entry-input { margin-bottom: 1; }
-#entry-status { margin-top: 1; }
-"""
-
-
-class SelectDialog(ModalScreen):
-    """One generic filterable selection dialog -- the primitive every list command
-    (``/help``, ``/model``, ``/config``, ``/doctor``, ``/runs``, ``/assume``) opens.
-
-    ``options`` is a list of dicts: ``{title, value, description?, category?,
-    on_select?}``. Options are grouped by ``category`` when present; typing filters,
-    arrows move, Enter calls the highlighted option's ``on_select(value)``.
-    """
-
-    BINDINGS = [("escape", "close", "Close")]
-    CSS = _DIALOG_CSS
-
-    def __init__(self, *, title: str, options: list[dict]) -> None:
-        super().__init__()
-        self._title = title
-        self._options = list(options)
-        self._visible: list[dict] = list(self._options)
-        self._highlight = 0
-
-    def compose(self) -> ComposeResult:
-        with VerticalScroll(id="dialog-box"):
-            yield Static(self._title, id="dialog-title")
-            yield FilterInput(placeholder="type to filter...", id="dialog-filter")
-            yield Static(id="dialog-list")
-            yield Static("up/down move  ·  enter choose  ·  esc close", id="dialog-hint")
-
-    def on_mount(self) -> None:
-        self.apply_filter("")
-        self.query_one("#dialog-filter", Input).focus()
-
-    # -- testable core --------------------------------------------------------
-
-    def apply_filter(self, text: str) -> None:
-        q = (text or "").strip().lower()
-
-        def match(option: dict) -> bool:
-            hay = " ".join(
-                str(option.get(k, "")) for k in ("title", "value", "description", "category")
-            ).lower()
-            return not q or q in hay
-
-        self._visible = [o for o in self._options if match(o)]
-        self._highlight = 0
-        self._refresh_list()
-
-    def visible_values(self) -> list:
-        return [o.get("value") for o in self._visible]
-
-    def move(self, delta: int) -> None:
-        if not self._visible:
-            return
-        self._highlight = max(0, min(len(self._visible) - 1, self._highlight + delta))
-        self._refresh_list()
-
-    def select_highlighted(self) -> None:
-        if self._visible:
-            self.choose(self._visible[self._highlight].get("value"))
-
-    def choose(self, value) -> None:
-        """Dismiss and invoke the chosen option's ``on_select`` (if any)."""
-        chosen = next((o for o in self._visible if o.get("value") == value), None)
-        if chosen is None:
-            return
-        self.dismiss()
-        callback = chosen.get("on_select")
-        if callback is not None:
-            callback(value)
-
-    # -- rendering ------------------------------------------------------------
-
-    def _refresh_list(self) -> None:
-        # NOTE: do NOT name this ``_render`` -- that shadows Textual's
-        # ``Widget._render`` (which must return a Visual) and renders the screen None.
-        try:
-            widget = self.query_one("#dialog-list", Static)
-        except Exception:  # noqa: BLE001 -- not mounted (headless logic-only use)
-            return
-        widget.update(self._list_renderable())
-
-    def _list_renderable(self) -> Text:
-        text = Text()
-        if not self._visible:
-            text.append("(no matches)", style="dim")
-            return text
-        last_category = object()
-        for i, option in enumerate(self._visible):
-            category = option.get("category")
-            if category and category != last_category:
-                text.append(f"{category}\n", style="bold")
-                last_category = category
-            marker = "> " if i == self._highlight else "  "
-            style = "reverse" if i == self._highlight else ""
-            line = f"{marker}{option.get('title', option.get('value', ''))}"
-            text.append(line, style=style)
-            desc = option.get("description")
-            if desc:
-                text.append(f"  -  {desc}", style="dim")
-            text.append("\n")
-        return text
-
-    # -- widget wiring --------------------------------------------------------
-
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "dialog-filter":
-            event.stop()
-            self.apply_filter(event.value)
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "dialog-filter":
-            event.stop()
-            self.select_highlighted()
-
-    def action_close(self) -> None:
-        self.dismiss()
-
-
-class TextEntryDialog(ModalScreen):
-    """A single-field entry dialog -- masked (``password=True``) for a key, plain
-    for a manual model slug. ``on_submit(value) -> (ok, note)``; the dialog stays
-    open (showing the note) on failure, dismisses on success. The value is read
-    ONLY from this dialog's own field -- never from the chat prompt."""
-
-    BINDINGS = [("escape", "close", "Close")]
-    CSS = _DIALOG_CSS
-
-    def __init__(
-        self, *, title: str, label: str, on_submit, password: bool = False,
-        placeholder: str = "",
-    ) -> None:
-        super().__init__()
-        self._title = title
-        self._label = label
-        self._on_submit = on_submit
-        self._password = password
-        self._placeholder = placeholder
-        self.status_text = ""
-
-    def compose(self) -> ComposeResult:
-        with VerticalScroll(id="dialog-box"):
-            yield Static(self._title, id="dialog-title")
-            yield Label(self._label)
-            yield Input(password=self._password, placeholder=self._placeholder, id="entry-input")
-            yield Button("Save", id="entry-save", variant="primary")
-            yield Static("", id="entry-status")
-            yield Static("enter to save  ·  esc to cancel", id="entry-hint")
-
-    def on_mount(self) -> None:
-        self.query_one("#entry-input", Input).focus()
-
-    def submit(self) -> bool:
-        """Read THIS dialog's field and hand it to ``on_submit``. Returns saved?."""
-        value = self.query_one("#entry-input", Input).value
-        ok, note = self._on_submit(value)
-        if ok:
-            self.dismiss()
-            return True
-        self._set_status(f"[red]{note}[/red]")
-        return False
-
-    def _set_status(self, message: str) -> None:
-        self.status_text = message
-        try:
-            self.query_one("#entry-status", Static).update(message)
-        except Exception:  # noqa: BLE001 -- not mounted
-            pass
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "entry-save":
-            event.stop()
-            self.submit()
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "entry-input":
-            event.stop()
-            self.submit()
-
-    def action_close(self) -> None:
-        self.dismiss()
-
-
-class SegmentRow(Static):
-    """The focusable key-sink for a :class:`SegmentedControl` (no text field, so
-    the row itself takes focus and routes left/right/enter/escape to the screen)."""
-
-    can_focus = True
-
-    def on_key(self, event) -> None:
-        screen = self.screen
-        if not hasattr(screen, "move"):
-            return
-        if event.key in ("left", "h"):
-            screen.move(-1); event.prevent_default(); event.stop()
-        elif event.key in ("right", "l"):
-            screen.move(1); event.prevent_default(); event.stop()
-        elif event.key == "enter":
-            screen.select_highlighted(); event.prevent_default(); event.stop()
-        elif event.key == "escape":
-            screen.action_close(); event.prevent_default(); event.stop()
-
-
-class SegmentedControl(ModalScreen):
-    """A reusable horizontal choose-one toggle (the analog of :class:`SelectDialog`
-    for a small fixed set picked with LEFT/RIGHT, with wrap-around).
-
-    ``options`` is an ordered list of ``{label, value}``; LEFT/RIGHT move the
-    highlight (wrapping at both ends), Enter commits the highlighted option (calls
-    ``on_select(value)`` then dismisses), Esc cancels. It's a ModalScreen (same CSS
-    family / aesthetic as the other dialogs), so it never touches the prompt input
-    or the InputRouter. The testable core (``move`` / ``highlighted_value`` /
-    ``select_highlighted``) is kept separate from rendering -- mirroring SelectDialog.
-    """
-
-    BINDINGS = [
-        ("left", "move_left", "Prev"),
-        ("right", "move_right", "Next"),
-        ("escape", "close", "Cancel"),
-    ]
-    CSS = _DIALOG_CSS
-
-    def __init__(
-        self, *, title: str, options: list[dict], start_index: int = 0, on_select=None
-    ) -> None:
-        super().__init__()
-        self._title = title
-        self._options = list(options)
-        n = len(self._options)
-        self._index = (start_index % n) if n else 0
-        self._on_select = on_select
-
-    def compose(self) -> ComposeResult:
-        with VerticalScroll(id="dialog-box"):
-            yield Static(self._title, id="dialog-title")
-            yield SegmentRow(id="segment-row")
-            yield Static("left/right to choose  ·  enter to confirm  ·  esc to cancel",
-                         id="dialog-hint")
-
-    def on_mount(self) -> None:
-        self._refresh_segments()
-        self.query_one("#segment-row", SegmentRow).focus()
-
-    # -- testable core (no rendering) ----------------------------------------
-
-    def move(self, delta: int) -> None:
-        """Move the highlight by ``delta`` with WRAP-AROUND at both ends."""
-        n = len(self._options)
-        if n == 0:
-            return
-        self._index = (self._index + delta) % n
-        self._refresh_segments()
-
-    def highlighted_value(self):
-        """The currently highlighted option's value (``None`` if there are none)."""
-        if not self._options:
-            return None
-        return self._options[self._index].get("value")
-
-    def select_highlighted(self) -> None:
-        """Commit the highlighted option: dismiss, then call ``on_select(value)``."""
-        if not self._options:
-            self.dismiss()
-            return
-        value = self._options[self._index].get("value")
-        self.dismiss()
-        if self._on_select is not None:
-            self._on_select(value)
-
-    # -- rendering ------------------------------------------------------------
-
-    def _refresh_segments(self) -> None:
-        try:
-            self.query_one("#segment-row", SegmentRow).update(self._segments_text())
-        except Exception:  # noqa: BLE001 -- not mounted (logic-only use in tests)
-            pass
-
-    def _segments_text(self) -> Text:
-        text = Text()
-        if not self._options:
-            text.append("(no options)", style="dim")
-            return text
-        for i, option in enumerate(self._options):
-            if i:
-                text.append("  <  >  ", style="dim")  # the toggle's left/right hint
-            label = str(option.get("label", option.get("value", "")))
-            if i == self._index:
-                text.append(f"[ {label} ]", style="reverse bold")
-            else:
-                text.append(f"  {label}  ")
-        return text
-
-    # -- key actions (real-terminal bindings; tests drive the core directly) --
-
-    def action_move_left(self) -> None:
-        self.move(-1)
-
-    def action_move_right(self) -> None:
-        self.move(1)
-
-    def action_close(self) -> None:
-        self.dismiss()
-
-
-# The registry -- one list; adding a command is adding a record. run(app) opens a
-# dialog or does a clean action. Categories group the list in /help and the popover.
-COMMANDS: list[Command] = [
-    Command("help", "Help", "List all commands", "general",
-            run=lambda app: app._cmd_help()),
-    Command("model", "Model", "Pick the model for a role", "config",
-            run=lambda app: app._cmd_model()),
-    Command("provider", "Provider", "Set a role's provider, then its model", "config",
-            run=lambda app: app._cmd_provider()),
-    Command("key", "Key", "Add a provider API key (masked)", "config",
-            run=lambda app: app._cmd_key()),
-    Command("config", "Config", "Show the resolved config", "config",
-            run=lambda app: app._cmd_config()),
-    Command("doctor", "Doctor", "Preflight each role's provider/model", "ops",
-            run=lambda app: app._cmd_doctor()),
-    Command("runs", "Runs", "List recent runs", "ops",
-            run=lambda app: app._cmd_runs()),
-    Command("assume", "Assume", "Set the assumption level for this session", "ops",
-            run=lambda app: app._cmd_assume()),
-    Command("cwd", "Working dir", "Show / set the session working directory", "ops",
-            run=lambda app: app._cmd_cwd(), enabled=lambda app: not _run_active(app)),
-    Command("redirect", "Redirect", "Steer now: redirect the work (or /redirect <input>)", "ops",
-            run=lambda app: app._open_inline_dialog("redirect")),
-    Command("queue", "Queue", "Do this next: queue input (or /queue <input>)", "ops",
-            run=lambda app: app._open_inline_dialog("queue")),
-    Command("cost", "Cost", "Session + per-goal spend; toggle / reset the counter", "ops",
-            run=lambda app: app._cmd_cost()),
-    Command("log", "Log", "Export a debug log (.md) to share when reporting an issue", "ops",
-            run=lambda app: app._cmd_log()),
-    Command("clear", "Clear", "Clear the stream + start a fresh session", "ops",
-            run=lambda app: app._cmd_clear(), enabled=lambda app: not _run_active(app)),
-]
-
+# U0/U1 keep stream/status/controller methods on RelayTuiApp; extraction is deferred
+# to U2 to avoid risky mixin surgery during the package split.
 
 class RelayTuiApp(App):
     """A welcome screen that hands off to a single live stream chat over the engine."""
@@ -1144,7 +184,7 @@ class RelayTuiApp(App):
     TITLE = "Relay"
 
     CSS = """
-    Screen { layout: vertical; background: #06090e; }
+    Screen { layout: vertical; background: #050505; }
 
     /* -- the welcome state (shown first; hidden once work begins) -- */
     #welcome { height: 1fr; align: center middle; }
@@ -1153,23 +193,41 @@ class RelayTuiApp(App):
         height: auto;
         align: center middle;
         padding: 1 4;
-        border: double $primary;
+        border: double #ff0000;
+        background: #0a0a0a;
     }
-    #brand { width: auto; content-align: center middle; text-style: bold; }
-    #greeting { width: auto; content-align: center middle; text-style: bold; margin-top: 1; }
-    #indicator { width: auto; content-align: center middle; color: $text-muted; margin-top: 1; }
-    #hint { width: auto; content-align: center middle; color: $text-muted; text-style: dim; margin-top: 1; }
+    #brand { width: auto; content-align: center middle; text-style: bold; color: #ff0000; }
+    #greeting { width: auto; content-align: center middle; text-style: bold; margin-top: 1; color: #f0f0f0; }
+    #indicator { width: auto; content-align: center middle; color: #888888; margin-top: 1; }
+    #hint { width: auto; content-align: center middle; color: #555555; text-style: dim; margin-top: 1; }
 
-    /* -- the working state: ONE live scrolling stream (v0.0.30) -- */
+    /* -- cockpit: status rail + plan dock + stream (U2) -- */
     #working { height: 1fr; layout: vertical; display: none; }
+    #status {
+        height: auto;
+        min-height: 1;
+        max-height: 2;
+        padding: 0 1;
+        background: #0a0a0a;
+        border-bottom: solid #1a1a1a;
+    }
+    #cockpit-body { height: 1fr; layout: horizontal; }
+    #plan-dock {
+        width: 36;
+        min-width: 24;
+        max-width: 48;
+        padding: 0 1;
+        background: #0f0f0f;
+        border-right: solid #1a1a1a;
+    }
+    #plan-dock.-hidden { display: none; width: 0; min-width: 0; max-width: 0; padding: 0; border: none; }
     #stream {
         height: 1fr;
+        width: 1fr;
         padding: 0 1;
-        background: #06090e;
+        background: #050505;
     }
-    #stream .plan { margin: 1 0 1 0; padding: 0 0 0 2; }
     #stream .stream-row { width: 1fr; }
-    #status { height: 1; padding: 0 1; background: #080d14; }
 
     /* -- the slash-command popover (shown only while typing a /command) -- */
     #command-popover {
@@ -1178,8 +236,8 @@ class RelayTuiApp(App):
         max-height: 12;
         margin: 0 1;
         padding: 0 1;
-        border: round $primary;
-        background: $surface;
+        border: round #ff0000;
+        background: #0f0f0f;
     }
     """
 
@@ -1231,6 +289,7 @@ class RelayTuiApp(App):
         # Slash-command seams (injected by tests; default to the real CLI logic).
         self._doctor_fn = doctor_fn
         self._runs_fn = runs_fn
+        self._pending_model_pick: dict | None = None
         # The slash-command popover state (mirrored for headless tests).
         self._popover_open = False
         self._popover_commands: list[Command] = []
@@ -1241,7 +300,14 @@ class RelayTuiApp(App):
         # TODO(prompt-2): drive anim_mode from persisted settings + a launch
         # counter (a longer "first few launches" variant for "long"). Hardcoded
         # "short" for now; "off" is a clean instant no-op.
-        self._anim_mode = anim_mode
+        # Animation: non-default constructor arg wins; else RELAY_TUI_ANIM; else short.
+        import os as _os
+        if anim_mode != "short":
+            self._anim_mode = anim_mode
+        elif _os.environ.get("RELAY_TUI_ANIM") is not None:
+            self._anim_mode = resolve_anim_mode(None)
+        else:
+            self._anim_mode = "short"
         self._anim_timer = None
         self._router = InputRouter()
         self._runner: EngineRunner | None = None
@@ -1278,34 +344,81 @@ class RelayTuiApp(App):
         # active step + mode LED are the ONLY motion (activity-only, gated off in
         # "off" anim mode).
         self._plan_steps: list[dict] = []   # [{"instruction", "status"}], the live plan
-        self._plan_block = None             # the mounted plan widget (updated in place)
+        self._plan_block = None             # legacy alias; dock is #plan-dock (U2)
+        self._plan_mode = resolve_plan_mode(None)
+        self._plan_pinned_full = False      # user explicitly chose /plan full
+        self._cost_warn_level = "normal"    # escalates with envelope thresholds
+        self._model_router = None
+        self._session_approvals: set[str] = set()  # U4 session allowlist
+        self._tool_folds: dict[int, dict] = {}     # id -> {label, result, expanded}
+        self._tool_fold_seq = 0
+        self._route_pulse = False
+        self._find_query = ""
         # The rendered stream rows (Rich Text / str), in order -- the headless mirror
         # of what the single stream shows (so tests can pin speaker/finding styling
-        # without depending on Textual widget internals). The live plan block updates
-        # in place and is NOT in here (its state is _plan_steps).
+        # without depending on Textual widget internals). The live plan lives in the
+        # plan dock (U2), not in the stream mirror.
         self._stream_rendered: list = []
+        self._stream_plain: list[str] = []  # plain text for /find (U6)
         self._spin_frame = 0                # active-step spinner frame
         self._spin_timer = None             # active while a step is executing
         self._led_on = True                 # the mode LED's breathing phase
         self._led_timer = None
+        self._load_tui_prefs()
 
     # -- layout ---------------------------------------------------------------
+
+    def _load_tui_prefs(self) -> None:
+        """Apply durable ``tui.*`` prefs from config.json (U6)."""
+        try:
+            from relay.store import load_config
+
+            cfg = load_config() or {}
+            tui = cfg.get("tui") or {}
+            anim = tui.get("animations")
+            if anim is False or str(anim).lower() in ("0", "false", "off"):
+                self._anim_mode = "off"
+            plan = tui.get("plan_dock")
+            if isinstance(plan, str) and plan.strip().lower() in PLAN_MODES:
+                self._plan_mode = plan.strip().lower()
+                self._plan_pinned_full = self._plan_mode == "full"
+        except Exception:  # noqa: BLE001 -- prefs must never block launch
+            pass
+
+    def _save_tui_prefs(self) -> None:
+        """Persist animations + plan dock mode into config.json."""
+        try:
+            from relay.config import default_config
+            from relay.store import CONFIG_VERSION, load_config, save_config
+
+            config = load_config() or default_config()
+            config.setdefault("version", CONFIG_VERSION)
+            tui = config.setdefault("tui", {})
+            tui["animations"] = self._anim_mode != "off"
+            tui["plan_dock"] = self._plan_mode
+            save_config(config)
+        except Exception as exc:  # noqa: BLE001
+            self._write_activity(f"(could not save tui prefs: {exc.__class__.__name__})", dim=True)
 
     def compose(self) -> ComposeResult:
         with Container(id="welcome"):
             with Vertical(id="welcome-inner"):
-                yield Static(RELAY_WORDMARK, id="brand")
+                yield Static(self._welcome_brand(), id="brand")
                 yield Static(self._greeting, id="greeting")
                 yield Static(self._indicator_text, id="indicator")
                 yield Static("esc to cancel  ·  ctrl+q to quit", id="hint")
         with Container(id="working"):
-            # ONE live scrolling stream: conversation, the inline live plan, tool
-            # calls, findings, and verdicts all interleaved in the order they happen
-            # (the v0.0.30 replacement for the old Conversation/Activity two-pane).
-            yield VerticalScroll(id="stream")
+            # IDE cockpit (U2): status rail on top, plan dock + stream below.
             yield Static(id="status")
+            with Horizontal(id="cockpit-body"):
+                yield Static(id="plan-dock", classes="plan-dock")
+                yield VerticalScroll(id="stream")
         yield Static(id="command-popover")
         yield PromptInput(id="prompt", placeholder=self._placeholder)
+
+    def _welcome_brand(self) -> str:
+        """Welcome hero wordmark; SVG mark is packaged under relay/assets/ (U6)."""
+        return RELAY_WORDMARK
 
     def on_mount(self) -> None:
         # The model indicator is visible from launch, BEFORE the first message
@@ -1449,16 +562,18 @@ class RelayTuiApp(App):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "prompt":
             return  # a dialog's own field; its screen handles submit
-        # Inline-arg commands (/queue <input>, /redirect <input>) take precedence over
-        # the popover -- they carry an argument the popover can't. They also work mid-run
-        # (the popover is suppressed while executing, but Enter still routes here).
+        # Unified slash dispatch: any Command with accepts_args + a non-empty arg
+        # runs immediately (same path for /queue, /redirect, /model, /cwd, …).
         inline = _parse_inline_command(event.value)
-        if inline is not None and inline[0] in ("queue", "redirect") and inline[1]:
-            event.input.value = ""
-            self._popover_close()
-            (self._do_queue if inline[0] == "queue" else self._do_redirect)(inline[1])
-            self._update_status()
-            return
+        if inline is not None:
+            name, arg = inline
+            command = command_by_name(name)
+            if command is not None and command.accepts_args and arg:
+                event.input.value = ""
+                self._popover_close()
+                command.run(self, arg)
+                self._update_status()
+                return
         # Enter while the popover is open runs the highlighted command, never a goal.
         if self._popover_open:
             event.input.value = ""
@@ -1482,7 +597,7 @@ class RelayTuiApp(App):
             # Answers that become transcript turns render via the sync pass;
             # approval answers never reach the transcript, so echo them here.
             if outcome.kind == REQUEST_APPROVAL:
-                self._write_conversation(f"you (approval): {text}")
+                self._write_conversation(f"you (approval): {text}", speaker="user")
         elif text.strip():
             self._write_activity("(input ignored: the engine is busy)")
         self._update_status()
@@ -1635,34 +750,90 @@ class RelayTuiApp(App):
     # -- worker -> UI marshaling (the only crossing) ----------------------------
 
     def _marshal(self, handler):
-        """Wrap a UI handler so bridge callbacks (worker thread) reach it safely."""
+        """Wrap a UI handler so bridge callbacks (worker thread) reach it safely.
+
+        Exceptions are logged and surfaced in the activity feed -- never silently
+        dropped (a silent ``on_finished`` loss used to strand the UI).
+        """
 
         def callback(*args) -> None:
             if self._quitting:
                 return  # shutting down: drop UI updates, let the worker unwind
             try:
                 self.call_from_thread(handler, *args)
-            except Exception:  # noqa: BLE001 -- app torn down mid-callback; drop it
-                pass
+            except Exception as exc:  # noqa: BLE001 -- app torn down OR handler bug
+                _LOG.exception("marshal %s failed: %s", getattr(handler, "__name__", handler), exc)
+                try:
+                    self.call_from_thread(self._note_marshal_error, handler, exc)
+                except Exception:  # noqa: BLE001 -- fully torn down; nothing left to tell
+                    pass
 
         return callback
 
+    def _note_marshal_error(self, handler, exc: BaseException) -> None:
+        name = getattr(handler, "__name__", type(handler).__name__)
+        self._write_activity(
+            f"(ui marshal error in {name}: {exc.__class__.__name__})",
+            dim=True,
+        )
+
     def _handle_request(self, request: UiRequest) -> None:
-        """A blocking ask arrived: show it, point the input box at it."""
+        """A blocking ask arrived: show it, point the input box at it.
+
+        Approvals open a dedicated modal (U4) instead of y/n in the goal box.
+        """
         self._router.on_request(request)
         self._sync_transcript()
-        # A REACTION ask is the proposal: its full numbered plan is NOT dumped into
-        # the conversation -- the stream keeps the human story (the headline turn +
-        # the surfaced assumptions, from the plan_proposed event via
-        # _render_plan_split_buffer) while the numbered steps render as the inline
-        # live PLAN block. Other asks (decision/approval) still surface their prompt
-        # when it adds detail beyond the last transcript turn (e.g. the approval command).
+        if request.kind == REQUEST_APPROVAL:
+            self._open_approve_modal(request)
+            self._update_status()
+            return
         if request.kind != REQUEST_REACTION:
             last_turn_text = self._last_synced_turn_text()
             if request.prompt.strip() != (last_turn_text or "").strip():
                 for line in present_prompt(request.prompt).splitlines():
-                    self._write_conversation(f"brain: {line}" if line.strip() else "")
+                    self._write_conversation(
+                        f"brain: {line}" if line.strip() else "",
+                        speaker="brain" if line.strip() else None,
+                    )
         self._update_status()
+
+    def _open_approve_modal(self, request: UiRequest) -> None:
+        """Parse command/reason from the approval prompt and open ApproveDialog."""
+        prompt = request.prompt or ""
+        command = ""
+        reason = ""
+        for line in prompt.splitlines():
+            s = line.strip()
+            if s.startswith("Why gated:"):
+                reason = s[len("Why gated:"):].strip()
+            elif s and not s.startswith("The executor") and not s.startswith("Approve?"):
+                if not command and not s.startswith("Why"):
+                    command = s
+        # Session allowlist short-circuit.
+        if command and command in self._session_approvals:
+            request.deliver("yes")
+            self._write_activity(f"[approve] session-allow · {command[:80]}", dim=True)
+            return
+
+        def on_decision(action: str, req=request, cmd=command) -> None:
+            if action == "deny":
+                req.deliver("no")
+                self._write_conversation("you (approval): no", speaker="user")
+            else:
+                if action == "session" and cmd:
+                    self._session_approvals.add(cmd)
+                req.deliver("yes")
+                self._write_conversation(
+                    f"you (approval): yes ({action})", speaker="user",
+                )
+            self._update_status()
+
+        self.push_screen(ApproveDialog(
+            command=command or prompt[:200],
+            reason=reason or "CONFIRM",
+            on_decision=on_decision,
+        ))
 
     def _handle_event(self, event: Event) -> None:
         """One engine event: phase changes steer the router; everything else renders
@@ -1673,12 +844,42 @@ class RelayTuiApp(App):
         the render path makes no model call (proven by the zero-new-tokens guard).
         """
         if event.kind == EVENT_PHASE:
-            # Internal routing only -- not surfaced as a stream line.
             self._router.set_phase(event.payload.get("phase", ""))
+            self._pulse_route_if_anim()  # phase change = instrument tick when anim on
+        elif event.kind == "route_change":
+            self._on_route_change(event)
         else:
             self._render_event(event)
         self._sync_transcript()
-        self._refresh_cost()  # live per-goal cost off the run's ledger (no model call)
+        self._refresh_cost()
+        self._update_status()
+
+    def _on_route_change(self, event: Event) -> None:
+        """U5: brief route chip pulse + activity note (zero tokens)."""
+        payload = event.payload or {}
+        name = payload.get("route") or payload.get("name") or "?"
+        self._write_activity(f"[route] → {name}", dim=True)
+        router = self._ensure_model_router()
+        if router is not None and payload.get("route"):
+            try:
+                from relay.router import get_route, builtin_contract
+                # Best-effort: refresh contract name display via router if API allows.
+                _ = get_route(str(payload.get("route")))
+            except Exception:  # noqa: BLE001
+                pass
+        self._pulse_route_if_anim()
+
+    def _pulse_route_if_anim(self) -> None:
+        if self._anim_mode == "off":
+            return
+        self._route_pulse = True
+        try:
+            self.set_timer(0.35, self._end_route_pulse)
+        except Exception:  # noqa: BLE001
+            self._route_pulse = False
+
+    def _end_route_pulse(self) -> None:
+        self._route_pulse = False
         self._update_status()
 
     # Event kinds that get a BESPOKE inline form in the stream (the live plan, tool
@@ -1743,7 +944,7 @@ class RelayTuiApp(App):
         assumptions = payload.get("assumptions")
         if isinstance(assumptions, list) and assumptions:
             for assumption in assumptions:
-                self._write_conversation(f"brain (assumes): {assumption}")
+                self._write_conversation(f"brain (assumes): {assumption}", speaker="brain")
 
     def _handle_finished(self, outcome: RunOutcome) -> None:
         self._sync_transcript()  # the result turn is in the transcript by now
@@ -1860,27 +1061,40 @@ class RelayTuiApp(App):
     def _sync_transcript(self) -> None:
         """Append transcript turns not yet rendered (id-deduplicated, in order).
 
-        The transcript is append-only and its turns are frozen, so snapshotting
-        the list from the UI thread while the worker appends is safe; ids (not
-        indices) dedupe so compaction or re-sync can never double-render.
+        Primary delivery is event/request/finished marshals; the slow interval is
+        only a safety net. Reads go through :meth:`Transcript.snapshot_turns` so
+        the UI thread never walks a list the worker is appending to.
         """
         runner = self._runner
         if runner is None:
             return
-        for turn in list(runner.transcript.turns):
+        transcript = runner.transcript
+        if hasattr(transcript, "snapshot_turns"):
+            snapshot = transcript.snapshot_turns()
+        else:
+            snapshot = list(getattr(transcript, "turns", []) or [])
+        for turn in snapshot:
             if turn.id in self._seen_turn_ids:
                 continue
             self._seen_turn_ids.add(turn.id)
             text = format_turn(turn)
             if turn.speaker != "user":
                 text = present_prompt(text)
-            self._write_conversation(text)
+            speaker = "user" if turn.speaker == "user" else "brain"
+            self._write_conversation(text, speaker=speaker)
 
     def _last_synced_turn_text(self) -> str | None:
         runner = self._runner
-        if runner is None or not runner.transcript.turns:
+        if runner is None:
             return None
-        return runner.transcript.turns[-1].text
+        transcript = runner.transcript
+        if hasattr(transcript, "snapshot_turns"):
+            turns = transcript.snapshot_turns()
+        else:
+            turns = list(getattr(transcript, "turns", []) or [])
+        if not turns:
+            return None
+        return turns[-1].text
 
     # -- widget writes (the render path; buffers mirror the widgets for tests) --
 
@@ -1898,47 +1112,69 @@ class RelayTuiApp(App):
             return None
 
     def _mount_stream(self, widget) -> None:
-        """Mount one row/widget into the stream and keep it pinned to the live edge."""
+        """Mount one row/widget into the stream; follow the live edge only if pinned."""
         stream = self._stream()
         if stream is None:
             return
         try:
+            follow = stream_should_follow(stream)
             stream.mount(widget)
-            stream.scroll_end(animate=False)
+            trim_stream_children(stream, keep=self._plan_block, max_lines=STREAM_MAX_LINES)
+            if follow:
+                stream.scroll_end(animate=False)
         except Exception:  # noqa: BLE001 -- teardown race; the buffer already has it
             pass
 
-    def _push_row(self, renderable, *, classes: str = "stream-row") -> None:
+    def _push_row(self, renderable, *, classes: str = "stream-row", plain: str | None = None) -> None:
         """Record a stream row (the headless mirror) and mount it into the stream."""
         self._stream_rendered.append(renderable)
+        trim_deque_list(self._stream_rendered, STREAM_MAX_LINES)
+        plain_text = plain
+        if plain_text is None:
+            plain_text = renderable.plain if hasattr(renderable, "plain") else str(renderable)
+        self._stream_plain.append(plain_text)
+        trim_deque_list(self._stream_plain, STREAM_MAX_LINES)
         self._mount_stream(Static(renderable, classes=classes))
 
     def _row(self, gutter: str, body: str, *, gutter_style: str = "", body_style: str = "") -> None:
         """Build + push one labeled stream row (the mockup's gutter + body line)."""
+        body_renderable = render_conversation_body(body) if gutter == "brain" else body
+        if not isinstance(body_renderable, str):
+            # Markdown / structured: gutter as a prefix line, then the body widget.
+            head = Text()
+            head.append(f"{gutter:<6}" if gutter else " " * 6, style=gutter_style or C_DIM)
+            self._push_row(head, plain=f"{gutter} {body}")
+            self._push_row(body_renderable, plain=body)
+            return
         text = Text()
         text.append(f"{gutter:<6}" if gutter else " " * 6, style=gutter_style or C_DIM)
-        text.append(body, style=body_style or C_TXT)
-        self._push_row(text)
+        text.append(body_renderable, style=body_style or C_TXT)
+        self._push_row(text, plain=f"{gutter} {body}".strip())
 
     def _record_activity(self, actor: str | None, line: str) -> None:
         """Append to the activity BUFFER only (the test/debug record) -- no stream row.
         Used for the bespoke-form events + the dim detail lines, so the stream shows
         their inline form (or nothing) rather than a duplicate generic row."""
         self._activity_lines.append(f"{actor} | {line}" if actor else line)
+        trim_deque_list(self._activity_lines, STREAM_BUFFER_MAX)
 
-    def _write_conversation(self, line: str) -> None:
-        """Record a conversation line (buffer) and render it as a stream row, colored
-        by speaker (you = bright magenta, brain = magenta, system = muted)."""
+    def _write_conversation(self, line: str, *, speaker: str | None = None) -> None:
+        """Record a conversation line (buffer) and render it as a stream row.
+
+        Prefer a structured ``speaker`` (``user`` / ``brain`` / other) over
+        re-parsing the rendered line. Legacy callers may omit it.
+        """
         self._conversation_lines.append(line)
+        trim_deque_list(self._conversation_lines, STREAM_BUFFER_MAX)
         if not line.strip():
             self._push_row("")  # a blank spacer between runs
             return
-        head = line.split(None, 1)[0]
-        rest = line.split(None, 1)[1] if " " in line else ""
-        if head == "you":
-            self._row("you", rest, gutter_style=f"bold {C_MAGENTA}", body_style=C_TXT)
-        elif head == "brain":
-            self._row("brain", rest, gutter_style=C_MAGENTA, body_style=C_TXT)
+        if speaker == "user" or (speaker is None and line.startswith("you")):
+            rest = line.split(None, 1)[1] if " " in line else ""
+            self._row("you", rest, gutter_style=f"bold {W_TEXT}", body_style=C_TXT)
+        elif speaker == "brain" or (speaker is None and line.startswith("brain")):
+            rest = line.split(None, 1)[1] if " " in line else ""
+            self._row("brain", rest, gutter_style=W_RED, body_style=C_TXT)
         else:
             self._row("", line, body_style=C_MUTED)  # system / result / notice lines
 
@@ -1958,13 +1194,33 @@ class RelayTuiApp(App):
     # -- the inline forms: tool calls, findings, verdicts (hands acting) --------
 
     def _stream_tool(self, label: str, result: str = "") -> None:
-        """A compact tool-call stream line: ``▸ read cli.py · 78 lines``."""
-        text = Text()
-        text.append("  ▸ ", style=C_CYAN)
-        text.append(label, style=C_MUTED)
-        if result:
-            text.append(f"  · {result[:60]}", style=C_DIM)
-        self._push_row(text)
+        """A compact tool-call stream line; long bodies fold by default (U3)."""
+        fold_id = self._tool_fold_seq
+        self._tool_fold_seq += 1
+        expanded = False
+        self._tool_folds[fold_id] = {
+            "label": label, "result": result, "expanded": expanded,
+        }
+        text = tool_summary_line(label, result, folded=bool(result) and len(result) > 60)
+        obs = render_observation(result, expanded=False) if result else None
+        self._push_row(text, plain=f"{label} {result}", classes=f"stream-row tool-{fold_id}")
+        if obs is not None and not isinstance(obs, str):
+            # Diff-shaped: show a folded syntax preview beneath the summary.
+            self._push_row(obs, plain=result[:200], classes=f"stream-row tool-body-{fold_id}")
+
+    def _toggle_tool_fold(self, fold_id: int) -> None:
+        """Expand/collapse a folded tool observation (click or /expand)."""
+        meta = self._tool_folds.get(fold_id)
+        if not meta:
+            return
+        meta["expanded"] = not meta["expanded"]
+        self._write_activity(
+            f"[tool] {'expanded' if meta['expanded'] else 'folded'} · {meta['label']}",
+            dim=True,
+        )
+        if meta["expanded"] and meta.get("result"):
+            body = render_observation(meta["result"], expanded=True)
+            self._push_row(body, plain=meta["result"])
 
     def _stream_finding(self, note: str) -> None:
         """A finding (v0.0.29 hands->brain channel) renders as a distinct GREEN line."""
@@ -1975,7 +1231,8 @@ class RelayTuiApp(App):
 
     def _stream_verdict(self, index, verdict: str) -> None:
         """A compact review verdict line: ``review ✓ accept · step 04``."""
-        accepted = "accept" in (verdict or "").lower()
+        # Classify from the payload field (exact match), not substring search.
+        accepted = (verdict or "").strip().lower() == "accept"
         text = Text()
         text.append("  review ", style=C_DIM)
         text.append(f"{'✓' if accepted else '•'} {verdict}", style=C_GREEN if accepted else C_AMBER)
@@ -1988,18 +1245,20 @@ class RelayTuiApp(App):
     # -- the inline LIVE plan: ONE block, updated IN PLACE -----------------------
 
     def _plan_set(self, steps: list[str], *, revised: bool = False) -> None:
-        """(Re)build the live plan from an emitted step list and mount/refresh its
-        block. The initial plan starts every step pending; a revision keeps already-
-        settled steps and replaces the pending tail with the new pending steps."""
+        """(Re)build the live plan and refresh the plan dock (U2 source of truth).
+
+        A compact ``plan committed`` line goes to the stream; the dock holds the
+        interactive step list with active highlight.
+        """
         if revised and self._plan_steps:
             kept = [s for s in self._plan_steps if s["status"] != "pending"]
             self._plan_steps = kept + [{"instruction": s, "status": "pending"} for s in steps]
         else:
             self._plan_steps = [{"instruction": s, "status": "pending"} for s in steps]
-            self._plan_block = None  # a fresh plan -> a fresh block (prior plan stays in scroll-back)
-        if self._plan_block is None:
-            self._plan_block = Static(classes="plan")
-            self._mount_stream(self._plan_block)
+            self._write_activity(
+                f"plan committed · {len(steps)} step{'s' if len(steps) != 1 else ''}",
+                dim=True,
+            )
         self._plan_render()
 
     def _plan_mark(self, index, status: str) -> None:
@@ -2014,31 +1273,133 @@ class RelayTuiApp(App):
             self._start_spin()
         self._plan_render()
 
-    def _plan_render(self) -> None:
-        """Render the live plan block from its step states: ◉ done (dim) / ◍ active
-        (spinner, bright) / ○ pending (dimmer). Updates the SAME widget in place."""
-        block = self._plan_block
-        if block is None:
-            return
-        total = len(self._plan_steps)
-        text = Text()
-        text.append(f"plan · {total} step{'s' if total != 1 else ''}", style=C_DIM)
-        for i, step in enumerate(self._plan_steps):
-            status = step["status"]
-            icon = (_SPINNER_FRAMES[self._spin_frame % len(_SPINNER_FRAMES)]
-                    if status == "active" else _PLAN_ICON.get(status, "○"))
-            icon_style = {"done": C_GREEN, "active": C_CYAN, "failed": C_RED}.get(status, C_DIM)
-            body_style = {"active": f"bold {C_TXT}", "done": C_MUTED}.get(status, C_DIM)
-            text.append("\n")
-            text.append(f"{icon} ", style=icon_style)
-            text.append(f"{i + 1:02d} ", style=C_DIM)
-            text.append(step["instruction"], style=body_style)
+    def _plan_dock(self):
         try:
-            block.update(text)
-        except Exception:  # noqa: BLE001 -- teardown race
+            return self.query_one("#plan-dock", Static)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _effective_plan_mode(self) -> str:
+        width = None
+        try:
+            width = self.size.width
+        except Exception:  # noqa: BLE001
+            width = None
+        return resolve_plan_mode(
+            self._plan_mode, width=width, pinned_full=self._plan_pinned_full,
+        )
+
+    def _refresh_plan_dock_visibility(self) -> None:
+        dock = self._plan_dock()
+        if dock is None:
+            return
+        mode = self._effective_plan_mode()
+        try:
+            if mode == "hidden":
+                dock.add_class("-hidden")
+            else:
+                dock.remove_class("-hidden")
+        except Exception:  # noqa: BLE001
             pass
+
+    def _plan_render(self) -> None:
+        """Render the plan dock from step states (full / active / hidden)."""
+        dock = self._plan_dock()
+        mode = self._effective_plan_mode()
+        self._refresh_plan_dock_visibility()
+        rendered = render_plan_dock(
+            self._plan_steps, mode=mode, spin_frame=self._spin_frame,
+        )
+        self._plan_block = dock
+        if dock is not None:
+            try:
+                dock.update(rendered)
+            except Exception:  # noqa: BLE001
+                pass
         if not any(s["status"] == "active" for s in self._plan_steps):
             self._stop_spin()
+
+    def _set_plan_mode(self, mode: str) -> None:
+        mode = (mode or "").strip().lower()
+        if mode not in PLAN_MODES:
+            self._write_activity(f"/plan: use full|active|hidden (got '{mode}')")
+            return
+        self._plan_mode = mode
+        self._plan_pinned_full = mode == "full"
+        self._plan_render()
+        self._update_status()
+        self._write_activity(f"[plan] dock mode = {mode}")
+        self._save_tui_prefs()
+
+    def _cmd_plan(self, arg: str = "") -> None:
+        """Set plan dock mode: ``/plan full|active|hidden``."""
+        mode = (arg or "").strip().lower()
+        if not mode:
+            self._write_activity(
+                f"[plan] mode={self._effective_plan_mode()} "
+                f"(session={self._plan_mode}; /plan full|active|hidden)"
+            )
+            return
+        self._set_plan_mode(mode)
+
+    def _cmd_anim(self, arg: str = "") -> None:
+        """Session animation kill switch: ``/anim off|on`` (U5 surface)."""
+        raw = (arg or "").strip().lower()
+        if raw in ("off", "0", "false"):
+            self._anim_mode = "off"
+            self._stop_spin()
+            if self._led_timer is not None:
+                try:
+                    self._led_timer.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._led_timer = None
+            self._write_activity("[anim] off — instant updates only")
+            self._save_tui_prefs()
+        elif raw in ("on", "1", "true", "short"):
+            self._anim_mode = "short"
+            if self._led_timer is None:
+                try:
+                    self._led_timer = self.set_interval(_LED_INTERVAL_S, self._led_tick)
+                except Exception:  # noqa: BLE001
+                    self._led_timer = None
+            self._write_activity("[anim] on")
+            self._save_tui_prefs()
+        else:
+            self._write_activity(f"[anim] mode={self._anim_mode} — /anim on|off")
+        self._update_status()
+
+    def _cmd_find(self, arg: str = "") -> None:
+        """Search stream scrollback for ``query`` (U6)."""
+        query = (arg or "").strip()
+        if not query:
+            self._write_activity("[find] usage: /find <text>")
+            return
+        self._find_query = query
+        hits = find_in_lines(self._stream_plain, query)
+        if not hits:
+            # Also search conversation/activity buffers ( /log sources ).
+            hits_buf = find_in_lines(self._conversation_lines + self._activity_lines, query)
+            if not hits_buf:
+                self._write_activity(f"[find] no matches for '{query}'")
+                return
+            self._write_activity(
+                f"[find] {len(hits_buf)} match(es) in buffers · "
+                f"first: { (self._conversation_lines + self._activity_lines)[hits_buf[0]][:80] }"
+            )
+            return
+        first = hits[0]
+        self._write_activity(
+            f"[find] {len(hits)} match(es) · first#{first}: {self._stream_plain[first][:80]}"
+        )
+        stream = self._stream()
+        if stream is not None:
+            try:
+                children = list(stream.children)
+                if 0 <= first < len(children):
+                    stream.scroll_to_widget(children[first], animate=self._anim_mode != "off")
+            except Exception:  # noqa: BLE001
+                pass
 
     def _reset_plan(self) -> None:
         """Drop the live-plan state (a new goal starts a fresh plan; prior plans stay
@@ -2046,6 +1407,7 @@ class RelayTuiApp(App):
         self._plan_steps = []
         self._plan_block = None
         self._stop_spin()
+        self._plan_render()
 
     def _settle_plan(self) -> None:
         """The run ended: stop the active-step spinner and demote any still-active step
@@ -2096,87 +1458,110 @@ class RelayTuiApp(App):
         self._update_status()
 
     def _mode_word(self, state) -> str:
-        """The status-line MODE word: WORKING while the engine generates, INTERRUPTED
-        at the interrupt prompt, AWAITING YOU when it is the user's turn (idle or an
-        awaiting-reaction/decision/approval ask)."""
-        if state is InputState.INTERRUPTED:
-            return "INTERRUPTED"
-        if state in (InputState.PLANNING, InputState.EXECUTING):
-            return "WORKING"
-        return "AWAITING YOU"
+        return mode_word(state)
 
     def _step_segment(self) -> str:
-        """``step N/M`` from the live plan (active step, else settled count); '' if no plan."""
-        total = len(self._plan_steps)
-        if not total:
-            return ""
-        active = next((i for i, s in enumerate(self._plan_steps) if s["status"] == "active"), None)
-        if active is not None:
-            n = active + 1
-        else:
-            n = sum(1 for s in self._plan_steps if s["status"] in ("done", "failed"))
-        return f"step {n}/{total}"
+        return step_segment(self._plan_steps)
 
-    def _update_status(self) -> None:
-        """The status line: a breathing mode LED + WORKING/AWAITING YOU · step N/M ·
-        cost (amber) · cwd (cyan) · the model pairing (dim) · queue (magenta), with a
-        right hint. The plain ``_status_text`` mirror carries the same facts (what the
-        headless tests assert on); the widget gets the styled render."""
+    def _ensure_model_router(self):
+        """Lazy ModelRouter for the status rail ``route=`` chip."""
+        if self._model_router is not None:
+            return self._model_router
+        try:
+            from relay.router import ModelRouter
+
+            self._model_router = ModelRouter.from_resolve(
+                None, root=self._session.working_dir,
+            )
+        except Exception:  # noqa: BLE001 -- rail must never crash
+            self._model_router = None
+        return self._model_router
+
+    def _status_snapshot(self) -> StatusSnapshot:
+        """Build the cockpit status facts (mirror + widget share this)."""
         state = self._router.state
-        mode = self._mode_word(state)
-        step = self._step_segment()
-        cost = self._cost_segment()
+        mode = mode_word(state)
+        step = step_segment(self._plan_steps)
+        instr = active_instruction(self._plan_steps)
+        if step and instr:
+            step = f"{step} · {instr}"
+        runner = self._runner
+        envelope = getattr(runner, "envelope", None) if runner is not None else None
+        ledger = getattr(runner, "ledger", None) if runner is not None else None
+        cost, cost_level = cost_segment(
+            goal_cost=self._goal_cost,
+            visible=self._cost_visible,
+            run_in_flight=self._run_in_flight(),
+            stopping=self._stopping,
+            envelope=envelope,
+            ledger=ledger,
+        )
+        if self._cost_pulse:
+            cost_level = "pulse"
+        if self._cost_warn_level in ("warn", "critical") and cost_level == "normal":
+            cost_level = self._cost_warn_level
+        route = route_segment(self._ensure_model_router())
+        ctx = context_segment(self._models, self._catalog)
         cwd = self._cwd_segment()
         queued = f"queued: {len(self._session.queue)}" if self._session.queue else ""
+        models = f"brain {self._models.brain} · hands {self._models.hands}"
+        hint = (
+            "esc interrupt · /queue"
+            if self._run_in_flight()
+            else "enter send · ↑ recall · /queue"
+        )
+        return StatusSnapshot(
+            mode=mode, step=step, cost=cost, cost_level=cost_level,
+            route=route, context=ctx, cwd=cwd, models=models, queued=queued, hint=hint,
+        )
 
-        segs = [mode]
-        for seg in (step, cost, cwd):
-            if seg:
-                segs.append(seg)
-        segs.append(f"brain {self._models.brain}")
-        segs.append(f"hands {self._models.hands}")
-        if queued:
-            segs.append(queued)
-        self._status_text = "  ·  ".join(segs)
-
-        working = mode == "WORKING"
-        led_color = C_GREEN if working else C_MAGENTA
+    def _update_status(self) -> None:
+        """Status rail: LED · phase · step · cost · route · ctx · models · queue."""
+        snap = self._status_snapshot()
+        self._status_text = snap.plain()
+        working = snap.mode == "WORKING"
+        led_color = C_GREEN if working else W_RED
         text = Text()
-        text.append("● " if self._led_on else "○ ", style=led_color)  # the breathing LED
-        text.append(mode, style=f"bold {led_color}")
-        if step:
+        text.append("● " if self._led_on else "○ ", style=led_color)
+        text.append(snap.mode, style=f"bold {led_color}")
+        for seg, style in (
+            (snap.step, W_TEXT),
+            (snap.cost, self._cost_style(snap.cost_level)),
+            (snap.route, f"bold {W_RED}" if self._route_pulse else C_DIM),
+            (snap.context, C_DIM),
+            (snap.cwd, W_TEXT_DIM),
+            (snap.models, C_DIM),
+            (snap.queued, W_RED),
+        ):
+            if not seg:
+                continue
             text.append("  ·  ", style=C_DIM)
-            text.append(step, style=C_CYAN)
-        if cost:
-            text.append("  ·  ", style=C_DIM)
-            text.append(cost, style=("bold " + C_AMBER) if self._cost_pulse else C_AMBER)
-        if cwd:
-            text.append("  ·  ", style=C_DIM)
-            text.append(cwd, style=C_CYAN)
-        text.append("  ·  ", style=C_DIM)
-        text.append(f"brain {self._models.brain} · hands {self._models.hands}", style=C_DIM)
-        if queued:
-            text.append("  ·  ", style=C_DIM)
-            text.append(queued, style=C_MAGENTA)
-        hint = "esc interrupt · /queue" if self._run_in_flight() else "enter send · ↑ recall · /queue"
+            text.append(seg, style=style)
         text.append("    ", style=C_DIM)
-        text.append(hint, style=C_DIM)
+        text.append(snap.hint, style=C_DIM)
         try:
             self.query_one("#status", Static).update(text)
         except Exception:  # noqa: BLE001 -- not mounted / teardown race
             pass
-        # The input box's placeholder tracks what a submit now means (Fix 1).
         try:
             self.query_one("#prompt", Input).placeholder = placeholder_for_state(
-                state, self._placeholder
+                self._router.state, self._placeholder
             )
         except Exception:  # noqa: BLE001 -- not mounted
             pass
+        self._refresh_plan_dock_visibility()
+
+    def _cost_style(self, level: str) -> str:
+        if level == "pulse":
+            return f"bold {W_WARN}"
+        if level == "critical":
+            return f"bold {W_RED}"
+        if level == "warn":
+            return f"bold {W_WARN}"
+        return W_WARN
 
     def _cwd_segment(self) -> str:
-        """The status-line working-dir segment, shown when the sticky working dir
-        has moved off the launch root (so the user can SEE where Relay will work).
-        At the launch root the default is obvious, so nothing extra is shown."""
+        """The status-line working-dir segment, shown when off the launch root."""
         session = self._session
         if session.is_launch_root():
             return ""
@@ -2209,14 +1594,16 @@ class RelayTuiApp(App):
         return self._router.state is not InputState.IDLE
 
     def _cost_segment(self) -> str:
-        """The status-line cost text (``""`` when hidden via the toggle). Shows the
-        current goal's cost; while a run is in flight it also shows the stop cue."""
-        if not self._cost_visible:
-            return ""
-        cost = f"${self._goal_cost:.4f}"
-        if not self._run_in_flight():
-            return cost
-        return f"{cost} · stopping..." if self._stopping else f"{cost} · esc to stop"
+        """Status-rail cost text (empty when hidden). Prefers envelope remaining."""
+        text, _level = cost_segment(
+            goal_cost=self._goal_cost,
+            visible=self._cost_visible,
+            run_in_flight=self._run_in_flight(),
+            stopping=self._stopping,
+            envelope=getattr(self._runner, "envelope", None) if self._runner else None,
+            ledger=getattr(self._runner, "ledger", None) if self._runner else None,
+        )
+        return text
 
     def _session_total(self) -> float:
         """Session spend: folded finished goals plus the live current goal while a run
@@ -2232,6 +1619,14 @@ class RelayTuiApp(App):
         if runner is None:
             return
         cost = runner.ledger.total_cost()
+        envelope = getattr(runner, "envelope", None)
+        if envelope is not None and hasattr(envelope, "drain_warnings"):
+            for warn in envelope.drain_warnings(ledger=runner.ledger, steps_used=None):
+                self._cost_warn_level = (
+                    "critical" if float(warn.get("threshold") or 0) >= 0.99 else "warn"
+                )
+                self._write_activity(f"[envelope] {warn.get('message', 'warn')}", dim=True)
+                self._flash_cost()
         if cost is None or cost == self._goal_cost:
             return
         self._goal_cost = cost
@@ -2339,8 +1734,21 @@ class RelayTuiApp(App):
         ]
         self.push_screen(SelectDialog(title="Commands", options=options))
 
-    def _cmd_model(self) -> None:
-        """Pick a role, then its model (reuses v0.0.16 listing + validation)."""
+    def _cmd_model(self, arg: str = "") -> None:
+        """Pick a role, then its model — or apply ``/model <role> [slug]`` inline."""
+        parts = (arg or "").split(None, 1)
+        if parts and parts[0] in ROLES:
+            role = parts[0]
+            if len(parts) == 2:
+                model = parts[1].strip()
+                provider = self._models.provider_for_role(role)
+                ok, note = self._save_role_model(role, provider, model)
+                self._write_activity(
+                    f"/model {role} → {provider}/{model}" if ok else f"/model failed: {note}"
+                )
+                return
+            self._pick_model_for(role)
+            return
         options = [
             {"title": "brain (planner)", "value": "brain",
              "on_select": (lambda v: self._pick_model_for("brain"))},
@@ -2358,10 +1766,9 @@ class RelayTuiApp(App):
 
         ``provider`` is explicit (so /provider can pick a model for a JUST-CHOSEN
         provider, not the stale config one). A ``list`` provider (DeepSeek) shows
-        the live ``/models`` SelectDialog; a ``manual`` provider (OpenRouter) a slug
-        TextEntryDialog validated live. On a successful save, ``then`` (if given) is
-        scheduled AFTER this dialog tears down -- the chaining seam ``both`` uses to
-        run brain then hands in sequence.
+        the live ``/models`` SelectDialog after an off-thread fetch; a ``manual``
+        provider (OpenRouter) a slug TextEntryDialog validated live. On a successful
+        save, ``then`` (if given) is scheduled AFTER this dialog tears down.
         """
         try:
             profile = resolve_provider(provider)
@@ -2373,21 +1780,18 @@ class RelayTuiApp(App):
                 self.call_after_refresh(then)  # next step, after this dialog dismisses
 
         if profile is not None and profile.discovery == DISCOVERY_LIST:
-            list_fn = self._list_models_fn or provider_list_models
-            try:
-                ids = list(list_fn(provider))
-            except Exception:  # noqa: BLE001 -- no key/network -> empty, handled below
-                ids = []
-
-            def on_pick(value, r=role, p=provider) -> None:
-                ok, _ = self._save_role_model(r, p, value)
-                after_save(ok)
-
-            options = [
-                {"title": mid, "value": mid, "category": provider, "on_select": on_pick}
-                for mid in ids
-            ] or [{"title": "(no models listed -- add a key with /key)", "value": "__none__"}]
-            self.push_screen(SelectDialog(title=f"Pick a {role} model ({provider})", options=options))
+            self._pending_model_pick = {
+                "role": role, "provider": provider, "then": then, "after_save": after_save,
+            }
+            self._write_activity(f"(loading {provider} models…)", dim=True)
+            self.run_worker(
+                self._fetch_models_for_pick,
+                thread=True,
+                name="list-models",
+                group="list-models",
+                exclusive=True,
+                exit_on_error=False,
+            )
         else:
             # manual aggregator: a slug field validated live before saving.
             def on_submit(slug, r=role, p=provider):
@@ -2401,6 +1805,33 @@ class RelayTuiApp(App):
                 password=False, placeholder="e.g. openai/gpt-4o",
                 on_submit=on_submit,
             ))
+
+    def _fetch_models_for_pick(self) -> list[str]:
+        """Worker body: list models for the pending /model pick (may hit the network)."""
+        pending = getattr(self, "_pending_model_pick", None) or {}
+        provider = pending.get("provider", "")
+        list_fn = self._list_models_fn or provider_list_models
+        try:
+            return list(list_fn(provider))
+        except Exception:  # noqa: BLE001 -- no key/network -> empty, handled below
+            return []
+
+    def _show_model_pick_dialog(self, ids: list[str]) -> None:
+        pending = getattr(self, "_pending_model_pick", None) or {}
+        role = pending.get("role", "brain")
+        provider = pending.get("provider", "")
+        after_save = pending.get("after_save") or (lambda ok: None)
+        self._pending_model_pick = None
+
+        def on_pick(value, r=role, p=provider) -> None:
+            ok, _ = self._save_role_model(r, p, value)
+            after_save(ok)
+
+        options = [
+            {"title": mid, "value": mid, "category": provider, "on_select": on_pick}
+            for mid in ids
+        ] or [{"title": "(no models listed -- add a key with /key)", "value": "__none__"}]
+        self.push_screen(SelectDialog(title=f"Pick a {role} model ({provider})", options=options))
 
     # -- /provider: set a role's provider, then its model ----------------------
 
@@ -2455,7 +1886,7 @@ class RelayTuiApp(App):
         """
         if thinking is None:
             thinking = self._models.thinking_for_role(role)
-        ok, note = persist_role(
+        ok, note = _call_persist_role(
             role, provider, model, thinking, validate_fn=self._validate_fn or provider_validate_model
         )
         if ok:
@@ -2485,7 +1916,7 @@ class RelayTuiApp(App):
         key = (key or "").strip()
         if not key:
             return False, "no key entered"
-        secrets_set_key(provider, key)  # the same v0.0.16 secrets path; value never echoed
+        _call_secrets_set_key(provider, key)  # the same v0.0.16 secrets path; value never echoed
         self._on_setup_saved()
         return True, f"stored a key for {provider}"
 
@@ -2507,6 +1938,22 @@ class RelayTuiApp(App):
         self.push_screen(TextEntryDialog(
             title=title, label=f"Input to {kind}:", placeholder="...", on_submit=on_submit,
         ))
+
+    def _cmd_queue(self, arg: str = "") -> None:
+        """Queue input for after the current run (``/queue <text>`` or dialog)."""
+        text = (arg or "").strip()
+        if text:
+            self._do_queue(text)
+            return
+        self._open_inline_dialog("queue")
+
+    def _cmd_redirect(self, arg: str = "") -> None:
+        """Steer now (``/redirect <text>`` or dialog)."""
+        text = (arg or "").strip()
+        if text:
+            self._do_redirect(text)
+            return
+        self._open_inline_dialog("redirect")
 
     def _cmd_config(self) -> None:
         """Show the resolved config (provider/model/thinking + source; key present/
@@ -2536,8 +1983,19 @@ class RelayTuiApp(App):
         self.push_screen(SelectDialog(title="Config (resolved: env > config > default)", options=options))
 
     def _cmd_doctor(self) -> None:
-        """Run the provider/model preflight (reusing the CLI logic) in a dialog."""
-        rows = self._run_doctor_report()
+        """Run the provider/model preflight off the UI thread, then show a dialog."""
+        self._write_activity("(doctor running…)", dim=True)
+        self.run_worker(
+            self._run_doctor_report,
+            thread=True,
+            name="doctor",
+            group="doctor",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    def _show_doctor_dialog(self, rows: list[dict] | None) -> None:
+        rows = rows or []
         options = [
             {"title": f"{r.get('role')}  {r.get('provider')}/{r.get('model')}: {r.get('status', '?')}",
              "value": r.get("model", "?"), "category": "preflight",
@@ -2551,16 +2009,32 @@ class RelayTuiApp(App):
         if self._doctor_fn is not None:
             return self._doctor_fn()
         try:
-            from relay import cli
+            from relay import doctor
 
-            checks = cli._doctor_checks(self._models, None)
-            clients = cli._build_provider_clients(checks)
-            rows, _ = cli._run_doctor(checks, clients)
+            checks = doctor._doctor_checks(self._models, None)
+            clients = doctor._build_provider_clients(checks)
+            rows, _ = doctor._run_doctor(checks, clients)
             return rows
         except Exception as exc:  # noqa: BLE001 -- never crash the TUI on a preflight
             note = friendly_provider_error(str(exc).splitlines()[0][:120])
             return [{"role": "?", "provider": "?", "model": "?",
                      "status": "FAILED", "note": note}]
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        """Deliver off-thread /model list + /doctor results onto the UI thread."""
+        worker = event.worker
+        if event.state is not WorkerState.SUCCESS:
+            if event.state is WorkerState.ERROR and worker.name in ("doctor", "list-models"):
+                err = worker.error
+                note = friendly_provider_error(
+                    str(err).splitlines()[0][:120] if err else "worker failed"
+                )
+                self._write_activity(f"({worker.name} failed: {note})", dim=True)
+            return
+        if worker.name == "doctor":
+            self._show_doctor_dialog(worker.result)
+        elif worker.name == "list-models":
+            self._show_model_pick_dialog(list(worker.result or []))
 
     def _cmd_runs(self) -> None:
         """List recent runs (reusing the runlog reader) read-only in a dialog."""
@@ -2592,13 +2066,17 @@ class RelayTuiApp(App):
         except Exception:  # noqa: BLE001 -- a missing/odd log is just "no runs"
             return []
 
-    def _cmd_assume(self) -> None:
-        """Pick the assumption level for this session (a select, not an inline number).
+    def _cmd_assume(self, arg: str = "") -> None:
+        """Pick the assumption level for this session (dialog or ``/assume <level>``).
 
         Each level carries a short description DERIVED from the real dial semantics
         (:func:`relay.config.assumption_summary`), so the text can't drift from what
         the brain is actually instructed to do. The current level is marked.
         """
+        level = (arg or "").strip()
+        if level in ASSUMPTION_LEVELS:
+            self._set_assume(level)
+            return
         options = []
         for lvl in ASSUMPTION_LEVELS:
             current = lvl == self._assumption_level
@@ -2614,12 +2092,54 @@ class RelayTuiApp(App):
         self._assumption_level = level
         self._update_status()
 
-    def _cmd_cwd(self) -> None:
+    def _cmd_profile(self, arg: str = "") -> None:
+        """B1: pick a named assumption profile for this session (session-only)."""
+        from relay.profiles import PROFILES, get_profile
+
+        name = (arg or "").strip().lower()
+        if name:
+            if get_profile(name) is None:
+                self._write_activity(f"/profile: unknown profile '{name}'")
+                return
+            self._set_profile(name)
+            return
+        options = []
+        for pname in PROFILES:
+            p = get_profile(pname)
+            assert p is not None
+            options.append({
+                "title": pname,
+                "value": pname,
+                "category": "profile",
+                "description": f"{p.description} (dial={p.assumption_level})",
+                "on_select": (lambda v, n=pname: self._set_profile(n)),
+            })
+        self.push_screen(SelectDialog(title="Assumption profile", options=options))
+
+    def _set_profile(self, name: str) -> None:
+        from relay.profiles import get_profile
+
+        p = get_profile(name)
+        if p is None:
+            return
+        self._assumption_level = p.assumption_level
+        self._write_activity(
+            f"[profile] {p.name} · dial={p.assumption_level} · {p.description}"
+        )
+        self._update_status()
+
+    def _cmd_cwd(self, arg: str = "") -> None:
         """Show the current session working dir and let the user set a new one.
 
         The working dir is session-sticky: a set here persists across subsequent
         goals (until changed) -- the next goal operates from it, not the launch
         root. Guarded to non-running states (the command's ``enabled`` predicate)."""
+        path = (arg or "").strip()
+        if path:
+            ok, note = self._set_working_dir(path)
+            if not ok:
+                self._write_activity(f"/cwd: {note}")
+            return
         current = self._session.working_dir
         self.push_screen(TextEntryDialog(
             title="Working directory (persists across goals)",
@@ -2649,15 +2169,52 @@ class RelayTuiApp(App):
         return True, f"working dir set to {target}"
 
     def _cmd_cost(self) -> None:
-        """Show session + per-goal spend, and offer toggle / reset. Dialog-driven (no
-        inline args); cost is already tracked so opening this makes NO model call.
-        Relay SHOWS spend and lets YOU decide when to stop -- it never caps."""
+        """Show envelope + session spend. Dialog-driven; ZERO model calls.
+
+        Session-only edits (ceilings / warn thresholds) mutate the live
+        :class:`CostEnvelope` on the runner when a run is in flight — they do
+        not write config/env.
+        """
         session = self._session_total()
+        runner = self._runner
+        env = getattr(runner, "envelope", None) if runner is not None else None
+        ledger = runner.ledger if runner is not None else None
+        spent = ledger.total_cost() if ledger is not None else self._goal_cost
+        remaining = env.remaining_cost(ledger) if env is not None else None
+        title = "Envelope" if env is not None and (
+            env.max_cost is not None or env.max_steps is not None
+        ) else "Cost (Relay shows spend; you decide when to stop)"
         options = [
             {"title": f"Session total: ${session:.4f}", "value": "__session__", "category": "spend",
              "description": "Cumulative across all goals since launch or last reset"},
-            {"title": f"This goal: ${self._goal_cost:.4f}", "value": "__goal__", "category": "spend",
-             "description": "The current goal's cost (or the last goal's, while idle)"},
+            {"title": f"This goal: ${(spent or 0):.4f}", "value": "__goal__", "category": "spend",
+             "description": "Current (or last) goal spend"},
+        ]
+        if env is not None:
+            cost_line = (
+                f"Ceiling: ${env.max_cost:.4f} (scope={env.scope})"
+                if env.max_cost is not None else "Ceiling: unbounded"
+            )
+            rem_line = (
+                f"Remaining: ${remaining:.4f}" if remaining is not None else "Remaining: n/a"
+            )
+            options.append({
+                "title": cost_line, "value": "__ceiling__", "category": "envelope",
+                "description": rem_line + " · session-only raise via set-ceiling",
+            })
+            options.append({
+                "title": f"Warn @ {', '.join(f'{t:.0%}' for t in env.warn_thresholds)}",
+                "value": "__warn__", "category": "envelope",
+                "description": "Soft thresholds (session-only; next boundary check)",
+            })
+            if env.max_cost is not None:
+                options.append({
+                    "title": "Raise cost ceiling +50% (session)", "value": "__raise__",
+                    "category": "actions",
+                    "description": "Mutates this run only — does not write config",
+                    "on_select": (lambda v: self._session_raise_cost_ceiling()),
+                })
+        options.extend([
             {"title": f"Live counter: {'on' if self._cost_visible else 'off'}", "value": "__toggle__",
              "category": "actions", "description": "Show/hide the status-line per-goal counter",
              "on_select": (lambda v: self._toggle_cost_counter())},
@@ -2665,9 +2222,111 @@ class RelayTuiApp(App):
              "description": "Zero the session figure (a deliberate break; leaves the goal "
                             "counter and any run untouched)",
              "on_select": (lambda v: self._reset_session_cost())},
+        ])
+        self.push_screen(SelectDialog(title=title, options=options))
+
+    def _session_raise_cost_ceiling(self) -> None:
+        """Session-only: bump the in-flight envelope's max_cost by 50%."""
+        runner = self._runner
+        env = getattr(runner, "envelope", None) if runner is not None else None
+        if env is None or env.max_cost is None:
+            return
+        env.max_cost = float(env.max_cost) * 1.5
+        self._write_activity(
+            f"[envelope] session ceiling raised to ${env.max_cost:.4f} (not saved to config)"
+        )
+        self._update_status()
+
+    def _cmd_why(self) -> None:
+        """A2: show the harness flight recorder for the current/last run (zero tokens)."""
+        from relay.explain import HarnessReport, explain_events
+        from relay.debug import redact_secrets
+
+        runner = self._runner
+        outcome = getattr(runner, "outcome", None) if runner is not None else None
+        result = getattr(outcome, "result", None) if outcome is not None else None
+        harness = getattr(result, "harness", None) if result is not None else None
+        if harness is None and result is not None and getattr(result, "events", None):
+            harness = explain_events(
+                result.events,
+                goal=getattr(result, "goal", ""),
+                status=getattr(result, "status", ""),
+                assumption_level=getattr(self, "_assumption_level", None),
+                max_total_steps=getattr(result, "max_total_steps", None),
+                max_cost=getattr(result, "max_cost", None),
+                envelope=getattr(result, "envelope", None),
+            ).to_dict()
+        if not harness:
+            self._write_activity("[why] no harness data yet — run a goal first")
+            return
+        fields = HarnessReport.__dataclass_fields__
+        kwargs = {k: harness[k] for k in fields if k in harness}
+        text = redact_secrets(HarnessReport(**kwargs).to_text())
+        for line in text.splitlines():
+            self._write_activity(line)
+
+    def _cmd_route(self) -> None:
+        """E3: spend-broker cockpit — active route, pins, freeze state."""
+        from relay.router import ModelRouter, format_broker_line
+
+        root = self._session.working_dir
+        router = getattr(self, "_model_router", None)
+        if router is None:
+            router = ModelRouter.from_resolve(None, root=root)
+            self._model_router = router
+        envelope = None
+        ledger = None
+        runner = self._runner
+        outcome = getattr(runner, "outcome", None) if runner is not None else None
+        result = getattr(outcome, "result", None) if outcome is not None else None
+        if result is not None:
+            envelope = getattr(result, "envelope", None)
+            ledger = getattr(result, "ledger", None)
+        line = format_broker_line(router, envelope, ledger)
+        self._write_activity(f"[route] {line}")
+        c = router.contract
+        if c is not None:
+            self._write_activity(
+                f"[route] brain={c.brain} hands={c.hands} "
+                f"provider={c.provider_sort} freeze@{int(c.bump_freeze_fraction * 100)}% "
+                f"frozen={router.bumps_frozen} phase={router.phase}"
+            )
+            self._write_activity(
+                f"[route] /model is an explicit override (beats the router). "
+                f"Pins: {c.pins or '{}'}"
+            )
+
+    def _cmd_memory(self) -> None:
+        """A3: list durable shared memory; offer pin/forget for the first entries."""
+        from relay.durable_memory import list_entries, pin_entry, forget_entry
+
+        root = self._session.working_dir
+        entries = list_entries(root)
+        options = [
+            {
+                "title": f"{e.id}: {e.summary}" + (" [pinned]" if "pinned" in e.tags else ""),
+                "value": e.id,
+                "category": "entries",
+                "description": e.detail[:120],
+            }
+            for e in entries[:20]
         ]
-        self.push_screen(SelectDialog(
-            title="Cost (Relay shows spend; you decide when to stop)", options=options))
+        if not options:
+            options = [{"title": "(empty)", "value": "__empty__", "category": "entries",
+                        "description": "No durable shared findings yet"}]
+        else:
+            first = entries[0]
+            options.append({
+                "title": f"Pin {first.id}", "value": "__pin__", "category": "actions",
+                "description": "Keep this entry across budget trim",
+                "on_select": (lambda v, eid=first.id: pin_entry(root, eid) and self._write_activity(f"[memory] pinned {eid}")),
+            })
+            options.append({
+                "title": f"Forget {first.id}", "value": "__forget__", "category": "actions",
+                "description": "Remove from durable shared store",
+                "on_select": (lambda v, eid=first.id: forget_entry(root, eid) and self._write_activity(f"[memory] forgot {eid}")),
+            })
+        self.push_screen(SelectDialog(title="Durable shared memory", options=options))
 
     def _toggle_cost_counter(self) -> None:
         """Show/hide the status-line per-goal counter (the /cost toggle)."""
@@ -2699,6 +2358,7 @@ class RelayTuiApp(App):
         self._conversation_lines = []
         self._activity_lines = []
         self._stream_rendered = []
+        self._stream_plain = []
         # Wipe the single stream (history rows + the live plan block) and its plan state.
         self._reset_plan()
         stream = self._stream()
@@ -2767,10 +2427,15 @@ class RelayTuiApp(App):
         if scope == "session":
             transcript_lines = list(self._conversation_lines)
         else:
-            transcript_lines = (
-                [format_turn(t) for t in runner.transcript.turns]
-                if runner is not None else []
-            )
+            if runner is None:
+                transcript_lines = []
+            else:
+                transcript = runner.transcript
+                if hasattr(transcript, "snapshot_turns"):
+                    turns = transcript.snapshot_turns()
+                else:
+                    turns = list(getattr(transcript, "turns", []) or [])
+                transcript_lines = [format_turn(t) for t in turns]
         activity_lines = list(self._activity_lines)
 
         outcome = runner.outcome if runner is not None else None

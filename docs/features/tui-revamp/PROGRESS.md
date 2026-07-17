@@ -25,6 +25,7 @@ Append-only. One section per stage after the review gate passes.
 ### U0 — Package split (2026-07-17)
 
 - Status: shipped
+- Commit: 844c90d
 - Tests: full suite + 164 TUI/CLI/doctor-related
 - Review: pass-with-notes
 - Shipped:

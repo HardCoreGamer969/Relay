@@ -46,7 +46,7 @@ from pathlib import Path
 
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.containers import Container, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.widgets import Input, Static
 from textual.worker import Worker, WorkerState
 
@@ -108,7 +108,18 @@ from .events import (
     present_prompt,
 )
 from .input import PromptInput
+from .plan import PLAN_MODES, render_plan_dock, resolve_plan_mode
 from .setup import SetupScreen, _call_persist_role, _call_secrets_set_key
+from .status import (
+    StatusSnapshot,
+    active_instruction,
+    context_segment,
+    cost_segment,
+    mode_word,
+    resolve_anim_mode,
+    route_segment,
+    step_segment,
+)
 from .stream import (
     STREAM_BUFFER_MAX,
     STREAM_MAX_LINES,
@@ -128,6 +139,15 @@ from .theme import (
     C_RED,
     C_TXT,
     RELAY_WORDMARK,
+    W_BG,
+    W_BG_CARD,
+    W_BG_RAISED,
+    W_BORDER,
+    W_RED,
+    W_TEXT,
+    W_TEXT_DIM,
+    W_TEXT_MUTED,
+    W_WARN,
     _ACTOR_STYLES,
     _ANIM_FPS,
     _COST_PULSE_S,
@@ -160,7 +180,7 @@ class RelayTuiApp(App):
     TITLE = "Relay"
 
     CSS = """
-    Screen { layout: vertical; background: #06090e; }
+    Screen { layout: vertical; background: #050505; }
 
     /* -- the welcome state (shown first; hidden once work begins) -- */
     #welcome { height: 1fr; align: center middle; }
@@ -169,23 +189,41 @@ class RelayTuiApp(App):
         height: auto;
         align: center middle;
         padding: 1 4;
-        border: double $primary;
+        border: double #ff0000;
+        background: #0a0a0a;
     }
-    #brand { width: auto; content-align: center middle; text-style: bold; }
-    #greeting { width: auto; content-align: center middle; text-style: bold; margin-top: 1; }
-    #indicator { width: auto; content-align: center middle; color: $text-muted; margin-top: 1; }
-    #hint { width: auto; content-align: center middle; color: $text-muted; text-style: dim; margin-top: 1; }
+    #brand { width: auto; content-align: center middle; text-style: bold; color: #ff0000; }
+    #greeting { width: auto; content-align: center middle; text-style: bold; margin-top: 1; color: #f0f0f0; }
+    #indicator { width: auto; content-align: center middle; color: #888888; margin-top: 1; }
+    #hint { width: auto; content-align: center middle; color: #555555; text-style: dim; margin-top: 1; }
 
-    /* -- the working state: ONE live scrolling stream (v0.0.30) -- */
+    /* -- cockpit: status rail + plan dock + stream (U2) -- */
     #working { height: 1fr; layout: vertical; display: none; }
+    #status {
+        height: auto;
+        min-height: 1;
+        max-height: 2;
+        padding: 0 1;
+        background: #0a0a0a;
+        border-bottom: solid #1a1a1a;
+    }
+    #cockpit-body { height: 1fr; layout: horizontal; }
+    #plan-dock {
+        width: 36;
+        min-width: 24;
+        max-width: 48;
+        padding: 0 1;
+        background: #0f0f0f;
+        border-right: solid #1a1a1a;
+    }
+    #plan-dock.-hidden { display: none; width: 0; min-width: 0; max-width: 0; padding: 0; border: none; }
     #stream {
         height: 1fr;
+        width: 1fr;
         padding: 0 1;
-        background: #06090e;
+        background: #050505;
     }
-    #stream .plan { margin: 1 0 1 0; padding: 0 0 0 2; }
     #stream .stream-row { width: 1fr; }
-    #status { height: 1; padding: 0 1; background: #080d14; }
 
     /* -- the slash-command popover (shown only while typing a /command) -- */
     #command-popover {
@@ -194,8 +232,8 @@ class RelayTuiApp(App):
         max-height: 12;
         margin: 0 1;
         padding: 0 1;
-        border: round $primary;
-        background: $surface;
+        border: round #ff0000;
+        background: #0f0f0f;
     }
     """
 
@@ -258,7 +296,14 @@ class RelayTuiApp(App):
         # TODO(prompt-2): drive anim_mode from persisted settings + a launch
         # counter (a longer "first few launches" variant for "long"). Hardcoded
         # "short" for now; "off" is a clean instant no-op.
-        self._anim_mode = anim_mode
+        # Animation: non-default constructor arg wins; else RELAY_TUI_ANIM; else short.
+        import os as _os
+        if anim_mode != "short":
+            self._anim_mode = anim_mode
+        elif _os.environ.get("RELAY_TUI_ANIM") is not None:
+            self._anim_mode = resolve_anim_mode(None)
+        else:
+            self._anim_mode = "short"
         self._anim_timer = None
         self._router = InputRouter()
         self._runner: EngineRunner | None = None
@@ -295,11 +340,15 @@ class RelayTuiApp(App):
         # active step + mode LED are the ONLY motion (activity-only, gated off in
         # "off" anim mode).
         self._plan_steps: list[dict] = []   # [{"instruction", "status"}], the live plan
-        self._plan_block = None             # the mounted plan widget (updated in place)
+        self._plan_block = None             # legacy alias; dock is #plan-dock (U2)
+        self._plan_mode = resolve_plan_mode(None)
+        self._plan_pinned_full = False      # user explicitly chose /plan full
+        self._cost_warn_level = "normal"    # escalates with envelope thresholds
+        self._model_router = None
         # The rendered stream rows (Rich Text / str), in order -- the headless mirror
         # of what the single stream shows (so tests can pin speaker/finding styling
-        # without depending on Textual widget internals). The live plan block updates
-        # in place and is NOT in here (its state is _plan_steps).
+        # without depending on Textual widget internals). The live plan lives in the
+        # plan dock (U2), not in the stream mirror.
         self._stream_rendered: list = []
         self._spin_frame = 0                # active-step spinner frame
         self._spin_timer = None             # active while a step is executing
@@ -316,11 +365,11 @@ class RelayTuiApp(App):
                 yield Static(self._indicator_text, id="indicator")
                 yield Static("esc to cancel  ·  ctrl+q to quit", id="hint")
         with Container(id="working"):
-            # ONE live scrolling stream: conversation, the inline live plan, tool
-            # calls, findings, and verdicts all interleaved in the order they happen
-            # (the v0.0.30 replacement for the old Conversation/Activity two-pane).
-            yield VerticalScroll(id="stream")
+            # IDE cockpit (U2): status rail on top, plan dock + stream below.
             yield Static(id="status")
+            with Horizontal(id="cockpit-body"):
+                yield Static(id="plan-dock", classes="plan-dock")
+                yield VerticalScroll(id="stream")
         yield Static(id="command-popover")
         yield PromptInput(id="prompt", placeholder=self._placeholder)
 
@@ -991,10 +1040,10 @@ class RelayTuiApp(App):
             return
         if speaker == "user" or (speaker is None and line.startswith("you")):
             rest = line.split(None, 1)[1] if " " in line else ""
-            self._row("you", rest, gutter_style=f"bold {C_MAGENTA}", body_style=C_TXT)
+            self._row("you", rest, gutter_style=f"bold {W_TEXT}", body_style=C_TXT)
         elif speaker == "brain" or (speaker is None and line.startswith("brain")):
             rest = line.split(None, 1)[1] if " " in line else ""
-            self._row("brain", rest, gutter_style=C_MAGENTA, body_style=C_TXT)
+            self._row("brain", rest, gutter_style=W_RED, body_style=C_TXT)
         else:
             self._row("", line, body_style=C_MUTED)  # system / result / notice lines
 
@@ -1016,7 +1065,7 @@ class RelayTuiApp(App):
     def _stream_tool(self, label: str, result: str = "") -> None:
         """A compact tool-call stream line: ``▸ read cli.py · 78 lines``."""
         text = Text()
-        text.append("  ▸ ", style=C_CYAN)
+        text.append("  ▸ ", style=W_TEXT_DIM)
         text.append(label, style=C_MUTED)
         if result:
             text.append(f"  · {result[:60]}", style=C_DIM)
@@ -1045,18 +1094,20 @@ class RelayTuiApp(App):
     # -- the inline LIVE plan: ONE block, updated IN PLACE -----------------------
 
     def _plan_set(self, steps: list[str], *, revised: bool = False) -> None:
-        """(Re)build the live plan from an emitted step list and mount/refresh its
-        block. The initial plan starts every step pending; a revision keeps already-
-        settled steps and replaces the pending tail with the new pending steps."""
+        """(Re)build the live plan and refresh the plan dock (U2 source of truth).
+
+        A compact ``plan committed`` line goes to the stream; the dock holds the
+        interactive step list with active highlight.
+        """
         if revised and self._plan_steps:
             kept = [s for s in self._plan_steps if s["status"] != "pending"]
             self._plan_steps = kept + [{"instruction": s, "status": "pending"} for s in steps]
         else:
             self._plan_steps = [{"instruction": s, "status": "pending"} for s in steps]
-            self._plan_block = None  # a fresh plan -> a fresh block (prior plan stays in scroll-back)
-        if self._plan_block is None:
-            self._plan_block = Static(classes="plan")
-            self._mount_stream(self._plan_block)
+            self._write_activity(
+                f"plan committed · {len(steps)} step{'s' if len(steps) != 1 else ''}",
+                dim=True,
+            )
         self._plan_render()
 
     def _plan_mark(self, index, status: str) -> None:
@@ -1071,31 +1122,98 @@ class RelayTuiApp(App):
             self._start_spin()
         self._plan_render()
 
-    def _plan_render(self) -> None:
-        """Render the live plan block from its step states: ◉ done (dim) / ◍ active
-        (spinner, bright) / ○ pending (dimmer). Updates the SAME widget in place."""
-        block = self._plan_block
-        if block is None:
-            return
-        total = len(self._plan_steps)
-        text = Text()
-        text.append(f"plan · {total} step{'s' if total != 1 else ''}", style=C_DIM)
-        for i, step in enumerate(self._plan_steps):
-            status = step["status"]
-            icon = (_SPINNER_FRAMES[self._spin_frame % len(_SPINNER_FRAMES)]
-                    if status == "active" else _PLAN_ICON.get(status, "○"))
-            icon_style = {"done": C_GREEN, "active": C_CYAN, "failed": C_RED}.get(status, C_DIM)
-            body_style = {"active": f"bold {C_TXT}", "done": C_MUTED}.get(status, C_DIM)
-            text.append("\n")
-            text.append(f"{icon} ", style=icon_style)
-            text.append(f"{i + 1:02d} ", style=C_DIM)
-            text.append(step["instruction"], style=body_style)
+    def _plan_dock(self):
         try:
-            block.update(text)
-        except Exception:  # noqa: BLE001 -- teardown race
+            return self.query_one("#plan-dock", Static)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _effective_plan_mode(self) -> str:
+        width = None
+        try:
+            width = self.size.width
+        except Exception:  # noqa: BLE001
+            width = None
+        return resolve_plan_mode(
+            self._plan_mode, width=width, pinned_full=self._plan_pinned_full,
+        )
+
+    def _refresh_plan_dock_visibility(self) -> None:
+        dock = self._plan_dock()
+        if dock is None:
+            return
+        mode = self._effective_plan_mode()
+        try:
+            if mode == "hidden":
+                dock.add_class("-hidden")
+            else:
+                dock.remove_class("-hidden")
+        except Exception:  # noqa: BLE001
             pass
+
+    def _plan_render(self) -> None:
+        """Render the plan dock from step states (full / active / hidden)."""
+        dock = self._plan_dock()
+        mode = self._effective_plan_mode()
+        self._refresh_plan_dock_visibility()
+        rendered = render_plan_dock(
+            self._plan_steps, mode=mode, spin_frame=self._spin_frame,
+        )
+        self._plan_block = dock
+        if dock is not None:
+            try:
+                dock.update(rendered)
+            except Exception:  # noqa: BLE001
+                pass
         if not any(s["status"] == "active" for s in self._plan_steps):
             self._stop_spin()
+
+    def _set_plan_mode(self, mode: str) -> None:
+        mode = (mode or "").strip().lower()
+        if mode not in PLAN_MODES:
+            self._write_activity(f"/plan: use full|active|hidden (got '{mode}')")
+            return
+        self._plan_mode = mode
+        self._plan_pinned_full = mode == "full"
+        self._plan_render()
+        self._update_status()
+        self._write_activity(f"[plan] dock mode = {mode}")
+
+    def _cmd_plan(self, arg: str = "") -> None:
+        """Set plan dock mode: ``/plan full|active|hidden``."""
+        mode = (arg or "").strip().lower()
+        if not mode:
+            self._write_activity(
+                f"[plan] mode={self._effective_plan_mode()} "
+                f"(session={self._plan_mode}; /plan full|active|hidden)"
+            )
+            return
+        self._set_plan_mode(mode)
+
+    def _cmd_anim(self, arg: str = "") -> None:
+        """Session animation kill switch: ``/anim off|on`` (U5 surface)."""
+        raw = (arg or "").strip().lower()
+        if raw in ("off", "0", "false"):
+            self._anim_mode = "off"
+            self._stop_spin()
+            if self._led_timer is not None:
+                try:
+                    self._led_timer.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._led_timer = None
+            self._write_activity("[anim] off — instant updates only")
+        elif raw in ("on", "1", "true", "short"):
+            self._anim_mode = "short"
+            if self._led_timer is None:
+                try:
+                    self._led_timer = self.set_interval(_LED_INTERVAL_S, self._led_tick)
+                except Exception:  # noqa: BLE001
+                    self._led_timer = None
+            self._write_activity("[anim] on")
+        else:
+            self._write_activity(f"[anim] mode={self._anim_mode} — /anim on|off")
+        self._update_status()
 
     def _reset_plan(self) -> None:
         """Drop the live-plan state (a new goal starts a fresh plan; prior plans stay
@@ -1103,6 +1221,7 @@ class RelayTuiApp(App):
         self._plan_steps = []
         self._plan_block = None
         self._stop_spin()
+        self._plan_render()
 
     def _settle_plan(self) -> None:
         """The run ended: stop the active-step spinner and demote any still-active step
@@ -1153,87 +1272,110 @@ class RelayTuiApp(App):
         self._update_status()
 
     def _mode_word(self, state) -> str:
-        """The status-line MODE word: WORKING while the engine generates, INTERRUPTED
-        at the interrupt prompt, AWAITING YOU when it is the user's turn (idle or an
-        awaiting-reaction/decision/approval ask)."""
-        if state is InputState.INTERRUPTED:
-            return "INTERRUPTED"
-        if state in (InputState.PLANNING, InputState.EXECUTING):
-            return "WORKING"
-        return "AWAITING YOU"
+        return mode_word(state)
 
     def _step_segment(self) -> str:
-        """``step N/M`` from the live plan (active step, else settled count); '' if no plan."""
-        total = len(self._plan_steps)
-        if not total:
-            return ""
-        active = next((i for i, s in enumerate(self._plan_steps) if s["status"] == "active"), None)
-        if active is not None:
-            n = active + 1
-        else:
-            n = sum(1 for s in self._plan_steps if s["status"] in ("done", "failed"))
-        return f"step {n}/{total}"
+        return step_segment(self._plan_steps)
 
-    def _update_status(self) -> None:
-        """The status line: a breathing mode LED + WORKING/AWAITING YOU · step N/M ·
-        cost (amber) · cwd (cyan) · the model pairing (dim) · queue (magenta), with a
-        right hint. The plain ``_status_text`` mirror carries the same facts (what the
-        headless tests assert on); the widget gets the styled render."""
+    def _ensure_model_router(self):
+        """Lazy ModelRouter for the status rail ``route=`` chip."""
+        if self._model_router is not None:
+            return self._model_router
+        try:
+            from relay.router import ModelRouter
+
+            self._model_router = ModelRouter.from_resolve(
+                None, root=self._session.working_dir,
+            )
+        except Exception:  # noqa: BLE001 -- rail must never crash
+            self._model_router = None
+        return self._model_router
+
+    def _status_snapshot(self) -> StatusSnapshot:
+        """Build the cockpit status facts (mirror + widget share this)."""
         state = self._router.state
-        mode = self._mode_word(state)
-        step = self._step_segment()
-        cost = self._cost_segment()
+        mode = mode_word(state)
+        step = step_segment(self._plan_steps)
+        instr = active_instruction(self._plan_steps)
+        if step and instr:
+            step = f"{step} · {instr}"
+        runner = self._runner
+        envelope = getattr(runner, "envelope", None) if runner is not None else None
+        ledger = getattr(runner, "ledger", None) if runner is not None else None
+        cost, cost_level = cost_segment(
+            goal_cost=self._goal_cost,
+            visible=self._cost_visible,
+            run_in_flight=self._run_in_flight(),
+            stopping=self._stopping,
+            envelope=envelope,
+            ledger=ledger,
+        )
+        if self._cost_pulse:
+            cost_level = "pulse"
+        if self._cost_warn_level in ("warn", "critical") and cost_level == "normal":
+            cost_level = self._cost_warn_level
+        route = route_segment(self._ensure_model_router())
+        ctx = context_segment(self._models, self._catalog)
         cwd = self._cwd_segment()
         queued = f"queued: {len(self._session.queue)}" if self._session.queue else ""
+        models = f"brain {self._models.brain} · hands {self._models.hands}"
+        hint = (
+            "esc interrupt · /queue"
+            if self._run_in_flight()
+            else "enter send · ↑ recall · /queue"
+        )
+        return StatusSnapshot(
+            mode=mode, step=step, cost=cost, cost_level=cost_level,
+            route=route, context=ctx, cwd=cwd, models=models, queued=queued, hint=hint,
+        )
 
-        segs = [mode]
-        for seg in (step, cost, cwd):
-            if seg:
-                segs.append(seg)
-        segs.append(f"brain {self._models.brain}")
-        segs.append(f"hands {self._models.hands}")
-        if queued:
-            segs.append(queued)
-        self._status_text = "  ·  ".join(segs)
-
-        working = mode == "WORKING"
-        led_color = C_GREEN if working else C_MAGENTA
+    def _update_status(self) -> None:
+        """Status rail: LED · phase · step · cost · route · ctx · models · queue."""
+        snap = self._status_snapshot()
+        self._status_text = snap.plain()
+        working = snap.mode == "WORKING"
+        led_color = C_GREEN if working else W_RED
         text = Text()
-        text.append("● " if self._led_on else "○ ", style=led_color)  # the breathing LED
-        text.append(mode, style=f"bold {led_color}")
-        if step:
+        text.append("● " if self._led_on else "○ ", style=led_color)
+        text.append(snap.mode, style=f"bold {led_color}")
+        for seg, style in (
+            (snap.step, W_TEXT),
+            (snap.cost, self._cost_style(snap.cost_level)),
+            (snap.route, C_DIM),
+            (snap.context, C_DIM),
+            (snap.cwd, W_TEXT_DIM),
+            (snap.models, C_DIM),
+            (snap.queued, W_RED),
+        ):
+            if not seg:
+                continue
             text.append("  ·  ", style=C_DIM)
-            text.append(step, style=C_CYAN)
-        if cost:
-            text.append("  ·  ", style=C_DIM)
-            text.append(cost, style=("bold " + C_AMBER) if self._cost_pulse else C_AMBER)
-        if cwd:
-            text.append("  ·  ", style=C_DIM)
-            text.append(cwd, style=C_CYAN)
-        text.append("  ·  ", style=C_DIM)
-        text.append(f"brain {self._models.brain} · hands {self._models.hands}", style=C_DIM)
-        if queued:
-            text.append("  ·  ", style=C_DIM)
-            text.append(queued, style=C_MAGENTA)
-        hint = "esc interrupt · /queue" if self._run_in_flight() else "enter send · ↑ recall · /queue"
+            text.append(seg, style=style)
         text.append("    ", style=C_DIM)
-        text.append(hint, style=C_DIM)
+        text.append(snap.hint, style=C_DIM)
         try:
             self.query_one("#status", Static).update(text)
         except Exception:  # noqa: BLE001 -- not mounted / teardown race
             pass
-        # The input box's placeholder tracks what a submit now means (Fix 1).
         try:
             self.query_one("#prompt", Input).placeholder = placeholder_for_state(
-                state, self._placeholder
+                self._router.state, self._placeholder
             )
         except Exception:  # noqa: BLE001 -- not mounted
             pass
+        self._refresh_plan_dock_visibility()
+
+    def _cost_style(self, level: str) -> str:
+        if level == "pulse":
+            return f"bold {W_WARN}"
+        if level == "critical":
+            return f"bold {W_RED}"
+        if level == "warn":
+            return f"bold {W_WARN}"
+        return W_WARN
 
     def _cwd_segment(self) -> str:
-        """The status-line working-dir segment, shown when the sticky working dir
-        has moved off the launch root (so the user can SEE where Relay will work).
-        At the launch root the default is obvious, so nothing extra is shown."""
+        """The status-line working-dir segment, shown when off the launch root."""
         session = self._session
         if session.is_launch_root():
             return ""
@@ -1266,14 +1408,16 @@ class RelayTuiApp(App):
         return self._router.state is not InputState.IDLE
 
     def _cost_segment(self) -> str:
-        """The status-line cost text (``""`` when hidden via the toggle). Shows the
-        current goal's cost; while a run is in flight it also shows the stop cue."""
-        if not self._cost_visible:
-            return ""
-        cost = f"${self._goal_cost:.4f}"
-        if not self._run_in_flight():
-            return cost
-        return f"{cost} · stopping..." if self._stopping else f"{cost} · esc to stop"
+        """Status-rail cost text (empty when hidden). Prefers envelope remaining."""
+        text, _level = cost_segment(
+            goal_cost=self._goal_cost,
+            visible=self._cost_visible,
+            run_in_flight=self._run_in_flight(),
+            stopping=self._stopping,
+            envelope=getattr(self._runner, "envelope", None) if self._runner else None,
+            ledger=getattr(self._runner, "ledger", None) if self._runner else None,
+        )
+        return text
 
     def _session_total(self) -> float:
         """Session spend: folded finished goals plus the live current goal while a run
@@ -1289,6 +1433,14 @@ class RelayTuiApp(App):
         if runner is None:
             return
         cost = runner.ledger.total_cost()
+        envelope = getattr(runner, "envelope", None)
+        if envelope is not None and hasattr(envelope, "drain_warnings"):
+            for warn in envelope.drain_warnings(ledger=runner.ledger, steps_used=None):
+                self._cost_warn_level = (
+                    "critical" if float(warn.get("threshold") or 0) >= 0.99 else "warn"
+                )
+                self._write_activity(f"[envelope] {warn.get('message', 'warn')}", dim=True)
+                self._flash_cost()
         if cost is None or cost == self._goal_cost:
             return
         self._goal_cost = cost

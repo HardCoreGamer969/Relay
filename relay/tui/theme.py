@@ -157,25 +157,9 @@ ACTOR_BRAIN = "brain"
 ACTOR_HANDS = "hands"
 ACTOR_YOU = "you"
 
-# -- the cyberpunk palette (v0.0.30): the single source of truth for the stream's
-# styling, mirroring the agreed mockup. Near-black background, neon accents.
-# Relay's improvement over a single-agent stream is the brain/hands/findings split:
-#   brain = magenta, hands = cyan, findings = green, you = bright magenta;
-#   cost = amber, done = green, active = cyan. Cyberpunk == palette + activity-only
-#   spinners/LED ONLY -- no CRT/scanlines/glow/ambient motion (it's a tool).
-C_BG = "#06090e"
-C_PANEL = "#080d14"
-C_CYAN = "#34d9ee"
-C_MAGENTA = "#e879f9"
-C_GREEN = "#3ee48b"
-C_AMBER = "#ffcf4d"
-C_RED = "#ff6b6b"
-C_TXT = "#d3e3ef"
-C_MUTED = "#8aa0b3"
-C_DIM = "#5a7187"
-
-# Website design tokens reserved for the future website-aligned theme.
-# U0 keeps the existing C_* palette unchanged, so these are intentionally unused.
+# -- palette: website brand (U2+) with legacy aliases kept for older tests ----
+# Source: website/css/style.css. Brain = signal red; hands = dim text; findings
+# stay green (success). Cost = warn amber. Cyberpunk ambient flair is NOT used.
 W_BG_DEEP = "#000000"
 W_BG = "#050505"
 W_BG_RAISED = "#0a0a0a"
@@ -188,8 +172,23 @@ W_TEXT_DIM = "#888888"
 W_TEXT_MUTED = "#555555"
 W_BORDER = "#1a1a1a"
 
+C_BG = W_BG
+C_PANEL = W_BG_RAISED
+C_CYAN = W_TEXT_DIM          # hands (was neon cyan; remapped to site dim)
+C_MAGENTA = W_RED            # brain (was magenta; remapped to site red)
+C_GREEN = "#3ee48b"
+C_AMBER = W_WARN
+C_RED = W_RED_BRIGHT
+C_TXT = W_TEXT
+C_MUTED = W_TEXT_DIM
+C_DIM = W_TEXT_MUTED
+
 # Speaker -> gutter style for the stream (Relay's brain/hands/you distinction).
-_ACTOR_STYLES = {ACTOR_BRAIN: C_MAGENTA, ACTOR_HANDS: C_CYAN, ACTOR_YOU: f"bold {C_MAGENTA}"}
+_ACTOR_STYLES = {
+    ACTOR_BRAIN: W_RED,
+    ACTOR_HANDS: W_TEXT_DIM,
+    ACTOR_YOU: f"bold {W_TEXT}",
+}
 
 # The active-step / running spinner (a clean spinner, from the mockup) + plan icons.
 # Motion happens ONLY on the active plan step + the mode LED (activity-only).

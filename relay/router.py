@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -576,7 +577,17 @@ def model_for_call_class(
     if purpose in contract.pins:
         return contract.pins[purpose]
 
-    # Phase role overrides beat the static call-class map (state-machine bind).
+    # Cheap skeptic must beat phase brain overlays — otherwise
+    # phases.planning.brain hijacks purpose="skeptic".
+    if purpose == "skeptic" and purpose in contract.call_class:
+        slug = contract.call_class[purpose]
+        return _resolve_class_slug(
+            slug,
+            brain=phase_brain or contract.brain,
+            hands=phase_hands or contract.hands,
+        )
+
+    # Phase role overrides for plan/hands (state-machine bind).
     if role == "hands" and phase_hands:
         return phase_hands
     if role == "brain" and phase_brain:
@@ -584,7 +595,6 @@ def model_for_call_class(
 
     if purpose in contract.call_class:
         slug = contract.call_class[purpose]
-        # Allow tier names inside call_class that weren't expanded.
         return _resolve_class_slug(
             slug,
             brain=phase_brain or contract.brain,
@@ -975,6 +985,8 @@ class ModelRouter:
     # Shadow (E12)
     shadow_enabled: bool = False
     shadow_root: str | Path | None = None
+    # Orchestra workers share one router; guard fitness counters.
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.contract is None:
@@ -1060,9 +1072,15 @@ class ModelRouter:
             contract, purpose, phase=self.phase, models=models
         )
 
-        # Fitness bump overrides hands_step when active.
-        if resolved_role == "hands" and self.fitness_hands and self.hands_bump_remaining > 0:
-            target = self.fitness_hands
+        # Fitness bump overrides hands_step when active (and not envelope-frozen).
+        with self._lock:
+            if (
+                resolved_role == "hands"
+                and self.fitness_hands
+                and self.hands_bump_remaining > 0
+                and not self.bumps_frozen
+            ):
+                target = self.fitness_hands
 
         # Explicit role env still wins for that role.
         if resolved_role == "brain" and self.brain_explicit:
@@ -1135,55 +1153,69 @@ class ModelRouter:
 
         return models, change
 
-    def note_parse_failure(self, models: ModelConfig) -> RouteChange | None:
-        """Fitness gate: accumulate parse failures; bump hands when threshold hit."""
-        if self.hands_explicit:
-            return None
-        self.parse_failures += 1
-        threshold = self._contract.hands_bump_on_parse_failures
-        if self.parse_failures < threshold:
-            return None
-        if self.bumps_frozen:
+    def note_parse_failure(
+        self,
+        models: ModelConfig,
+        *,
+        envelope: Any | None = None,
+        ledger: Any | None = None,
+    ) -> RouteChange | None:
+        """Fitness gate: accumulate parse failures; bump hands when threshold hit.
+
+        Honors envelope freeze (same fraction as replan bumps) so mid-step
+        fitness escalation cannot fire after the spend freeze point.
+        """
+        with self._lock:
+            if self.hands_explicit:
+                return None
+            if envelope is not None:
+                self.envelope_freeze(envelope, ledger)
+            self.parse_failures += 1
+            threshold = self._contract.hands_bump_on_parse_failures
+            if self.parse_failures < threshold:
+                return None
+            if self.bumps_frozen:
+                return RouteChange(
+                    reason="bump_frozen",
+                    role="hands",
+                    from_model=models.hands,
+                    to_model=models.hands,
+                    route=self.route.name,
+                    purpose="hands_step",
+                )
+            bumped = next_hands_tier(self.fitness_hands or models.hands)
+            if bumped is None or bumped == (self.fitness_hands or models.hands):
+                return None
+            self.fitness_hands = bumped
+            self.hands_bump_remaining = self._contract.hands_bump_steps
+            self.parse_failures = 0
             return RouteChange(
-                reason="bump_frozen",
+                reason="fitness_bump",
                 role="hands",
                 from_model=models.hands,
-                to_model=models.hands,
+                to_model=bumped,
                 route=self.route.name,
                 purpose="hands_step",
             )
-        bumped = next_hands_tier(self.fitness_hands or models.hands)
-        if bumped is None or bumped == (self.fitness_hands or models.hands):
-            return None
-        self.fitness_hands = bumped
-        self.hands_bump_remaining = self._contract.hands_bump_steps
-        self.parse_failures = 0
-        return RouteChange(
-            reason="fitness_bump",
-            role="hands",
-            from_model=models.hands,
-            to_model=bumped,
-            route=self.route.name,
-            purpose="hands_step",
-        )
 
     def note_hands_success(self) -> RouteChange | None:
         """Decrement fitness bump window; clear when exhausted."""
-        if self.hands_bump_remaining <= 0 or self.fitness_hands is None:
-            return None
-        self.hands_bump_remaining -= 1
-        if self.hands_bump_remaining > 0:
-            return None
-        old = self.fitness_hands
-        self.fitness_hands = None
-        return RouteChange(
-            reason="fitness_decay",
-            role="hands",
-            from_model=old,
-            to_model=self.bound_hands or self._contract.hands,
-            route=self.route.name,
-            purpose="hands_step",
-        )
+        with self._lock:
+            if self.hands_bump_remaining <= 0 or self.fitness_hands is None:
+                return None
+            self.hands_bump_remaining -= 1
+            if self.hands_bump_remaining > 0:
+                return None
+            old = self.fitness_hands
+            self.fitness_hands = None
+            return RouteChange(
+                reason="fitness_decay",
+                role="hands",
+                from_model=old,
+                to_model=self.bound_hands or self._contract.hands,
+                route=self.route.name,
+                purpose="hands_step",
+            )
 
     def envelope_freeze(self, envelope: Any | None, ledger: Any | None) -> bool:
         """Freeze bumps at ≥ freeze fraction of the cost envelope (when a ceiling exists)."""

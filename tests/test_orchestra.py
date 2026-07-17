@@ -123,3 +123,100 @@ def test_orchestra_overlapping_claims_detected():
     ]
     batch = select_disjoint_batch(steps, max_workers=2)
     assert batch == []  # both claim shared.txt → no parallel batch
+
+
+
+
+def test_orchestra_settles_success_when_sibling_fails(tmp_path):
+    """Successful sibling writes are settled even when another worker fails."""
+
+    class DispatchClient:
+        """Route replies by step instruction so parallel workers are deterministic."""
+
+        def __init__(self):
+            self.brain = [
+                "<plan><step>create right.txt with R</step></plan>",
+            ]
+            self._right_calls = 0
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        def _create(self, *, model, messages, **kwargs):
+            if model == "vendor/brain":
+                assert self.brain, "ran out of brain replies"
+                return _resp(self.brain.pop(0))
+            blob = " ".join(m.get("content", "") for m in messages)
+            if "left.txt" in blob and "right.txt" not in blob.split("create")[-1]:
+                # Prefer left when the step is about left.
+                if "create left.txt" in blob or ("left.txt" in blob and self._right_calls == 0 and "create right" not in blob):
+                    return _resp('<write path="left.txt">L</write>\n<done>left</done>')
+            if "create left.txt" in blob:
+                return _resp('<write path="left.txt">L</write>\n<done>left</done>')
+            if "create right.txt" in blob:
+                self._right_calls += 1
+                if self._right_calls == 1:
+                    return _resp("<blocked>nope</blocked>")
+                return _resp('<write path="right.txt">R</write>\n<done>right</done>')
+            # Fallback: blocked
+            return _resp("<blocked>unexpected</blocked>")
+
+    plan = Plan.from_instructions([
+        "create left.txt with L",
+        "create right.txt with R",
+    ])
+    result = run_planned(
+        "two files",
+        tmp_path,
+        models=CFG,
+        client=DispatchClient(),
+        committed_plan=plan,
+        supervise=False,
+        orchestra_workers=2,
+        auto_checkpoint=False,
+        max_escalations=3,
+    )
+    assert (tmp_path / "left.txt").read_text() == "L"
+    assert any(s.status == "done" for s in result.plan.steps), [
+        (s.index, s.status, s.instruction) for s in result.plan.steps
+    ]
+
+
+
+def test_orchestra_splits_step_budget(tmp_path):
+    """Each parallel worker gets a share of remaining budget, not the full ceiling."""
+    plan = Plan.from_instructions([
+        "create a.txt with A",
+        "create b.txt with B",
+        "create c.txt with C",
+    ])
+    # max_total_steps=2 with 3 workers: if each got full budget=2, all three could
+    # complete (3 calls). With split, per_worker=max(1, 2//3)=1 so at most ~2-3
+    # but the next boundary should stop — pin that we don't complete all 3 when
+    # budget is 2 with serial... Actually with orchestra of 3 and budget 2,
+    # per_worker=1, three workers each make 1 call = 3 calls total still.
+    # The review fix is about not giving each worker the FULL remaining budget
+    # of 2 (which would allow 6). With per_worker=1, total max is 3.
+    # Use max_total_steps=2, orchestra 2: per_worker=1. Two steps can complete
+    # (2 calls) then ceiling stops the third.
+    client = RoutedClient(
+        brain=[],
+        hands=[
+            '<write path="a.txt">A</write>\n<done>a</done>',
+            '<write path="b.txt">B</write>\n<done>b</done>',
+            '<write path="c.txt">C</write>\n<done>c</done>',
+        ],
+    )
+    from relay.telemetry import Ledger
+    result = run_planned(
+        "three",
+        tmp_path,
+        models=CFG,
+        client=client,
+        ledger=Ledger(),
+        committed_plan=plan,
+        supervise=False,
+        orchestra_workers=2,
+        auto_checkpoint=False,
+        max_total_steps=2,
+    )
+    hands_calls = sum(1 for r in result.ledger.records if r.role.startswith("hands"))
+    assert hands_calls <= 2

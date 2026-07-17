@@ -166,10 +166,21 @@ class SetupScreen(ModalScreen):
             self._start_fetch_models(role, self._models.provider_for_role(role))
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
-        """Apply off-thread model-list results onto the Select widgets."""
+        """Apply off-thread model-list / save-role results."""
+        name = event.worker.name or ""
+        if name.startswith("setup-save-") and event.state is WorkerState.SUCCESS:
+            role = name[len("setup-save-"):]
+            ok, note = event.worker.result or (False, "save failed")
+            if not ok:
+                note = friendly_provider_error(note)
+                self._set_status(f"[red]{role} rejected:[/red] {note}")
+                return
+            self._set_status(f"[green]saved {role}.[/green]")
+            self._refresh_summary()
+            self._notify_saved()
+            return
         if event.state is not WorkerState.SUCCESS:
             return
-        name = event.worker.name or ""
         if not name.startswith("setup-models-"):
             return
         # Name format: setup-models-{role}::{provider} — ignore stale completes.
@@ -283,8 +294,24 @@ class SetupScreen(ModalScreen):
             return
         provider = str(self.query_one(f"#{role}-provider", Select).value)
         model = self.query_one(f"#{role}-model", Input).value
-        thinking = self.query_one(f"#{role}-thinking", Checkbox).value
-        self.save_role(role, provider, model, bool(thinking))
+        thinking = bool(self.query_one(f"#{role}-thinking", Checkbox).value)
+        # Live validate+persist off the UI thread (setup screen Save button).
+        self._set_status(f"[dim]validating {role}…[/dim]")
+        validate_fn = self._validate_fn
+
+        def work():
+            return _call_persist_role(
+                role, provider, model, thinking, validate_fn=validate_fn
+            )
+
+        self.run_worker(
+            work,
+            thread=True,
+            name=f"setup-save-{role}",
+            group=f"setup-save-{role}",
+            exclusive=True,
+            exit_on_error=False,
+        )
 
     def _repopulate_model_list(self, role: str, provider: str) -> None:
         try:

@@ -7,6 +7,7 @@ from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static
+from textual.worker import Worker, WorkerState
 
 from .theme import C_DIM
 
@@ -157,14 +158,18 @@ class TextEntryDialog(ModalScreen):
     """A single-field entry dialog -- masked (``password=True``) for a key, plain
     for a manual model slug. ``on_submit(value) -> (ok, note)``; the dialog stays
     open (showing the note) on failure, dismisses on success. The value is read
-    ONLY from this dialog's own field -- never from the chat prompt."""
+    ONLY from this dialog's own field -- never from the chat prompt.
+
+    When ``async_submit=True``, validation/persist runs off the UI thread so a live
+    network probe cannot freeze Textual.
+    """
 
     BINDINGS = [("escape", "close", "Close")]
     CSS = _DIALOG_CSS
 
     def __init__(
         self, *, title: str, label: str, on_submit, password: bool = False,
-        placeholder: str = "",
+        placeholder: str = "", async_submit: bool = False,
     ) -> None:
         super().__init__()
         self._title = title
@@ -172,6 +177,8 @@ class TextEntryDialog(ModalScreen):
         self._on_submit = on_submit
         self._password = password
         self._placeholder = placeholder
+        self._async_submit = async_submit
+        self._submitting = False
         self.status_text = ""
 
     def compose(self) -> ComposeResult:
@@ -188,13 +195,39 @@ class TextEntryDialog(ModalScreen):
 
     def submit(self) -> bool:
         """Read THIS dialog's field and hand it to ``on_submit``. Returns saved?."""
+        if self._submitting:
+            return False
         value = self.query_one("#entry-input", Input).value
+        if self._async_submit:
+            self._submitting = True
+            self._set_status("[dim]validating…[/dim]")
+            def work():
+                return self._on_submit(value)
+            self.run_worker(
+                work, thread=True, name="text-entry-submit",
+                group="text-entry-submit", exclusive=True, exit_on_error=False,
+            )
+            return False
         ok, note = self._on_submit(value)
         if ok:
             self.dismiss()
             return True
         self._set_status(f"[red]{note}[/red]")
         return False
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        if (event.worker.name or "") != "text-entry-submit":
+            return
+        if event.state is WorkerState.SUCCESS:
+            ok, note = event.worker.result or (False, "validation failed")
+            self._submitting = False
+            if ok:
+                self.dismiss()
+            else:
+                self._set_status(f"[red]{note}[/red]")
+        elif event.state in (WorkerState.ERROR, WorkerState.CANCELLED):
+            self._submitting = False
+            self._set_status("[red]validation failed[/red]")
 
     def _set_status(self, message: str) -> None:
         self.status_text = message

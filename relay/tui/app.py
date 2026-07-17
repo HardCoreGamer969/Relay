@@ -692,6 +692,12 @@ class RelayTuiApp(App):
             self._write_conversation("")  # a blank line between runs
         self._write_conversation(f"you (goal): {goal}")
         self._router.begin_run()
+        # Attach the session ModelRouter so planning/execution honor call-class.
+        # Skip when tests inject a fake client (vendor/* models must stay unbound).
+        if self._client is None and self._run_kwargs.get("model_router") is None:
+            router = self._ensure_model_router()
+            if router is not None:
+                self._run_kwargs["model_router"] = router
         # Thread the SESSION-sticky working dir + the session transcript/memory, so a
         # working dir established earlier persists AND a later steer/queue continuation
         # keeps the same conversation + learnings.
@@ -1803,16 +1809,22 @@ class RelayTuiApp(App):
             )
         else:
             # manual aggregator: a slug field validated live before saving.
+            # Off-thread only for the real network validator — injected test
+            # seams stay sync so headless pilots can assert on submit().
             def on_submit(slug, r=role, p=provider):
                 ok, note = self._save_role_model(r, p, slug)
                 after_save(ok)
                 return ok, note
 
+            use_async = self._validate_fn is None or (
+                self._validate_fn is provider_validate_model
+            )
             self.push_screen(TextEntryDialog(
                 title=f"{role} model ({provider})",
                 label="Type a model slug (validated live before saving):",
                 password=False, placeholder="e.g. openai/gpt-4o",
                 on_submit=on_submit,
+                async_submit=use_async,
             ))
 
     def _fetch_models_for_pick(self) -> list[str]:

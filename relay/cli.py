@@ -612,6 +612,7 @@ def _run_planned(goal, root, cfg, ledger, auto_approve, approver, confirm_plan, 
             max_rounds=1 if confirm_plan else DEFAULT_MAX_ROUNDS,
             on_event=_on_conv_event, transcript=transcript, envelope=env,
             memory=memory,
+            model_router=model_router,
         )
     except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly message
         _print_run_error(exc)

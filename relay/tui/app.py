@@ -99,7 +99,7 @@ from .commands import (
     filter_commands,
     visible_commands,
 )
-from .dialogs import SegmentedControl, SelectDialog, TextEntryDialog
+from .dialogs import ApproveDialog, SegmentedControl, SelectDialog, TextEntryDialog
 from .events import (
     describe_event_for_activity,
     format_turn,
@@ -123,7 +123,11 @@ from .status import (
 from .stream import (
     STREAM_BUFFER_MAX,
     STREAM_MAX_LINES,
+    find_in_lines,
+    render_conversation_body,
+    render_observation,
     stream_should_follow,
+    tool_summary_line,
     trim_deque_list,
     trim_stream_children,
 )
@@ -345,22 +349,61 @@ class RelayTuiApp(App):
         self._plan_pinned_full = False      # user explicitly chose /plan full
         self._cost_warn_level = "normal"    # escalates with envelope thresholds
         self._model_router = None
+        self._session_approvals: set[str] = set()  # U4 session allowlist
+        self._tool_folds: dict[int, dict] = {}     # id -> {label, result, expanded}
+        self._tool_fold_seq = 0
+        self._route_pulse = False
+        self._find_query = ""
         # The rendered stream rows (Rich Text / str), in order -- the headless mirror
         # of what the single stream shows (so tests can pin speaker/finding styling
         # without depending on Textual widget internals). The live plan lives in the
         # plan dock (U2), not in the stream mirror.
         self._stream_rendered: list = []
+        self._stream_plain: list[str] = []  # plain text for /find (U6)
         self._spin_frame = 0                # active-step spinner frame
         self._spin_timer = None             # active while a step is executing
         self._led_on = True                 # the mode LED's breathing phase
         self._led_timer = None
+        self._load_tui_prefs()
 
     # -- layout ---------------------------------------------------------------
+
+    def _load_tui_prefs(self) -> None:
+        """Apply durable ``tui.*`` prefs from config.json (U6)."""
+        try:
+            from relay.store import load_config
+
+            cfg = load_config() or {}
+            tui = cfg.get("tui") or {}
+            anim = tui.get("animations")
+            if anim is False or str(anim).lower() in ("0", "false", "off"):
+                self._anim_mode = "off"
+            plan = tui.get("plan_dock")
+            if isinstance(plan, str) and plan.strip().lower() in PLAN_MODES:
+                self._plan_mode = plan.strip().lower()
+                self._plan_pinned_full = self._plan_mode == "full"
+        except Exception:  # noqa: BLE001 -- prefs must never block launch
+            pass
+
+    def _save_tui_prefs(self) -> None:
+        """Persist animations + plan dock mode into config.json."""
+        try:
+            from relay.config import default_config
+            from relay.store import CONFIG_VERSION, load_config, save_config
+
+            config = load_config() or default_config()
+            config.setdefault("version", CONFIG_VERSION)
+            tui = config.setdefault("tui", {})
+            tui["animations"] = self._anim_mode != "off"
+            tui["plan_dock"] = self._plan_mode
+            save_config(config)
+        except Exception as exc:  # noqa: BLE001
+            self._write_activity(f"(could not save tui prefs: {exc.__class__.__name__})", dim=True)
 
     def compose(self) -> ComposeResult:
         with Container(id="welcome"):
             with Vertical(id="welcome-inner"):
-                yield Static(RELAY_WORDMARK, id="brand")
+                yield Static(self._welcome_brand(), id="brand")
                 yield Static(self._greeting, id="greeting")
                 yield Static(self._indicator_text, id="indicator")
                 yield Static("esc to cancel  ·  ctrl+q to quit", id="hint")
@@ -372,6 +415,10 @@ class RelayTuiApp(App):
                 yield VerticalScroll(id="stream")
         yield Static(id="command-popover")
         yield PromptInput(id="prompt", placeholder=self._placeholder)
+
+    def _welcome_brand(self) -> str:
+        """Welcome hero wordmark; SVG mark is packaged under relay/assets/ (U6)."""
+        return RELAY_WORDMARK
 
     def on_mount(self) -> None:
         # The model indicator is visible from launch, BEFORE the first message
@@ -731,21 +778,62 @@ class RelayTuiApp(App):
         )
 
     def _handle_request(self, request: UiRequest) -> None:
-        """A blocking ask arrived: show it, point the input box at it."""
+        """A blocking ask arrived: show it, point the input box at it.
+
+        Approvals open a dedicated modal (U4) instead of y/n in the goal box.
+        """
         self._router.on_request(request)
         self._sync_transcript()
-        # A REACTION ask is the proposal: its full numbered plan is NOT dumped into
-        # the conversation -- the stream keeps the human story (the headline turn +
-        # the surfaced assumptions, from the plan_proposed event via
-        # _render_plan_split_buffer) while the numbered steps render as the inline
-        # live PLAN block. Other asks (decision/approval) still surface their prompt
-        # when it adds detail beyond the last transcript turn (e.g. the approval command).
+        if request.kind == REQUEST_APPROVAL:
+            self._open_approve_modal(request)
+            self._update_status()
+            return
         if request.kind != REQUEST_REACTION:
             last_turn_text = self._last_synced_turn_text()
             if request.prompt.strip() != (last_turn_text or "").strip():
                 for line in present_prompt(request.prompt).splitlines():
-                    self._write_conversation(f"brain: {line}" if line.strip() else "")
+                    self._write_conversation(
+                        f"brain: {line}" if line.strip() else "",
+                        speaker="brain" if line.strip() else None,
+                    )
         self._update_status()
+
+    def _open_approve_modal(self, request: UiRequest) -> None:
+        """Parse command/reason from the approval prompt and open ApproveDialog."""
+        prompt = request.prompt or ""
+        command = ""
+        reason = ""
+        for line in prompt.splitlines():
+            s = line.strip()
+            if s.startswith("Why gated:"):
+                reason = s[len("Why gated:"):].strip()
+            elif s and not s.startswith("The executor") and not s.startswith("Approve?"):
+                if not command and not s.startswith("Why"):
+                    command = s
+        # Session allowlist short-circuit.
+        if command and command in self._session_approvals:
+            request.deliver("yes")
+            self._write_activity(f"[approve] session-allow · {command[:80]}", dim=True)
+            return
+
+        def on_decision(action: str, req=request, cmd=command) -> None:
+            if action == "deny":
+                req.deliver("no")
+                self._write_conversation("you (approval): no", speaker="user")
+            else:
+                if action == "session" and cmd:
+                    self._session_approvals.add(cmd)
+                req.deliver("yes")
+                self._write_conversation(
+                    f"you (approval): yes ({action})", speaker="user",
+                )
+            self._update_status()
+
+        self.push_screen(ApproveDialog(
+            command=command or prompt[:200],
+            reason=reason or "CONFIRM",
+            on_decision=on_decision,
+        ))
 
     def _handle_event(self, event: Event) -> None:
         """One engine event: phase changes steer the router; everything else renders
@@ -756,12 +844,42 @@ class RelayTuiApp(App):
         the render path makes no model call (proven by the zero-new-tokens guard).
         """
         if event.kind == EVENT_PHASE:
-            # Internal routing only -- not surfaced as a stream line.
             self._router.set_phase(event.payload.get("phase", ""))
+            self._pulse_route_if_anim()  # phase change = instrument tick when anim on
+        elif event.kind == "route_change":
+            self._on_route_change(event)
         else:
             self._render_event(event)
         self._sync_transcript()
-        self._refresh_cost()  # live per-goal cost off the run's ledger (no model call)
+        self._refresh_cost()
+        self._update_status()
+
+    def _on_route_change(self, event: Event) -> None:
+        """U5: brief route chip pulse + activity note (zero tokens)."""
+        payload = event.payload or {}
+        name = payload.get("route") or payload.get("name") or "?"
+        self._write_activity(f"[route] → {name}", dim=True)
+        router = self._ensure_model_router()
+        if router is not None and payload.get("route"):
+            try:
+                from relay.router import get_route, builtin_contract
+                # Best-effort: refresh contract name display via router if API allows.
+                _ = get_route(str(payload.get("route")))
+            except Exception:  # noqa: BLE001
+                pass
+        self._pulse_route_if_anim()
+
+    def _pulse_route_if_anim(self) -> None:
+        if self._anim_mode == "off":
+            return
+        self._route_pulse = True
+        try:
+            self.set_timer(0.35, self._end_route_pulse)
+        except Exception:  # noqa: BLE001
+            self._route_pulse = False
+
+    def _end_route_pulse(self) -> None:
+        self._route_pulse = False
         self._update_status()
 
     # Event kinds that get a BESPOKE inline form in the stream (the live plan, tool
@@ -1007,18 +1125,31 @@ class RelayTuiApp(App):
         except Exception:  # noqa: BLE001 -- teardown race; the buffer already has it
             pass
 
-    def _push_row(self, renderable, *, classes: str = "stream-row") -> None:
+    def _push_row(self, renderable, *, classes: str = "stream-row", plain: str | None = None) -> None:
         """Record a stream row (the headless mirror) and mount it into the stream."""
         self._stream_rendered.append(renderable)
         trim_deque_list(self._stream_rendered, STREAM_MAX_LINES)
+        plain_text = plain
+        if plain_text is None:
+            plain_text = renderable.plain if hasattr(renderable, "plain") else str(renderable)
+        self._stream_plain.append(plain_text)
+        trim_deque_list(self._stream_plain, STREAM_MAX_LINES)
         self._mount_stream(Static(renderable, classes=classes))
 
     def _row(self, gutter: str, body: str, *, gutter_style: str = "", body_style: str = "") -> None:
         """Build + push one labeled stream row (the mockup's gutter + body line)."""
+        body_renderable = render_conversation_body(body) if gutter == "brain" else body
+        if not isinstance(body_renderable, str):
+            # Markdown / structured: gutter as a prefix line, then the body widget.
+            head = Text()
+            head.append(f"{gutter:<6}" if gutter else " " * 6, style=gutter_style or C_DIM)
+            self._push_row(head, plain=f"{gutter} {body}")
+            self._push_row(body_renderable, plain=body)
+            return
         text = Text()
         text.append(f"{gutter:<6}" if gutter else " " * 6, style=gutter_style or C_DIM)
-        text.append(body, style=body_style or C_TXT)
-        self._push_row(text)
+        text.append(body_renderable, style=body_style or C_TXT)
+        self._push_row(text, plain=f"{gutter} {body}".strip())
 
     def _record_activity(self, actor: str | None, line: str) -> None:
         """Append to the activity BUFFER only (the test/debug record) -- no stream row.
@@ -1063,13 +1194,33 @@ class RelayTuiApp(App):
     # -- the inline forms: tool calls, findings, verdicts (hands acting) --------
 
     def _stream_tool(self, label: str, result: str = "") -> None:
-        """A compact tool-call stream line: ``▸ read cli.py · 78 lines``."""
-        text = Text()
-        text.append("  ▸ ", style=W_TEXT_DIM)
-        text.append(label, style=C_MUTED)
-        if result:
-            text.append(f"  · {result[:60]}", style=C_DIM)
-        self._push_row(text)
+        """A compact tool-call stream line; long bodies fold by default (U3)."""
+        fold_id = self._tool_fold_seq
+        self._tool_fold_seq += 1
+        expanded = False
+        self._tool_folds[fold_id] = {
+            "label": label, "result": result, "expanded": expanded,
+        }
+        text = tool_summary_line(label, result, folded=bool(result) and len(result) > 60)
+        obs = render_observation(result, expanded=False) if result else None
+        self._push_row(text, plain=f"{label} {result}", classes=f"stream-row tool-{fold_id}")
+        if obs is not None and not isinstance(obs, str):
+            # Diff-shaped: show a folded syntax preview beneath the summary.
+            self._push_row(obs, plain=result[:200], classes=f"stream-row tool-body-{fold_id}")
+
+    def _toggle_tool_fold(self, fold_id: int) -> None:
+        """Expand/collapse a folded tool observation (click or /expand)."""
+        meta = self._tool_folds.get(fold_id)
+        if not meta:
+            return
+        meta["expanded"] = not meta["expanded"]
+        self._write_activity(
+            f"[tool] {'expanded' if meta['expanded'] else 'folded'} · {meta['label']}",
+            dim=True,
+        )
+        if meta["expanded"] and meta.get("result"):
+            body = render_observation(meta["result"], expanded=True)
+            self._push_row(body, plain=meta["result"])
 
     def _stream_finding(self, note: str) -> None:
         """A finding (v0.0.29 hands->brain channel) renders as a distinct GREEN line."""
@@ -1178,6 +1329,7 @@ class RelayTuiApp(App):
         self._plan_render()
         self._update_status()
         self._write_activity(f"[plan] dock mode = {mode}")
+        self._save_tui_prefs()
 
     def _cmd_plan(self, arg: str = "") -> None:
         """Set plan dock mode: ``/plan full|active|hidden``."""
@@ -1203,6 +1355,7 @@ class RelayTuiApp(App):
                     pass
                 self._led_timer = None
             self._write_activity("[anim] off — instant updates only")
+            self._save_tui_prefs()
         elif raw in ("on", "1", "true", "short"):
             self._anim_mode = "short"
             if self._led_timer is None:
@@ -1211,9 +1364,42 @@ class RelayTuiApp(App):
                 except Exception:  # noqa: BLE001
                     self._led_timer = None
             self._write_activity("[anim] on")
+            self._save_tui_prefs()
         else:
             self._write_activity(f"[anim] mode={self._anim_mode} — /anim on|off")
         self._update_status()
+
+    def _cmd_find(self, arg: str = "") -> None:
+        """Search stream scrollback for ``query`` (U6)."""
+        query = (arg or "").strip()
+        if not query:
+            self._write_activity("[find] usage: /find <text>")
+            return
+        self._find_query = query
+        hits = find_in_lines(self._stream_plain, query)
+        if not hits:
+            # Also search conversation/activity buffers ( /log sources ).
+            hits_buf = find_in_lines(self._conversation_lines + self._activity_lines, query)
+            if not hits_buf:
+                self._write_activity(f"[find] no matches for '{query}'")
+                return
+            self._write_activity(
+                f"[find] {len(hits_buf)} match(es) in buffers · "
+                f"first: { (self._conversation_lines + self._activity_lines)[hits_buf[0]][:80] }"
+            )
+            return
+        first = hits[0]
+        self._write_activity(
+            f"[find] {len(hits)} match(es) · first#{first}: {self._stream_plain[first][:80]}"
+        )
+        stream = self._stream()
+        if stream is not None:
+            try:
+                children = list(stream.children)
+                if 0 <= first < len(children):
+                    stream.scroll_to_widget(children[first], animate=self._anim_mode != "off")
+            except Exception:  # noqa: BLE001
+                pass
 
     def _reset_plan(self) -> None:
         """Drop the live-plan state (a new goal starts a fresh plan; prior plans stay
@@ -1341,7 +1527,7 @@ class RelayTuiApp(App):
         for seg, style in (
             (snap.step, W_TEXT),
             (snap.cost, self._cost_style(snap.cost_level)),
-            (snap.route, C_DIM),
+            (snap.route, f"bold {W_RED}" if self._route_pulse else C_DIM),
             (snap.context, C_DIM),
             (snap.cwd, W_TEXT_DIM),
             (snap.models, C_DIM),
@@ -2172,6 +2358,7 @@ class RelayTuiApp(App):
         self._conversation_lines = []
         self._activity_lines = []
         self._stream_rendered = []
+        self._stream_plain = []
         # Wipe the single stream (history rows + the live plan block) and its plan state.
         self._reset_plan()
         stream = self._stream()

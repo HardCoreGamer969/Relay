@@ -14,7 +14,7 @@ from .commands import (
     filter_commands,
     visible_commands,
 )
-from .dialogs import FilterInput, SegmentRow, SegmentedControl, SelectDialog, TextEntryDialog, _DIALOG_CSS
+from .dialogs import FilterInput, SegmentRow, SegmentedControl, SelectDialog, TextEntryDialog, ApproveDialog, _DIALOG_CSS
 from .events import (
     describe_event_for_activity,
     format_turn,
@@ -78,6 +78,7 @@ __all__ = [
     "Command",
     "SelectDialog",
     "TextEntryDialog",
+    "ApproveDialog",
     "SegmentedControl",
     "SetupScreen",
     "setup_summary",

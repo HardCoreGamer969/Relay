@@ -84,11 +84,11 @@ Narrow terminals: plan dock collapses to `active` mode automatically
 |-------|------|-----|--------|-------|
 | U0 | Package split | [U0-package-split.md](U0-package-split.md) | shipped | REVAMP T1; no visual change |
 | U1 | Foundation | [U1-foundation.md](U1-foundation.md) | shipped | Off-thread I/O, capped stream, slash args |
-| U2 | Cockpit chrome | [U2-cockpit.md](U2-cockpit.md) | planned | Status rail + plan dock + gauges |
-| U3 | Rich stream | [U3-rich-stream.md](U3-rich-stream.md) | planned | Markdown, diffs, folds |
-| U4 | Interaction | [U4-interaction.md](U4-interaction.md) | planned | Composer, approve modal, resume |
-| U5 | Motion system | [U5-motion.md](U5-motion.md) | planned | Instrument motions + kill switch |
-| U6 | Polish | [U6-polish.md](U6-polish.md) | planned | Theme polish, `/find`, logo welcome |
+| U2 | Cockpit chrome | [U2-cockpit.md](U2-cockpit.md) | shipped | Status rail + plan dock + gauges |
+| U3 | Rich stream | [U3-rich-stream.md](U3-rich-stream.md) | shipped | Markdown, diffs, folds |
+| U4 | Interaction | [U4-interaction.md](U4-interaction.md) | shipped | Composer, approve modal; resume thin |
+| U5 | Motion system | [U5-motion.md](U5-motion.md) | shipped | Instrument motions + kill switch |
+| U6 | Polish | [U6-polish.md](U6-polish.md) | shipped | Theme, `/find`, logo assets, prefs |
 
 ```text
 U0 split ──► U1 foundation ──► U2 cockpit ──► U3 rich stream

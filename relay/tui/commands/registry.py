@@ -116,6 +116,8 @@ COMMANDS: list[Command] = [
             run=lambda app, arg="": app._cmd_plan(arg), accepts_args=True),
     Command("anim", "Animations", "Motion kill switch: /anim on|off", "ops",
             run=lambda app, arg="": app._cmd_anim(arg), accepts_args=True),
+    Command("find", "Find", "Search stream scrollback: /find <text>", "ops",
+            run=lambda app, arg="": app._cmd_find(arg), accepts_args=True),
     Command("memory", "Memory", "List / pin / forget durable shared findings", "ops",
             run=lambda app, arg="": app._cmd_memory()),
     Command("log", "Log", "Export a debug log (.md) to share when reporting an issue", "ops",

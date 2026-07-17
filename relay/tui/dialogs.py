@@ -337,3 +337,67 @@ class SegmentedControl(ModalScreen):
     def action_close(self) -> None:
         self.dismiss()
 
+
+class ApproveDialog(ModalScreen):
+    """Dedicated approval modal (U4): command + reason + once / session / deny.
+
+    Settles via ``on_decision(action)`` where action is ``once`` | ``session`` | ``deny``.
+    """
+
+    BINDINGS = [
+        ("escape", "deny", "Deny"),
+        ("1", "once", "Once"),
+        ("2", "session", "Session"),
+        ("3", "deny", "Deny"),
+        ("y", "once", "Once"),
+        ("n", "deny", "Deny"),
+    ]
+    CSS = _DIALOG_CSS + """
+    #approve-cmd { margin: 1 0; color: #f0f0f0; }
+    #approve-reason { color: #888888; }
+    #approve-diff { margin-top: 1; max-height: 12; }
+    """
+
+    def __init__(
+        self,
+        *,
+        command: str,
+        reason: str,
+        on_decision=None,
+        diff: str = "",
+    ) -> None:
+        super().__init__()
+        self._command = command or ""
+        self._reason = reason or ""
+        self._diff = diff or ""
+        self._on_decision = on_decision
+        self.decision: str | None = None
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="dialog-box"):
+            yield Static("Approve gated command", id="dialog-title")
+            yield Static(self._command, id="approve-cmd")
+            yield Static(f"Why: {self._reason}" if self._reason else "", id="approve-reason")
+            if self._diff:
+                yield Static(self._diff[:2000], id="approve-diff")
+            yield Static(
+                "[1] once   [2] session allow   [3] deny   ·  esc deny",
+                id="dialog-hint",
+            )
+
+    def _finish(self, action: str) -> None:
+        self.decision = action
+        cb = self._on_decision
+        self.dismiss(action)
+        if cb is not None:
+            cb(action)
+
+    def action_once(self) -> None:
+        self._finish("once")
+
+    def action_session(self) -> None:
+        self._finish("session")
+
+    def action_deny(self) -> None:
+        self._finish("deny")
+

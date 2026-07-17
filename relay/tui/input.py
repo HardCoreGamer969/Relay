@@ -46,6 +46,12 @@ class PromptInput(Input):
             return
         # Otherwise up/down are the ONE unified recall-and-edit affordance: walk the
         # input history (goals, steers, queued items) into the field for editing.
+        # Shift+Enter inserts a newline (U4 multi-line composer) without submitting.
+        if event.key == "shift+enter":
+            self.insert_text_at_cursor("\n")
+            event.prevent_default()
+            event.stop()
+            return
         if event.key == "up":
             recalled = app._recall_older()
             if recalled is not None:

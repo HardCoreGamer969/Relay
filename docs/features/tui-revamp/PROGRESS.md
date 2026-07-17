@@ -22,6 +22,37 @@ Append-only. One section per stage after the review gate passes.
 
 ## Log
 
+### U3–U6 — Rich stream through polish (2026-07-17)
+
+- Status: shipped (batched)
+- Commit: (pending)
+- Tests: 946 passed; `tests/test_tui_rich_polish.py`
+- Review: pass-with-notes
+- Shipped:
+  - **U3:** Markdown brain bodies; diff Syntax for observations; tool fold markers `[+]`
+  - **U4:** Shift+Enter newlines; `ApproveDialog` (once/session/deny); session allowlist
+  - **U5:** `/anim on|off` + `RELAY_TUI_ANIM`; route pulse on `route_change`/phase; kill stops LED
+  - **U6:** `relay/assets/logo*.svg`; website palette chrome; `tui.animations` / `tui.plan_dock` prefs; `/find`
+- Deferred / blockers:
+  - Full RunState session resume — `/runs` still list-only (PROGRESS note)
+  - True SVG raster in-terminal — wordmark fallback; assets packaged
+  - Click-to-expand tool folds (summary + `/find` path shipped; click widget later)
+- Next: maintenance / product features as needed
+
+### U2 — Cockpit chrome (2026-07-17)
+
+- Status: shipped
+- Commit: (pending)
+- Tests: `tests/test_tui_cockpit.py` + full TUI suite
+- Review: pass-with-notes
+- Shipped:
+  - Status rail: phase · step(+instr) · first-class cost (/remaining) · always-on `route=` · ctx window
+  - Plan dock (`#plan-dock`) with `/plan full|active|hidden` + narrow coerce; stream gets compact commit line
+  - Website palette remap (brain=red, hands=dim); chrome CSS tokens
+  - Envelope warn escalates cost slot; `/anim` surface early for U5
+- Deferred: Markdown/diffs (U3), approve modal (U4), logo SVG render (U6)
+- Next unlocks: U3 rich stream
+
 ### U1 — Foundation (2026-07-17)
 
 - Status: shipped

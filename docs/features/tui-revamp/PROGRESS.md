@@ -25,7 +25,7 @@ Append-only. One section per stage after the review gate passes.
 ### U1 — Foundation (2026-07-17)
 
 - Status: shipped
-- Commit: (pending)
+- Commit: 1d74117
 - Tests: full suite 928 passed; new `tests/test_tui_foundation.py`
 - Review: pass-with-notes
 - Shipped:

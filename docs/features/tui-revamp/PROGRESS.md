@@ -25,7 +25,7 @@ Append-only. One section per stage after the review gate passes.
 ### U3–U6 — Rich stream through polish (2026-07-17)
 
 - Status: shipped (batched)
-- Commit: (pending)
+- Commit: 0716679
 - Tests: 946 passed; `tests/test_tui_rich_polish.py`
 - Review: pass-with-notes
 - Shipped:
@@ -42,7 +42,7 @@ Append-only. One section per stage after the review gate passes.
 ### U2 — Cockpit chrome (2026-07-17)
 
 - Status: shipped
-- Commit: (pending)
+- Commit: 0716679
 - Tests: `tests/test_tui_cockpit.py` + full TUI suite
 - Review: pass-with-notes
 - Shipped:

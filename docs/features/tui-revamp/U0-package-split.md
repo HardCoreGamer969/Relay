@@ -1,5 +1,7 @@
 # U0 — Package Split
 
+**Shipped:** features-revamp (`relay/tui/` package + `relay/doctor.py`)
+
 **Stage:** U0 · **Status:** [MASTER](MASTER.md) only  
 **Maps to:** REVAMP Stage T1  
 **Depends on:** nothing (enabler)

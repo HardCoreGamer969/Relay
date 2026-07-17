@@ -22,6 +22,21 @@ Append-only. One section per stage after the review gate passes.
 
 ## Log
 
+### U0 — Package split (2026-07-17)
+
+- Status: shipped
+- Tests: full suite + 164 TUI/CLI/doctor-related
+- Review: pass-with-notes
+- Shipped:
+  - `relay/tui/` package: theme, events, dialogs, setup, input, commands/registry
+  - `relay/doctor.py` extracted; CLI/TUI no longer share via private cli imports
+  - Public `relay.tui` re-exports unchanged for tests
+  - Website brand token stubs in `theme.py` (unused visually)
+- Deferred / v1 cuts:
+  - Stream/status/controller method bodies still on `RelayTuiApp` (U2)
+  - `persist_role` in `setup.py` not yet `config.py`
+- Next unlocks: U1 foundation
+
 ### Planning lock (2026-07-16)
 
 - Status: designing → planned stages

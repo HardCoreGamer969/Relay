@@ -36,11 +36,14 @@ relay/tui/
 
 ## Acceptance
 
-- [ ] `from relay.tui import RelayTuiApp` still works
-- [ ] All existing `tests/test_tui*.py` green with import-path updates only
-- [ ] No intentional rendered-output diffs (mirror buffers assertable)
-- [ ] `bridge.py` untouched
+- [x] `from relay.tui import RelayTuiApp` still works
+- [x] All existing `tests/test_tui*.py` green with import-path updates only
+- [x] No intentional rendered-output diffs (mirror buffers assertable)
+- [x] `bridge.py` untouched
 
 ## v1 cuts
 
 - No visual redesign in U0 (theme file may define website tokens unused yet)
+- Stream / status / controller **methods** remain on `RelayTuiApp` (stub modules
+  document deferral to U2); widgets + pure helpers are extracted.
+- `persist_role` lives in `setup.py` (not yet `config.py`)

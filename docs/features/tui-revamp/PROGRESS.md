@@ -22,6 +22,24 @@ Append-only. One section per stage after the review gate passes.
 
 ## Log
 
+### U1 — Foundation (2026-07-17)
+
+- Status: shipped
+- Commit: (pending)
+- Tests: full suite 928 passed; new `tests/test_tui_foundation.py`
+- Review: pass-with-notes
+- Shipped:
+  - Setup `compose()` starts with empty model Selects; lists load via thread workers
+  - `/model` list-provider fetch + `/doctor` probes off UI thread (`run_worker`)
+  - Stream/mirrors capped (`STREAM_MAX_LINES` / `STREAM_BUFFER_MAX`); scroll-pin
+  - `_marshal` logs + activity note on failure; `Transcript.snapshot_turns` + lock
+  - `Command.accepts_args` unified dispatch (`/model`, `/queue`, `/cwd`, …)
+  - Structured conversation speaker + exact verdict match
+- Deferred / v1 cuts:
+  - RichLog / full render-model → U3/U6
+  - Sync `persist_role` validate on Enter (dialog contract)
+- Next unlocks: U2 cockpit chrome
+
 ### U0 — Package split (2026-07-17)
 
 - Status: shipped

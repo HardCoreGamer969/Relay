@@ -8,6 +8,7 @@ from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static
+from textual.worker import Worker, WorkerState
 
 from relay.config import ROLES, ModelConfig, default_config, describe_resolution
 from relay.providers import (
@@ -90,6 +91,9 @@ class SetupScreen(ModalScreen):
     config.json for selections). Network-touching work (model listing, slug
     validation) is behind injectable seams so the screen is headless-testable and
     never hits the network in tests. Real unicode; consistent cyberpunk aesthetic.
+
+    U1: ``compose()`` never calls the network -- model lists load via a thread
+    worker after mount (and again when the provider Select changes).
     """
 
     BINDINGS = [("escape", "close", "Close setup")]
@@ -146,10 +150,9 @@ class SetupScreen(ModalScreen):
                              allow_blank=False, value=provider)
                 yield Input(value=self._models.for_role(role),
                             placeholder="model id / slug", id=f"{role}-model")
-                # For a list provider, a selectable list of live ids (fills the
-                # input on pick). For a manual provider it simply stays empty.
-                yield Select(self._model_options(role, provider), id=f"{role}-model-list",
-                             allow_blank=True)
+                # Empty at compose time -- populated off-thread in on_mount /
+                # provider-change (U1: no live HTTP on the UI thread during compose).
+                yield Select([], id=f"{role}-model-list", allow_blank=True)
                 yield Checkbox("thinking", value=self._models.thinking_for_role(role),
                                id=f"{role}-thinking")
                 yield Button(f"Save {role}", id=f"save-{role}")
@@ -157,6 +160,21 @@ class SetupScreen(ModalScreen):
             yield Static("", id="setup-status")
             yield Static("openrouter: type any slug  ·  deepseek: pick from the list  ·  esc to close",
                          id="setup-hint")
+
+    def on_mount(self) -> None:
+        for role in ROLES:
+            self._start_fetch_models(role, self._models.provider_for_role(role))
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        """Apply off-thread model-list results onto the Select widgets."""
+        if event.state is not WorkerState.SUCCESS:
+            return
+        name = event.worker.name or ""
+        if not name.startswith("setup-models-"):
+            return
+        role = name[len("setup-models-"):]
+        ids = list(event.worker.result or [])
+        self._apply_model_options(role, ids)
 
     # -- seams + helpers (testable) ------------------------------------------
 
@@ -176,6 +194,27 @@ class SetupScreen(ModalScreen):
             return list(self._list_models_fn(provider))
         except Exception:  # noqa: BLE001 -- no key/network: just an empty list
             return []
+
+    def _start_fetch_models(self, role: str, provider: str) -> None:
+        """Kick a named thread worker so results can be routed per role."""
+        def fetch() -> list[str]:
+            return self.models_for(provider)
+
+        self.run_worker(
+            fetch,
+            thread=True,
+            name=f"setup-models-{role}",
+            group="setup-models",
+            exclusive=False,
+            exit_on_error=False,
+        )
+
+    def _apply_model_options(self, role: str, ids: list[str]) -> None:
+        try:
+            select = self.query_one(f"#{role}-model-list", Select)
+        except Exception:  # noqa: BLE001 -- not mounted / torn down
+            return
+        select.set_options([(mid, mid) for mid in ids])
 
     def save_key(self, provider: str, key: str) -> bool:
         """Store a key (masked-entered) to auth.json 0o600. Returns saved?."""
@@ -238,7 +277,8 @@ class SetupScreen(ModalScreen):
             select = self.query_one(f"#{role}-model-list", Select)
         except Exception:  # noqa: BLE001 -- not mounted yet
             return
-        select.set_options(self._model_options(role, provider))
+        select.set_options([])  # clear immediately; refill off-thread
+        self._start_fetch_models(role, provider)
 
     def _refresh_summary(self) -> None:
         try:
@@ -259,4 +299,3 @@ class SetupScreen(ModalScreen):
 
     def action_close(self) -> None:
         self.dismiss()
-

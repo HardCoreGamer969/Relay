@@ -38,6 +38,7 @@ experience-level projection slots in there without a refactor.
 from __future__ import annotations
 
 import asyncio
+import logging
 import platform
 import random
 from datetime import datetime
@@ -47,6 +48,9 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Container, Vertical, VerticalScroll
 from textual.widgets import Input, Static
+from textual.worker import Worker, WorkerState
+
+_LOG = logging.getLogger("relay.tui")
 
 from relay.bridge import (
     ACTION_ANSWER,
@@ -91,6 +95,7 @@ from .commands import (
     Command,
     _parse_inline_command,
     _run_active,
+    command_by_name,
     filter_commands,
     visible_commands,
 )
@@ -104,6 +109,13 @@ from .events import (
 )
 from .input import PromptInput
 from .setup import SetupScreen, _call_persist_role, _call_secrets_set_key
+from .stream import (
+    STREAM_BUFFER_MAX,
+    STREAM_MAX_LINES,
+    stream_should_follow,
+    trim_deque_list,
+    trim_stream_children,
+)
 from .theme import (
     ACTOR_BRAIN,
     ACTOR_HANDS,
@@ -134,12 +146,12 @@ from .theme import (
     placeholder_for_state,
 )
 
-# How often the conversation pane catches up with the (append-only) transcript.
-_SYNC_INTERVAL_S = 0.2
+# Backup transcript sync (events are the primary path; this catches rare gaps).
+_SYNC_INTERVAL_S = 1.0
 # Bounded wait when joining the worker on quit -- never hang the exit.
 _JOIN_TIMEOUT_S = 5.0
 
-# U0 keeps stream/status/controller methods on RelayTuiApp; extraction is deferred
+# U0/U1 keep stream/status/controller methods on RelayTuiApp; extraction is deferred
 # to U2 to avoid risky mixin surgery during the package split.
 
 class RelayTuiApp(App):
@@ -235,6 +247,7 @@ class RelayTuiApp(App):
         # Slash-command seams (injected by tests; default to the real CLI logic).
         self._doctor_fn = doctor_fn
         self._runs_fn = runs_fn
+        self._pending_model_pick: dict | None = None
         # The slash-command popover state (mirrored for headless tests).
         self._popover_open = False
         self._popover_commands: list[Command] = []
@@ -453,16 +466,18 @@ class RelayTuiApp(App):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "prompt":
             return  # a dialog's own field; its screen handles submit
-        # Inline-arg commands (/queue <input>, /redirect <input>) take precedence over
-        # the popover -- they carry an argument the popover can't. They also work mid-run
-        # (the popover is suppressed while executing, but Enter still routes here).
+        # Unified slash dispatch: any Command with accepts_args + a non-empty arg
+        # runs immediately (same path for /queue, /redirect, /model, /cwd, …).
         inline = _parse_inline_command(event.value)
-        if inline is not None and inline[0] in ("queue", "redirect") and inline[1]:
-            event.input.value = ""
-            self._popover_close()
-            (self._do_queue if inline[0] == "queue" else self._do_redirect)(inline[1])
-            self._update_status()
-            return
+        if inline is not None:
+            name, arg = inline
+            command = command_by_name(name)
+            if command is not None and command.accepts_args and arg:
+                event.input.value = ""
+                self._popover_close()
+                command.run(self, arg)
+                self._update_status()
+                return
         # Enter while the popover is open runs the highlighted command, never a goal.
         if self._popover_open:
             event.input.value = ""
@@ -486,7 +501,7 @@ class RelayTuiApp(App):
             # Answers that become transcript turns render via the sync pass;
             # approval answers never reach the transcript, so echo them here.
             if outcome.kind == REQUEST_APPROVAL:
-                self._write_conversation(f"you (approval): {text}")
+                self._write_conversation(f"you (approval): {text}", speaker="user")
         elif text.strip():
             self._write_activity("(input ignored: the engine is busy)")
         self._update_status()
@@ -639,17 +654,32 @@ class RelayTuiApp(App):
     # -- worker -> UI marshaling (the only crossing) ----------------------------
 
     def _marshal(self, handler):
-        """Wrap a UI handler so bridge callbacks (worker thread) reach it safely."""
+        """Wrap a UI handler so bridge callbacks (worker thread) reach it safely.
+
+        Exceptions are logged and surfaced in the activity feed -- never silently
+        dropped (a silent ``on_finished`` loss used to strand the UI).
+        """
 
         def callback(*args) -> None:
             if self._quitting:
                 return  # shutting down: drop UI updates, let the worker unwind
             try:
                 self.call_from_thread(handler, *args)
-            except Exception:  # noqa: BLE001 -- app torn down mid-callback; drop it
-                pass
+            except Exception as exc:  # noqa: BLE001 -- app torn down OR handler bug
+                _LOG.exception("marshal %s failed: %s", getattr(handler, "__name__", handler), exc)
+                try:
+                    self.call_from_thread(self._note_marshal_error, handler, exc)
+                except Exception:  # noqa: BLE001 -- fully torn down; nothing left to tell
+                    pass
 
         return callback
+
+    def _note_marshal_error(self, handler, exc: BaseException) -> None:
+        name = getattr(handler, "__name__", type(handler).__name__)
+        self._write_activity(
+            f"(ui marshal error in {name}: {exc.__class__.__name__})",
+            dim=True,
+        )
 
     def _handle_request(self, request: UiRequest) -> None:
         """A blocking ask arrived: show it, point the input box at it."""
@@ -747,7 +777,7 @@ class RelayTuiApp(App):
         assumptions = payload.get("assumptions")
         if isinstance(assumptions, list) and assumptions:
             for assumption in assumptions:
-                self._write_conversation(f"brain (assumes): {assumption}")
+                self._write_conversation(f"brain (assumes): {assumption}", speaker="brain")
 
     def _handle_finished(self, outcome: RunOutcome) -> None:
         self._sync_transcript()  # the result turn is in the transcript by now
@@ -864,27 +894,40 @@ class RelayTuiApp(App):
     def _sync_transcript(self) -> None:
         """Append transcript turns not yet rendered (id-deduplicated, in order).
 
-        The transcript is append-only and its turns are frozen, so snapshotting
-        the list from the UI thread while the worker appends is safe; ids (not
-        indices) dedupe so compaction or re-sync can never double-render.
+        Primary delivery is event/request/finished marshals; the slow interval is
+        only a safety net. Reads go through :meth:`Transcript.snapshot_turns` so
+        the UI thread never walks a list the worker is appending to.
         """
         runner = self._runner
         if runner is None:
             return
-        for turn in list(runner.transcript.turns):
+        transcript = runner.transcript
+        if hasattr(transcript, "snapshot_turns"):
+            snapshot = transcript.snapshot_turns()
+        else:
+            snapshot = list(getattr(transcript, "turns", []) or [])
+        for turn in snapshot:
             if turn.id in self._seen_turn_ids:
                 continue
             self._seen_turn_ids.add(turn.id)
             text = format_turn(turn)
             if turn.speaker != "user":
                 text = present_prompt(text)
-            self._write_conversation(text)
+            speaker = "user" if turn.speaker == "user" else "brain"
+            self._write_conversation(text, speaker=speaker)
 
     def _last_synced_turn_text(self) -> str | None:
         runner = self._runner
-        if runner is None or not runner.transcript.turns:
+        if runner is None:
             return None
-        return runner.transcript.turns[-1].text
+        transcript = runner.transcript
+        if hasattr(transcript, "snapshot_turns"):
+            turns = transcript.snapshot_turns()
+        else:
+            turns = list(getattr(transcript, "turns", []) or [])
+        if not turns:
+            return None
+        return turns[-1].text
 
     # -- widget writes (the render path; buffers mirror the widgets for tests) --
 
@@ -902,19 +945,23 @@ class RelayTuiApp(App):
             return None
 
     def _mount_stream(self, widget) -> None:
-        """Mount one row/widget into the stream and keep it pinned to the live edge."""
+        """Mount one row/widget into the stream; follow the live edge only if pinned."""
         stream = self._stream()
         if stream is None:
             return
         try:
+            follow = stream_should_follow(stream)
             stream.mount(widget)
-            stream.scroll_end(animate=False)
+            trim_stream_children(stream, keep=self._plan_block, max_lines=STREAM_MAX_LINES)
+            if follow:
+                stream.scroll_end(animate=False)
         except Exception:  # noqa: BLE001 -- teardown race; the buffer already has it
             pass
 
     def _push_row(self, renderable, *, classes: str = "stream-row") -> None:
         """Record a stream row (the headless mirror) and mount it into the stream."""
         self._stream_rendered.append(renderable)
+        trim_deque_list(self._stream_rendered, STREAM_MAX_LINES)
         self._mount_stream(Static(renderable, classes=classes))
 
     def _row(self, gutter: str, body: str, *, gutter_style: str = "", body_style: str = "") -> None:
@@ -929,19 +976,24 @@ class RelayTuiApp(App):
         Used for the bespoke-form events + the dim detail lines, so the stream shows
         their inline form (or nothing) rather than a duplicate generic row."""
         self._activity_lines.append(f"{actor} | {line}" if actor else line)
+        trim_deque_list(self._activity_lines, STREAM_BUFFER_MAX)
 
-    def _write_conversation(self, line: str) -> None:
-        """Record a conversation line (buffer) and render it as a stream row, colored
-        by speaker (you = bright magenta, brain = magenta, system = muted)."""
+    def _write_conversation(self, line: str, *, speaker: str | None = None) -> None:
+        """Record a conversation line (buffer) and render it as a stream row.
+
+        Prefer a structured ``speaker`` (``user`` / ``brain`` / other) over
+        re-parsing the rendered line. Legacy callers may omit it.
+        """
         self._conversation_lines.append(line)
+        trim_deque_list(self._conversation_lines, STREAM_BUFFER_MAX)
         if not line.strip():
             self._push_row("")  # a blank spacer between runs
             return
-        head = line.split(None, 1)[0]
-        rest = line.split(None, 1)[1] if " " in line else ""
-        if head == "you":
+        if speaker == "user" or (speaker is None and line.startswith("you")):
+            rest = line.split(None, 1)[1] if " " in line else ""
             self._row("you", rest, gutter_style=f"bold {C_MAGENTA}", body_style=C_TXT)
-        elif head == "brain":
+        elif speaker == "brain" or (speaker is None and line.startswith("brain")):
+            rest = line.split(None, 1)[1] if " " in line else ""
             self._row("brain", rest, gutter_style=C_MAGENTA, body_style=C_TXT)
         else:
             self._row("", line, body_style=C_MUTED)  # system / result / notice lines
@@ -979,7 +1031,8 @@ class RelayTuiApp(App):
 
     def _stream_verdict(self, index, verdict: str) -> None:
         """A compact review verdict line: ``review ✓ accept · step 04``."""
-        accepted = "accept" in (verdict or "").lower()
+        # Classify from the payload field (exact match), not substring search.
+        accepted = (verdict or "").strip().lower() == "accept"
         text = Text()
         text.append("  review ", style=C_DIM)
         text.append(f"{'✓' if accepted else '•'} {verdict}", style=C_GREEN if accepted else C_AMBER)
@@ -1343,8 +1396,21 @@ class RelayTuiApp(App):
         ]
         self.push_screen(SelectDialog(title="Commands", options=options))
 
-    def _cmd_model(self) -> None:
-        """Pick a role, then its model (reuses v0.0.16 listing + validation)."""
+    def _cmd_model(self, arg: str = "") -> None:
+        """Pick a role, then its model — or apply ``/model <role> [slug]`` inline."""
+        parts = (arg or "").split(None, 1)
+        if parts and parts[0] in ROLES:
+            role = parts[0]
+            if len(parts) == 2:
+                model = parts[1].strip()
+                provider = self._models.provider_for_role(role)
+                ok, note = self._save_role_model(role, provider, model)
+                self._write_activity(
+                    f"/model {role} → {provider}/{model}" if ok else f"/model failed: {note}"
+                )
+                return
+            self._pick_model_for(role)
+            return
         options = [
             {"title": "brain (planner)", "value": "brain",
              "on_select": (lambda v: self._pick_model_for("brain"))},
@@ -1362,10 +1428,9 @@ class RelayTuiApp(App):
 
         ``provider`` is explicit (so /provider can pick a model for a JUST-CHOSEN
         provider, not the stale config one). A ``list`` provider (DeepSeek) shows
-        the live ``/models`` SelectDialog; a ``manual`` provider (OpenRouter) a slug
-        TextEntryDialog validated live. On a successful save, ``then`` (if given) is
-        scheduled AFTER this dialog tears down -- the chaining seam ``both`` uses to
-        run brain then hands in sequence.
+        the live ``/models`` SelectDialog after an off-thread fetch; a ``manual``
+        provider (OpenRouter) a slug TextEntryDialog validated live. On a successful
+        save, ``then`` (if given) is scheduled AFTER this dialog tears down.
         """
         try:
             profile = resolve_provider(provider)
@@ -1377,21 +1442,18 @@ class RelayTuiApp(App):
                 self.call_after_refresh(then)  # next step, after this dialog dismisses
 
         if profile is not None and profile.discovery == DISCOVERY_LIST:
-            list_fn = self._list_models_fn or provider_list_models
-            try:
-                ids = list(list_fn(provider))
-            except Exception:  # noqa: BLE001 -- no key/network -> empty, handled below
-                ids = []
-
-            def on_pick(value, r=role, p=provider) -> None:
-                ok, _ = self._save_role_model(r, p, value)
-                after_save(ok)
-
-            options = [
-                {"title": mid, "value": mid, "category": provider, "on_select": on_pick}
-                for mid in ids
-            ] or [{"title": "(no models listed -- add a key with /key)", "value": "__none__"}]
-            self.push_screen(SelectDialog(title=f"Pick a {role} model ({provider})", options=options))
+            self._pending_model_pick = {
+                "role": role, "provider": provider, "then": then, "after_save": after_save,
+            }
+            self._write_activity(f"(loading {provider} models…)", dim=True)
+            self.run_worker(
+                self._fetch_models_for_pick,
+                thread=True,
+                name="list-models",
+                group="list-models",
+                exclusive=True,
+                exit_on_error=False,
+            )
         else:
             # manual aggregator: a slug field validated live before saving.
             def on_submit(slug, r=role, p=provider):
@@ -1405,6 +1467,33 @@ class RelayTuiApp(App):
                 password=False, placeholder="e.g. openai/gpt-4o",
                 on_submit=on_submit,
             ))
+
+    def _fetch_models_for_pick(self) -> list[str]:
+        """Worker body: list models for the pending /model pick (may hit the network)."""
+        pending = getattr(self, "_pending_model_pick", None) or {}
+        provider = pending.get("provider", "")
+        list_fn = self._list_models_fn or provider_list_models
+        try:
+            return list(list_fn(provider))
+        except Exception:  # noqa: BLE001 -- no key/network -> empty, handled below
+            return []
+
+    def _show_model_pick_dialog(self, ids: list[str]) -> None:
+        pending = getattr(self, "_pending_model_pick", None) or {}
+        role = pending.get("role", "brain")
+        provider = pending.get("provider", "")
+        after_save = pending.get("after_save") or (lambda ok: None)
+        self._pending_model_pick = None
+
+        def on_pick(value, r=role, p=provider) -> None:
+            ok, _ = self._save_role_model(r, p, value)
+            after_save(ok)
+
+        options = [
+            {"title": mid, "value": mid, "category": provider, "on_select": on_pick}
+            for mid in ids
+        ] or [{"title": "(no models listed -- add a key with /key)", "value": "__none__"}]
+        self.push_screen(SelectDialog(title=f"Pick a {role} model ({provider})", options=options))
 
     # -- /provider: set a role's provider, then its model ----------------------
 
@@ -1512,6 +1601,22 @@ class RelayTuiApp(App):
             title=title, label=f"Input to {kind}:", placeholder="...", on_submit=on_submit,
         ))
 
+    def _cmd_queue(self, arg: str = "") -> None:
+        """Queue input for after the current run (``/queue <text>`` or dialog)."""
+        text = (arg or "").strip()
+        if text:
+            self._do_queue(text)
+            return
+        self._open_inline_dialog("queue")
+
+    def _cmd_redirect(self, arg: str = "") -> None:
+        """Steer now (``/redirect <text>`` or dialog)."""
+        text = (arg or "").strip()
+        if text:
+            self._do_redirect(text)
+            return
+        self._open_inline_dialog("redirect")
+
     def _cmd_config(self) -> None:
         """Show the resolved config (provider/model/thinking + source; key present/
         absent) -- NEVER the key. Any row jumps into the full setup screen."""
@@ -1540,8 +1645,19 @@ class RelayTuiApp(App):
         self.push_screen(SelectDialog(title="Config (resolved: env > config > default)", options=options))
 
     def _cmd_doctor(self) -> None:
-        """Run the provider/model preflight (reusing the CLI logic) in a dialog."""
-        rows = self._run_doctor_report()
+        """Run the provider/model preflight off the UI thread, then show a dialog."""
+        self._write_activity("(doctor running…)", dim=True)
+        self.run_worker(
+            self._run_doctor_report,
+            thread=True,
+            name="doctor",
+            group="doctor",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    def _show_doctor_dialog(self, rows: list[dict] | None) -> None:
+        rows = rows or []
         options = [
             {"title": f"{r.get('role')}  {r.get('provider')}/{r.get('model')}: {r.get('status', '?')}",
              "value": r.get("model", "?"), "category": "preflight",
@@ -1565,6 +1681,22 @@ class RelayTuiApp(App):
             note = friendly_provider_error(str(exc).splitlines()[0][:120])
             return [{"role": "?", "provider": "?", "model": "?",
                      "status": "FAILED", "note": note}]
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        """Deliver off-thread /model list + /doctor results onto the UI thread."""
+        worker = event.worker
+        if event.state is not WorkerState.SUCCESS:
+            if event.state is WorkerState.ERROR and worker.name in ("doctor", "list-models"):
+                err = worker.error
+                note = friendly_provider_error(
+                    str(err).splitlines()[0][:120] if err else "worker failed"
+                )
+                self._write_activity(f"({worker.name} failed: {note})", dim=True)
+            return
+        if worker.name == "doctor":
+            self._show_doctor_dialog(worker.result)
+        elif worker.name == "list-models":
+            self._show_model_pick_dialog(list(worker.result or []))
 
     def _cmd_runs(self) -> None:
         """List recent runs (reusing the runlog reader) read-only in a dialog."""
@@ -1596,13 +1728,17 @@ class RelayTuiApp(App):
         except Exception:  # noqa: BLE001 -- a missing/odd log is just "no runs"
             return []
 
-    def _cmd_assume(self) -> None:
-        """Pick the assumption level for this session (a select, not an inline number).
+    def _cmd_assume(self, arg: str = "") -> None:
+        """Pick the assumption level for this session (dialog or ``/assume <level>``).
 
         Each level carries a short description DERIVED from the real dial semantics
         (:func:`relay.config.assumption_summary`), so the text can't drift from what
         the brain is actually instructed to do. The current level is marked.
         """
+        level = (arg or "").strip()
+        if level in ASSUMPTION_LEVELS:
+            self._set_assume(level)
+            return
         options = []
         for lvl in ASSUMPTION_LEVELS:
             current = lvl == self._assumption_level
@@ -1618,20 +1754,27 @@ class RelayTuiApp(App):
         self._assumption_level = level
         self._update_status()
 
-    def _cmd_profile(self) -> None:
+    def _cmd_profile(self, arg: str = "") -> None:
         """B1: pick a named assumption profile for this session (session-only)."""
         from relay.profiles import PROFILES, get_profile
 
+        name = (arg or "").strip().lower()
+        if name:
+            if get_profile(name) is None:
+                self._write_activity(f"/profile: unknown profile '{name}'")
+                return
+            self._set_profile(name)
+            return
         options = []
-        for name in PROFILES:
-            p = get_profile(name)
+        for pname in PROFILES:
+            p = get_profile(pname)
             assert p is not None
             options.append({
-                "title": name,
-                "value": name,
+                "title": pname,
+                "value": pname,
                 "category": "profile",
                 "description": f"{p.description} (dial={p.assumption_level})",
-                "on_select": (lambda v, n=name: self._set_profile(n)),
+                "on_select": (lambda v, n=pname: self._set_profile(n)),
             })
         self.push_screen(SelectDialog(title="Assumption profile", options=options))
 
@@ -1647,12 +1790,18 @@ class RelayTuiApp(App):
         )
         self._update_status()
 
-    def _cmd_cwd(self) -> None:
+    def _cmd_cwd(self, arg: str = "") -> None:
         """Show the current session working dir and let the user set a new one.
 
         The working dir is session-sticky: a set here persists across subsequent
         goals (until changed) -- the next goal operates from it, not the launch
         root. Guarded to non-running states (the command's ``enabled`` predicate)."""
+        path = (arg or "").strip()
+        if path:
+            ok, note = self._set_working_dir(path)
+            if not ok:
+                self._write_activity(f"/cwd: {note}")
+            return
         current = self._session.working_dir
         self.push_screen(TextEntryDialog(
             title="Working directory (persists across goals)",
@@ -1939,10 +2088,15 @@ class RelayTuiApp(App):
         if scope == "session":
             transcript_lines = list(self._conversation_lines)
         else:
-            transcript_lines = (
-                [format_turn(t) for t in runner.transcript.turns]
-                if runner is not None else []
-            )
+            if runner is None:
+                transcript_lines = []
+            else:
+                transcript = runner.transcript
+                if hasattr(transcript, "snapshot_turns"):
+                    turns = transcript.snapshot_turns()
+                else:
+                    turns = list(getattr(transcript, "turns", []) or [])
+                transcript_lines = [format_turn(t) for t in turns]
         activity_lines = list(self._activity_lines)
 
         outcome = runner.outcome if runner is not None else None

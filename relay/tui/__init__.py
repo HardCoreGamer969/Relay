@@ -10,6 +10,7 @@ from .commands import (
     Command,
     _parse_inline_command,
     _run_active,
+    command_by_name,
     filter_commands,
     visible_commands,
 )
@@ -23,6 +24,7 @@ from .events import (
 )
 from .input import PromptInput
 from .setup import SetupScreen, persist_role, secrets_set_key, setup_summary
+from .stream import STREAM_BUFFER_MAX, STREAM_MAX_LINES
 from .theme import (
     ACTOR_BRAIN,
     ACTOR_HANDS,
@@ -103,10 +105,13 @@ __all__ = [
     "_glitch_thresholds",
     "visible_commands",
     "filter_commands",
+    "command_by_name",
     "_parse_inline_command",
     "_run_active",
     "PromptInput",
     "FilterInput",
     "SegmentRow",
     "_DIALOG_CSS",
+    "STREAM_MAX_LINES",
+    "STREAM_BUFFER_MAX",
 ]

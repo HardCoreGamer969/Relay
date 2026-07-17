@@ -1,6 +1,6 @@
 # U1 — Foundation
 
-**Stage:** U1 · **Status:** [MASTER](MASTER.md) only  
+**Stage:** U1 · **Status:** shipped  
 **Maps to:** REVAMP Stage T2  
 **Depends on:** U0
 
@@ -23,11 +23,15 @@ readable and bounded on long runs.
 
 ## Acceptance
 
-- [ ] No live HTTP during `compose()` on the UI thread
-- [ ] Long-run stream memory bounded; scrollback readable mid-run
-- [ ] Marshal errors visible in debug / activity, not silently dropped
-- [ ] Existing TUI tests green; add cases for scroll-pin and worker dialogs
+- [x] No live HTTP during `compose()` on the UI thread
+- [x] Long-run stream memory bounded; scrollback readable mid-run
+- [x] Marshal errors visible in debug / activity, not silently dropped
+- [x] Existing TUI tests green; add cases for scroll-pin and worker dialogs
 
 ## v1 cuts
 
 - Full render-model layer can wait for U6; mirrors remain for `/log` for now
+- Stream still uses capped `VerticalScroll` + `Static` rows (plan block stays
+  in-place until U2 dock); `RichLog` swap deferred with U3 markdown
+- `persist_role` live-validate stays sync on Enter (dialog contract); list/doctor
+  are the felt-latency wins

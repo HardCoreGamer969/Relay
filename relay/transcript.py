@@ -36,6 +36,7 @@ narrative a human can still follow.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import asdict, dataclass, field, replace
 
 from relay.config import ModelConfig
@@ -102,20 +103,25 @@ class Transcript:
     In-process only (like plan memory -- no persistence here), but snapshot-shaped
     (:meth:`to_state` / :meth:`from_state` round-trip) so persistence and
     cross-session scroll-back are cheap to add later.
+
+    Mutations and UI snapshots are lock-guarded so the TUI thread can read a
+    stable copy while the engine worker appends (U1).
     """
 
     turns: list[Turn] = field(default_factory=list)
     counter: int = 0  # next monotonic ordinal; part of the snapshot state
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
     # -- mutation ----------------------------------------------------------
 
     def add(self, turn: Turn) -> Turn:
         """Append ``turn``, assigning a monotonic ``created_at`` (and ``id`` if blank)."""
-        ordinal = self.counter
-        self.counter += 1
-        stored = replace(turn, id=turn.id or f"t{ordinal}", created_at=ordinal)
-        self.turns.append(stored)
-        return stored
+        with self._lock:
+            ordinal = self.counter
+            self.counter += 1
+            stored = replace(turn, id=turn.id or f"t{ordinal}", created_at=ordinal)
+            self.turns.append(stored)
+            return stored
 
     def record(self, speaker: str, phase: str, text: str, *, refs: list[str] | None = None) -> Turn:
         """Convenience: build a :class:`Turn` and :meth:`add` it."""
@@ -127,16 +133,24 @@ class Transcript:
 
     def recent(self, n: int) -> list[Turn]:
         """The most recent ``n`` turns in chronological order (empty if ``n<=0``)."""
-        return self.turns[-n:] if n > 0 else []
+        with self._lock:
+            return self.turns[-n:] if n > 0 else []
 
     def is_empty(self) -> bool:
-        return not self.turns
+        with self._lock:
+            return not self.turns
+
+    def snapshot_turns(self) -> list[Turn]:
+        """A point-in-time copy of turns for UI-thread reads (worker-safe)."""
+        with self._lock:
+            return list(self.turns)
 
     # -- snapshot shape (cheap point-in-time copy; the persistence hook) ----
 
     def to_state(self) -> dict:
         """Capture full state as a plain JSON-able value."""
-        return {"counter": self.counter, "turns": [asdict(t) for t in self.turns]}
+        with self._lock:
+            return {"counter": self.counter, "turns": [asdict(t) for t in self.turns]}
 
     @classmethod
     def from_state(cls, state: dict) -> "Transcript":
@@ -211,7 +225,7 @@ def render_for_brain(
     The result is guaranteed to fit the budget. Used so a mid-run escalation can be
     phrased as a continuation of the conversation so far, not a context-less popup.
     """
-    turns = transcript.turns
+    turns = transcript.snapshot_turns()
     if not turns or budget_tokens <= 0:
         return ""
 
@@ -250,7 +264,7 @@ def compact_transcript(
     the original is left untouched. Degrades gracefully -- a failing summarizer
     falls back to a readable, noted brief rather than crashing.
     """
-    turns = transcript.turns
+    turns = transcript.snapshot_turns()
     if len(turns) <= keep_recent:
         return transcript.copy()  # nothing to fold
 

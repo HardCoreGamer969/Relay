@@ -83,7 +83,7 @@ Narrow terminals: plan dock collapses to `active` mode automatically
 | Stage | Name | Doc | Status | Notes |
 |-------|------|-----|--------|-------|
 | U0 | Package split | [U0-package-split.md](U0-package-split.md) | shipped | REVAMP T1; no visual change |
-| U1 | Foundation | [U1-foundation.md](U1-foundation.md) | planned | Off-thread I/O, virtualized stream |
+| U1 | Foundation | [U1-foundation.md](U1-foundation.md) | shipped | Off-thread I/O, capped stream, slash args |
 | U2 | Cockpit chrome | [U2-cockpit.md](U2-cockpit.md) | planned | Status rail + plan dock + gauges |
 | U3 | Rich stream | [U3-rich-stream.md](U3-rich-stream.md) | planned | Markdown, diffs, folds |
 | U4 | Interaction | [U4-interaction.md](U4-interaction.md) | planned | Composer, approve modal, resume |

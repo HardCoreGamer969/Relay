@@ -42,7 +42,7 @@ Append-only. One section per stage after the review gate passes.
 ### U2 — Cockpit chrome (2026-07-17)
 
 - Status: shipped
-- Commit: 0716679
+- Commit: cbd3cba
 - Tests: `tests/test_tui_cockpit.py` + full TUI suite
 - Review: pass-with-notes
 - Shipped:
